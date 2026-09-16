@@ -370,11 +370,11 @@ impl Coder for Lzma2Coder {
     /// other worker, instead of on whoever drains the output.
     #[cfg(feature = "crc")]
     fn checksum(&mut self) {
-        let Some(props_checks) = self.props.checks.as_ref() else {
-            return;
-        };
-        let _ = props_checks;
-        if self.props.plan.is_none() || self.code_res.is_some() || self.parse_failed {
+        if self.props.checks.is_none()
+            || self.props.plan.is_none()
+            || self.code_res.is_some()
+            || self.parse_failed
+        {
             return;
         }
         // Take the block buffer back from the decoder early; `write` reclaims
