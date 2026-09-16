@@ -22,9 +22,15 @@ on a single core. This crate ports that shape rather than that lineage.
 
 ## Status
 
-Scaffold. The decoder is being ported; see
-[docs/porting.md](../../docs/porting.md) for the plan and the acceptance gate
-(within 3% of `7zz` single-threaded on the repository's fixtures).
+The decoder is real: LZMA1 and LZMA2, single-threaded, decode only, ported
+function by function from the reference decoder. It is byte-identical to
+`xz -dc` on the repository's fixtures (256 MiB LZMA1, 1 GiB LZMA1, 256 MiB
+LZMA2) and on the committed vectors, including non-default `lc`/`lp`/`pb`, and
+it is fuzzed for panics and out-of-bounds reads.
+
+Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
+the same file and machine) is tracked in [docs/perf-log.md](../../docs/perf-log.md);
+see [docs/porting.md](../../docs/porting.md) for the plan.
 
 ## Provenance and license
 

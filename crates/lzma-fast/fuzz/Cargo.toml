@@ -1,0 +1,31 @@
+[package]
+name = "lzma-fast-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lzma-fast = { path = ".." }
+
+[[bin]]
+name = "decode_lzma"
+path = "fuzz_targets/decode_lzma.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_lzma2"
+path = "fuzz_targets/decode_lzma2.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

@@ -1,0 +1,6 @@
+# Only the hand-made seeds are tracked; everything libFuzzer adds to the corpus
+# during a run is regenerable and stays local.
+*
+!*/
+!.gitignore
+!*.seed

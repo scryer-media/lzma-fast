@@ -9,14 +9,51 @@
 //!
 //! Decode only. There is no encoder here and none is planned.
 //!
-//! # Status
+//! # Example
 //!
-//! Scaffold. The public API is not yet defined; see `docs/porting.md` in the
-//! repository for the port plan and its acceptance gate.
+//! ```no_run
+//! use std::fs::File;
+//! use std::io::Read;
+//! use lzma_fast::LzmaReader;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let mut out = Vec::new();
+//! LzmaReader::new(File::open("archive.lzma")?)?.read_to_end(&mut out)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Provenance
+//!
+//! Derived from `C/LzmaDec.c` and `C/Lzma2Dec.c` of the LZMA SDK, which are in
+//! the public domain. Each ported function names its C counterpart in a
+//! comment.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs, rust_2018_idioms)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+mod error;
+mod lzma;
+mod lzma2;
+mod lzma_alone;
+
+#[cfg(feature = "std")]
+mod reader;
+
+pub use error::{Error, FinishMode, Progress, Status};
+pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};
+pub use lzma::{LzmaDecoder, LzmaProps};
+pub use lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
+pub use lzma2::Lzma2Decoder;
+
+#[cfg(feature = "std")]
+pub use reader::{Lzma2Reader, LzmaReader};
 
 /// Crate version, for consumers that record which decoder produced an output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

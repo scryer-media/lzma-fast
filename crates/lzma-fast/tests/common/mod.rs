@@ -1,0 +1,183 @@
+//! Shared test helpers.
+//!
+//! Includes a deliberately minimal `.xz` container reader: enough to find the
+//! LZMA2 filter properties and the compressed data of a single-block stream so
+//! the LZMA2 decoder can be driven from an `xz(1)` output. It is test-only;
+//! the crate itself decodes raw LZMA/LZMA2 and leaves containers to callers.
+
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use lzma_fast::{Error, FinishMode, Lzma2Decoder, LzmaAloneHeader, LzmaDecoder, Status};
+
+pub fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data")
+}
+
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
+}
+
+pub fn read(name: &str) -> Vec<u8> {
+    std::fs::read(data_dir().join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
+}
+
+/// Every committed source file and the stems of the streams built from it.
+pub const SOURCES: &[&str] = &["text", "rand", "zeros", "mixed", "tiny", "empty"];
+/// Suffixes of the committed LZMA1 (`.lzma`) vectors.
+pub const LZMA_VARIANTS: &[&str] = &["p1", "p9e", "lc0lp2pb0", "lc4pb1"];
+/// Suffixes of the committed LZMA2-in-xz vectors.
+pub const XZ_VARIANTS: &[&str] = &["p1", "lc1lp1pb0"];
+
+/// Outcome of a streaming decode: the bytes and the last status seen.
+pub struct Decoded {
+    pub bytes: Vec<u8>,
+    pub status: Status,
+}
+
+/// Drives [`LzmaDecoder::decode`] over a `.lzma` stream in fixed-size input
+/// and output slices, which is what makes the `tempBuf` / `TryDummy` paths run.
+pub fn decode_lzma(data: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Decoded, Error> {
+    if data.len() < 13 {
+        return Err(Error::CorruptData);
+    }
+    let header: [u8; 13] = data[..13].try_into().expect("13 bytes");
+    let header = LzmaAloneHeader::parse(&header)?;
+    let mut dec = LzmaDecoder::new(header.props)?;
+
+    let mut input = &data[13..];
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    let mut remaining = header.uncompressed_size;
+    let mut status = Status::NotSpecified;
+
+    loop {
+        let feed = in_chunk.min(input.len());
+        let limit = match remaining {
+            Some(r) => buf.len().min(r as usize),
+            None => buf.len(),
+        };
+        if limit == 0 {
+            break;
+        }
+        let finish = match remaining {
+            Some(r) if (r as usize) <= limit => FinishMode::End,
+            _ => FinishMode::Any,
+        };
+
+        let p = dec.decode(&input[..feed], &mut buf[..limit], finish)?;
+        status = p.status;
+        input = &input[p.read..];
+        out.extend_from_slice(&buf[..p.written]);
+        if let Some(r) = remaining.as_mut() {
+            *r -= p.written as u64;
+            if *r == 0 {
+                break;
+            }
+        }
+        if status == Status::FinishedWithMark {
+            break;
+        }
+        if p.read == 0 && p.written == 0 {
+            break;
+        }
+    }
+
+    Ok(Decoded { bytes: out, status })
+}
+
+/// Drives [`Lzma2Decoder::decode`] over a raw LZMA2 stream.
+pub fn decode_lzma2(
+    dict_prop: u8,
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Decoded, Error> {
+    let mut dec = Lzma2Decoder::new(dict_prop)?;
+    let mut input = data;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    #[allow(unused_assignments)]
+    let mut status = Status::NotSpecified;
+
+    loop {
+        let feed = in_chunk.min(input.len());
+        let p = dec.decode(&input[..feed], &mut buf, FinishMode::Any)?;
+        status = p.status;
+        input = &input[p.read..];
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::FinishedWithMark {
+            break;
+        }
+        if p.read == 0 && p.written == 0 {
+            break;
+        }
+    }
+
+    Ok(Decoded { bytes: out, status })
+}
+
+/// The LZMA2 filter id in an xz block header.
+const XZ_FILTER_LZMA2: u64 = 0x21;
+
+/// Reads a multibyte integer as xz encodes them (7 bits per byte, high bit
+/// continues).
+fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut v: u64 = 0;
+    for i in 0..9 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        v |= u64::from(b & 0x7F) << (i * 7);
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Minimal single-block `.xz` reader: returns the LZMA2 dictionary property
+/// byte and the block's compressed data. Test-only, and deliberately strict —
+/// it rejects anything it does not understand rather than guessing.
+pub fn xz_lzma2_block(data: &[u8]) -> Option<(u8, &[u8])> {
+    const MAGIC: &[u8] = &[0xFD, b'7', b'z', b'X', b'Z', 0x00];
+    if data.len() < 12 || &data[..6] != MAGIC {
+        return None;
+    }
+    let mut pos = 12; // stream header
+    let first = *data.get(pos)?;
+    if first == 0 {
+        return None; // index, i.e. no block at all
+    }
+    let header_size = (usize::from(first) + 1) * 4;
+    let header_end = pos + header_size;
+    if header_end > data.len() {
+        return None;
+    }
+    pos += 1;
+    let flags = *data.get(pos)?;
+    pos += 1;
+    let num_filters = usize::from(flags & 0x03) + 1;
+    if flags & 0x3C != 0 {
+        return None; // reserved bits set
+    }
+    if flags & 0x40 != 0 {
+        xz_varint(data, &mut pos)?; // compressed size
+    }
+    if flags & 0x80 != 0 {
+        xz_varint(data, &mut pos)?; // uncompressed size
+    }
+    if num_filters != 1 {
+        return None;
+    }
+    let id = xz_varint(data, &mut pos)?;
+    let props_size = xz_varint(data, &mut pos)? as usize;
+    if id != XZ_FILTER_LZMA2 || props_size != 1 {
+        return None;
+    }
+    let dict_prop = *data.get(pos)?;
+    Some((dict_prop, &data[header_end..]))
+}
