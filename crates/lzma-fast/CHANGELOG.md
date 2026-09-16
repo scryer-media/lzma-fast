@@ -8,6 +8,18 @@
   `mt_memory_estimate`. A stream with no dictionary resets, or a run larger
   than the block budget, falls back to the single-threaded decoder for that
   region without buffering it.
+- `Lzma2AdaptiveDecoder`: LZMA2 decoding for a stream that is still arriving.
+  Input is fed rather than read and never blocks, output is polled as
+  `(offset, bytes)` blocks in order or as decoded, the thread count can be
+  changed mid-stream and takes effect at the next run boundary, memory in
+  flight is accounted and bounded, and the decode can be cancelled. Worker
+  threads are created at the first dispatch and parked, not torn down, across
+  a mode change.
+- `Lzma2RunScanner` and `Lzma2Run`: incremental, public discovery of the
+  independently decodable runs in an LZMA2 stream, costing O(chunks) and no
+  decoding.
+- `Error::CorruptRun` locates corruption by run index and output offset, and
+  `Error::Cancelled` reports a cancelled decode.
 - `Lzma2Dec_Parse` is ported as `lzma2::parse`, and the LZMA2 chunk-header
   state machine it shares with the decoder is factored out into `lzma2::frame`
   so the parser and the decoder cannot drift apart.

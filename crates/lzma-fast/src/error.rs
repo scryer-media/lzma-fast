@@ -24,6 +24,21 @@ pub enum Error {
     InternalFailure,
     /// The decoder could not allocate its dictionary or probability table.
     Alloc,
+    /// [`Error::CorruptData`], located.
+    ///
+    /// Only the multi-threaded decoder produces this: a worker decodes one
+    /// independently decodable run and so can say which one failed and where
+    /// its output would have gone, which a caller writing blocks by offset
+    /// needs in order to know what it has and has not got.
+    CorruptRun {
+        /// The run's index in the stream, counting from zero.
+        index: u64,
+        /// Where the run's output starts, in bytes from the start of the
+        /// decoded stream.
+        out_offset: u64,
+    },
+    /// The decode was cancelled by the caller.
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -33,6 +48,13 @@ impl fmt::Display for Error {
             Error::CorruptData => "corrupt LZMA data",
             Error::InternalFailure => "internal LZMA decoder failure",
             Error::Alloc => "LZMA decoder allocation failed",
+            Error::CorruptRun { index, out_offset } => {
+                return write!(
+                    f,
+                    "corrupt LZMA2 data in run {index}, at output offset {out_offset}"
+                );
+            }
+            Error::Cancelled => "LZMA decode cancelled",
         };
         f.write_str(s)
     }

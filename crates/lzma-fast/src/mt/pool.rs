@@ -1,0 +1,292 @@
+//! A pool of LZMA2 run decoders that outlives any one decode mode.
+//!
+//! C: nothing. [`super::mtdec`] is a faithful port of `C/MtDec.c`, in which
+//! the threads *are* the control flow: they hand two event tokens around a
+//! ring, thread 0 runs on the caller's stack, and the whole structure exists
+//! for the duration of one blocking `Lzma2DecMt_Decode` call. That is a good
+//! design for "decode this stream, return when done", and it is what the
+//! throughput path uses.
+//!
+//! It cannot serve a caller that is chasing a download: such a caller feeds
+//! bytes as they arrive, wants output back without blocking, and switches
+//! between single- and multi-threaded decoding as the backlog of complete runs
+//! grows and shrinks. So the adaptive decoder drives workers instead of being
+//! driven by them, and this is the pool it drives: threads that are spawned on
+//! first use, block on a channel when idle, decode whole runs handed to them,
+//! and stay parked across a mode change rather than being torn down.
+//!
+//! The deviation is recorded in `docs/porting.md`.
+
+use alloc::vec::Vec;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::thread::JoinHandle;
+
+use crate::error::{Error, FinishMode};
+use crate::lzma2::Lzma2Decoder;
+
+/// One independently decodable run, on its way to a worker.
+pub(crate) struct Job {
+    /// The run's index in the stream.
+    pub(crate) index: u64,
+    /// Where the run's output belongs.
+    pub(crate) out_offset: u64,
+    /// What the run's chunk headers say it decodes to.
+    pub(crate) unpacked_len: usize,
+    /// The run's compressed bytes, exactly: the next run's control byte is not
+    /// included.
+    pub(crate) packed: Vec<u8>,
+    /// A buffer to decode into, recycled from a previous block.
+    pub(crate) out: Vec<u8>,
+}
+
+/// A finished job on its way back.
+pub(crate) struct Done {
+    pub(crate) index: u64,
+    pub(crate) out_offset: u64,
+    pub(crate) unpacked_len: usize,
+    /// The decoded block, or why it could not be decoded. Either way the
+    /// buffer comes back so it can be used again.
+    pub(crate) res: Result<(), Error>,
+    pub(crate) out: Vec<u8>,
+    /// The job's input buffer, returned for reuse.
+    pub(crate) packed: Vec<u8>,
+}
+
+/// Worker threads shared by every decode mode.
+pub(crate) struct Pool {
+    dict_prop: u8,
+    job_tx: Option<Sender<Job>>,
+    done_rx: Receiver<Done>,
+    done_tx: Sender<Done>,
+    job_rx: Arc<std::sync::Mutex<Receiver<Job>>>,
+    cancel: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl Pool {
+    pub(crate) fn new(dict_prop: u8) -> Self {
+        let (job_tx, job_rx) = channel::<Job>();
+        let (done_tx, done_rx) = channel::<Done>();
+        Pool {
+            dict_prop,
+            job_tx: Some(job_tx),
+            done_rx,
+            done_tx,
+            job_rx: Arc::new(std::sync::Mutex::new(job_rx)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handles: Vec::new(),
+        }
+    }
+
+    /// How many threads have actually been spawned.
+    pub(crate) fn spawned(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Spawns one more worker, if the pool is still accepting work.
+    ///
+    /// Workers are added on demand: a decoder configured for sixteen threads
+    /// that only ever has one run in flight never creates the other fifteen.
+    pub(crate) fn grow(&mut self) {
+        if self.job_tx.is_none() || self.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let rx = Arc::clone(&self.job_rx);
+        let tx = self.done_tx.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let prop = self.dict_prop;
+        let name = alloc::format!("lzma2-mt-{}", self.handles.len());
+        let spawned = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || worker(prop, &rx, &tx, &cancel));
+        // A thread that will not start is not an error: the work is simply
+        // done by the threads that did, or on the caller's own stack.
+        // A thread that will not start is not an error: the work is simply
+        // done by the threads that did, or on the caller's own stack.
+        if let Ok(h) = spawned {
+            self.handles.push(h);
+        }
+    }
+
+    /// Hands a run to whichever worker wakes first.
+    pub(crate) fn dispatch(&self, job: Job) -> Result<(), Error> {
+        match &self.job_tx {
+            Some(tx) => tx.send(job).map_err(|_| Error::Cancelled),
+            None => Err(Error::Cancelled),
+        }
+    }
+
+    /// Takes a finished block if one is ready, without waiting.
+    pub(crate) fn try_collect(&self) -> Option<Done> {
+        self.done_rx.try_recv().ok()
+    }
+
+    /// Waits for the next finished block.
+    ///
+    /// Only ever called with work outstanding, but it still refuses to wait
+    /// forever: the pool holds a sender of its own so the channel never
+    /// disconnects, and a worker that has died would otherwise hang its
+    /// dispatcher. If nothing arrives and no worker is alive to send it, the
+    /// answer is "never".
+    pub(crate) fn collect(&self) -> Option<Done> {
+        loop {
+            match self
+                .done_rx
+                .recv_timeout(core::time::Duration::from_millis(50))
+            {
+                Ok(d) => return Some(d),
+                Err(RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.handles.iter().all(JoinHandle::is_finished) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops the workers and waits for them.
+    pub(crate) fn shutdown(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        // Dropping the sender is what wakes an idle worker: its `recv` fails.
+        self.job_tx = None;
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// A worker's whole life: park on the channel, decode one run, park again.
+///
+/// The decoder and its probability table are built once and reused; a run's
+/// output buffer is its dictionary, so no worker ever allocates one.
+fn worker(
+    dict_prop: u8,
+    rx: &std::sync::Mutex<Receiver<Job>>,
+    tx: &Sender<Done>,
+    cancel: &AtomicBool,
+) {
+    let mut dec = match Lzma2Decoder::new_probs_only(dict_prop) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    loop {
+        // The lock is held only across `recv`, which is where a worker waits.
+        // `Receiver` is not `Sync`, so the queue is shared this way rather
+        // than cloned; contention is one hand-off per run.
+        let mut job = {
+            let g = match rx.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            match g.recv() {
+                Ok(j) => j,
+                Err(_) => return,
+            }
+        };
+
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(Done {
+                index: job.index,
+                out_offset: job.out_offset,
+                unpacked_len: job.unpacked_len,
+                res: Err(Error::Cancelled),
+                out: job.out,
+                packed: job.packed,
+            });
+            continue;
+        }
+
+        // A worker that dies without answering would leave its dispatcher
+        // waiting for a block that is never coming, so a panic is caught,
+        // reported as the internal failure it is, and the decoder rebuilt.
+        let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_run(&mut dec, &mut job)
+        })) {
+            Ok(r) => r,
+            Err(_) => {
+                dec = match Lzma2Decoder::new_probs_only(dict_prop) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(Done {
+                            index: job.index,
+                            out_offset: job.out_offset,
+                            unpacked_len: job.unpacked_len,
+                            res: Err(e),
+                            out: Vec::new(),
+                            packed: job.packed,
+                        });
+                        return;
+                    }
+                };
+                Err(Error::InternalFailure)
+            }
+        };
+        let out = dec.take_block_dic();
+        if tx
+            .send(Done {
+                index: job.index,
+                out_offset: job.out_offset,
+                unpacked_len: job.unpacked_len,
+                res,
+                out,
+                packed: job.packed,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Decodes one whole run into the buffer the job carries.
+///
+/// C: `Lzma2DecMt_MtCallback_Code`, minus the partial-block bookkeeping: the
+/// run's length is known from its headers before it is dispatched, so a
+/// worker either decodes all of it or the stream is corrupt.
+fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
+    let want = job.unpacked_len;
+
+    // The buffer is grown, never shrunk and never re-zeroed: `dicBufSize` says
+    // how much of it this run uses, so a stream of unequal runs does not pay
+    // to clear the whole thing every time.
+    let mut out = core::mem::take(&mut job.out);
+    if out.len() < want {
+        let more = want - out.len();
+        out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
+        out.resize(want, 0u8);
+    }
+    dec.set_block_dic(out, want);
+
+    let (used, status) = dec.decode_block(want, &job.packed, FinishMode::End)?;
+
+    // The run's boundaries came from its own chunk headers, so a worker that
+    // did not consume exactly the run, or did not produce exactly what the
+    // headers promised, was given something that does not decode.
+    if used != job.packed.len() || dec.dic_pos() != want {
+        return Err(Error::CorruptData);
+    }
+    // The status itself says nothing useful here. A run ends at the next run's
+    // control byte, which is not part of the job, so the decoder reports that
+    // it wants more input even though the run is complete; what makes it
+    // complete is the two counts above, which come from the run's own headers.
+    let _ = status;
+    Ok(())
+}
+
+/// Maps a decode result onto the located error the caller gets.
+pub(crate) fn locate(index: u64, out_offset: u64, e: Error) -> Error {
+    match e {
+        Error::CorruptData => Error::CorruptRun { index, out_offset },
+        other => other,
+    }
+}

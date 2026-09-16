@@ -592,8 +592,7 @@ impl<'e, C: Coder> MtDec<'e, C> {
                             }
                             let cr_size = size - parse_src_size;
                             in_data_size -= cr_size as u64;
-                            rd.cross[..cr_size]
-                                .copy_from_slice(&bufs[link][parse_src_size..size]);
+                            rd.cross[..cr_size].copy_from_slice(&bufs[link][parse_src_size..size]);
                             rd.cross_end = cr_size;
                             rd.cross_start = 0;
                         }
@@ -627,23 +626,25 @@ impl<'e, C: Coder> MtDec<'e, C> {
                 }
             }
 
-            if res.is_none() && need_code && !was_interrupted {
-                if let Some(c) = coder.as_mut() {
-                    match c.pre_code() {
-                        Ok(()) => {}
-                        Err(MtError::Lzma(e)) => {
-                            code_res = Some(e);
-                            need_code = false;
-                            finish = true;
-                            if e == Error::Alloc {
-                                is_alloc_error = true;
-                            }
+            if res.is_none()
+                && need_code
+                && !was_interrupted
+                && let Some(c) = coder.as_mut()
+            {
+                match c.pre_code() {
+                    Ok(()) => {}
+                    Err(MtError::Lzma(e)) => {
+                        code_res = Some(e);
+                        need_code = false;
+                        finish = true;
+                        if e == Error::Alloc {
+                            is_alloc_error = true;
                         }
-                        Err(MtError::Io(e)) => {
-                            io_err = Some(e);
-                            need_code = false;
-                            finish = true;
-                        }
+                    }
+                    Err(MtError::Io(e)) => {
+                        io_err = Some(e);
+                        need_code = false;
+                        finish = true;
                     }
                 }
             }
@@ -672,7 +673,11 @@ impl<'e, C: Coder> MtDec<'e, C> {
 
                 if !finish {
                     let next = index + 1;
-                    next_thread = Some(if next >= rd.num_started_threads { 0 } else { next });
+                    next_thread = Some(if next >= rd.num_started_threads {
+                        0
+                    } else {
+                        next
+                    });
                 }
             }
 
@@ -860,8 +865,7 @@ impl<'e, C: Coder> MtDec<'e, C> {
                         };
                         lim = 0;
                         rem -= lim_now as u64;
-                        let buf =
-                            std::mem::replace(&mut bufs[link], Vec::new().into_boxed_slice());
+                        let buf = std::mem::replace(&mut bufs[link], Vec::new().into_boxed_slice());
                         wr.replay.push_back(ReplayBuf { buf, len: lim_now });
                         link += 1;
                     }

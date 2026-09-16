@@ -11,7 +11,7 @@
 //! the single-threaded decoder.
 
 use crate::lzma::LzmaProps;
-use crate::lzma2::frame::{Lzma2Frame, Lzma2State, LZMA2_LCLP_MAX, is_uncompressed_state};
+use crate::lzma2::frame::{LZMA2_LCLP_MAX, Lzma2Frame, Lzma2State, is_uncompressed_state};
 
 /// C: `ELzma2ParseStatus`, which is `ELzmaStatus` plus two codes of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

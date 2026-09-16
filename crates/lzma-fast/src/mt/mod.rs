@@ -15,9 +15,11 @@
 //! See [`mtdec`] for the ring of threads that does the work; this module is
 //! the LZMA2-specific half plus the public API and the single-threaded tail.
 
+pub mod adaptive;
 mod event;
 mod lzma2;
 mod mtdec;
+mod pool;
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -49,6 +51,9 @@ fn expected_block_size(dict_size: u32) -> u64 {
     const K_MIN_SIZE: u64 = 1 << 20;
     const K_MAX_SIZE: u64 = 1 << 28;
     let mut block_size = u64::from(dict_size) << 2;
+    // Left as the C's two comparisons rather than a `clamp`: the next two
+    // clauses are the same shape and only make sense read together.
+    #[allow(clippy::manual_clamp)]
     if block_size < K_MIN_SIZE {
         block_size = K_MIN_SIZE;
     }
@@ -187,11 +192,7 @@ impl Lzma2ParallelDecoder {
     /// Propagates I/O errors from either stream, and returns
     /// [`std::io::ErrorKind::InvalidData`] wrapping an [`Error`] for a stream
     /// that does not decode.
-    pub fn decode<R: Read + Send, W: Write + Send>(
-        &self,
-        input: R,
-        out: W,
-    ) -> io::Result<u64> {
+    pub fn decode<R: Read + Send, W: Write + Send>(&self, input: R, out: W) -> io::Result<u64> {
         let mut input = input;
         let mut out = out;
         self.decode_dyn(&mut input, &mut out)
@@ -204,7 +205,14 @@ impl Lzma2ParallelDecoder {
     ) -> io::Result<u64> {
         if self.plan.st_only {
             let mut written = 0u64;
-            return decode_st(self.dict_prop, input, out, VecDeque::new(), false, &mut written);
+            return decode_st(
+                self.dict_prop,
+                input,
+                out,
+                VecDeque::new(),
+                false,
+                &mut written,
+            );
         }
 
         let props = Lzma2CoderProps {
@@ -380,8 +388,8 @@ fn decode_st(
         let out_processed = dec.dic_pos() - dic_pos;
         *written += out_processed as u64;
 
-        let need_stop = (in_processed == 0 && out_processed == 0)
-            || status == Status::FinishedWithMark;
+        let need_stop =
+            (in_processed == 0 && out_processed == 0) || status == Status::FinishedWithMark;
 
         if need_stop || out_processed >= size {
             let end = dec.dic_pos();

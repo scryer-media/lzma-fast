@@ -9,7 +9,7 @@ C bindings, no build script, no encoder.
 
 ```toml
 [dependencies]
-lzma-fast = "0.1"
+lzma-fast = "0.2"
 ```
 
 ## Why another LZMA crate
@@ -23,8 +23,8 @@ on a single core. This crate ports that shape rather than that lineage.
 
 ## Status
 
-The decoder is real: LZMA1 and LZMA2, single-threaded, decode only, ported
-function by function from the reference decoder. It is byte-identical to
+The decoder is real: LZMA1 and LZMA2, decode only, ported function by function
+from the reference decoder. It is byte-identical to
 `xz -dc` on the repository's fixtures (256 MiB LZMA1, 1 GiB LZMA1, 256 MiB
 LZMA2) and on the committed vectors, including non-default `lc`/`lp`/`pb`, and
 it is fuzzed for panics and out-of-bounds reads.
@@ -35,6 +35,16 @@ that feature off (`--no-default-features --features std`) falls back to the
 portable Rust port of the C loop, which is what every other target uses. Both
 paths are held to the same tests, and a differential test decodes every vector
 with each and compares.
+
+LZMA2 also decodes on several threads, behind the `std` feature: a port of
+7-Zip's `Lzma2DecMt.c` over the `MtDec.c` ring of workers, cutting the stream
+at the dictionary resets that make a run independently decodable. A stream
+with no resets — what `7zz -mmt=1` produces — falls back to the
+single-threaded decoder rather than buffering. Alongside it,
+`Lzma2AdaptiveDecoder` decodes a stream that is still arriving: input is fed
+rather than read, output is polled, and the thread count can be changed
+mid-stream at run boundaries. See the "Adaptive use" section of
+[docs/porting.md](../../docs/porting.md).
 
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](../../docs/perf-log.md);
