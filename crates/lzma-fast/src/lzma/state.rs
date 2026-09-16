@@ -148,8 +148,21 @@ impl LzmaDec {
     /// C: `LzmaDec_Allocate` (which is `LzmaProps_Decode` +
     /// `LzmaDec_AllocateProbs2` + the dictionary allocation).
     pub(crate) fn new(prop: LzmaProps) -> Result<Self, Error> {
-        let num_probs = lzma_props_get_num_probs(prop.lc, prop.lp);
         let dic_buf_size = prop.dic_buf_size();
+        Self::alloc(prop, dic_buf_size)
+    }
+
+    /// C: `LzmaDec_AllocateProbs`, which allocates the probability table and
+    /// records the properties but leaves `dic` null. The multi-threaded
+    /// decoder uses it because each worker's dictionary *is* its output block,
+    /// handed to it per block rather than owned by the decoder.
+    #[cfg(feature = "std")]
+    pub(crate) fn new_probs_only(prop: LzmaProps) -> Result<Self, Error> {
+        Self::alloc(prop, 0)
+    }
+
+    fn alloc(prop: LzmaProps, dic_buf_size: usize) -> Result<Self, Error> {
+        let num_probs = lzma_props_get_num_probs(prop.lc, prop.lp);
 
         let mut probs = Vec::new();
         probs

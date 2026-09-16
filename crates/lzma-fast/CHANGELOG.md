@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+- Multi-threaded LZMA2 decoding behind the `std` feature, ported from
+  `C/Lzma2DecMt.c` and the generic `C/MtDec.c` ring of worker threads:
+  `Lzma2ParallelDecoder`, `Lzma2ParallelReader`, `Lzma2MtOptions` and
+  `mt_memory_estimate`. A stream with no dictionary resets, or a run larger
+  than the block budget, falls back to the single-threaded decoder for that
+  region without buffering it.
+- `Lzma2Dec_Parse` is ported as `lzma2::parse`, and the LZMA2 chunk-header
+  state machine it shares with the decoder is factored out into `lzma2::frame`
+  so the parser and the decoder cannot drift apart.
+
 ## 0.1.0 (unreleased)
 
 - LZMA1 and LZMA2 decoding, ported function by function from Igor Pavlov's

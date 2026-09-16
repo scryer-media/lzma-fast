@@ -1,8 +1,8 @@
 //! LZMA2 decoding: chunk framing over the LZMA1 decoder.
 //!
-//! C: `C/Lzma2Dec.c`. `Lzma2Dec_Parse` and everything it exists for
-//! (`Lzma2DecMt.c`, `MtDec.c`) are out of scope: this crate is
-//! single-threaded, so nothing needs to scan ahead for block boundaries.
+//! C: `C/Lzma2Dec.c`. The chunk-header state machine itself lives in
+//! [`frame`], because [`parse`] runs the same one without a dictionary for
+//! the multi-threaded decoder's benefit.
 //!
 //! ```text
 //! 00000000  -  End of data
@@ -18,50 +18,24 @@
 //!   S - Props
 //! ```
 
+pub(crate) mod frame;
+pub(crate) mod parse;
+
 use crate::error::{Error, FinishMode, Progress, Status};
 use crate::lzma::consts::LZMA_DIC_MIN;
 use crate::lzma::{LzmaDec, LzmaProps, lzma_dec_decode_to_dic};
 
-/// C: `LZMA2_CONTROL_COPY_RESET_DIC`.
-const LZMA2_CONTROL_COPY_RESET_DIC: u8 = 1;
-/// C: `LZMA2_LCLP_MAX`.
-const LZMA2_LCLP_MAX: u8 = 4;
-
-/// C: `LZMA2_IS_UNCOMPRESSED_STATE(p)`.
-const fn is_uncompressed_state(control: u8) -> bool {
-    (control & (1 << 7)) == 0
-}
-
-/// C: `LZMA2_DIC_SIZE_FROM_PROP(p)`.
-const fn dic_size_from_prop(prop: u8) -> u32 {
-    (2u32 | (prop as u32 & 1)) << (prop as u32 / 2 + 11)
-}
-
-/// C: `ELzma2State`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lzma2State {
-    Control,
-    Unpack0,
-    Unpack1,
-    Pack0,
-    Pack1,
-    Prop,
-    Data,
-    DataCont,
-    Finished,
-    Error,
-}
+use frame::{
+    LZMA2_CONTROL_COPY_RESET_DIC, LZMA2_LCLP_MAX, Lzma2Frame, Lzma2State, dic_size_from_prop,
+    is_uncompressed_state,
+};
 
 /// LZMA2 decoder.
 ///
 /// C: `CLzma2Dec`.
 pub struct Lzma2Decoder {
-    state: Lzma2State,
-    control: u8,
-    need_init_level: u8,
-    unpack_size: u32,
-    pack_size: u32,
-    decoder: LzmaDec,
+    frame: Lzma2Frame,
+    pub(crate) decoder: LzmaDec,
 }
 
 impl Lzma2Decoder {
@@ -88,11 +62,7 @@ impl Lzma2Decoder {
         // sizes the probability table for the largest (lc + lp) LZMA2 allows.
         let prop = LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))?;
         let mut p = Lzma2Decoder {
-            state: Lzma2State::Control,
-            control: 0,
-            need_init_level: 0xE0,
-            unpack_size: 0,
-            pack_size: 0,
+            frame: Lzma2Frame::new(),
             decoder: LzmaDec::new(prop)?,
         };
         p.reset();
@@ -114,84 +84,13 @@ impl Lzma2Decoder {
 
     /// C: `Lzma2Dec_Init`.
     pub fn reset(&mut self) {
-        self.state = Lzma2State::Control;
-        self.need_init_level = 0xE0;
-        self.unpack_size = 0;
+        self.frame.init();
         self.decoder.init();
     }
 
     /// C: `Lzma2Dec_UpdateState`.
     fn update_state(&mut self, b: u8) -> Lzma2State {
-        match self.state {
-            Lzma2State::Control => {
-                self.control = b;
-                if b == 0 {
-                    return Lzma2State::Finished;
-                }
-                if is_uncompressed_state(b) {
-                    if b == LZMA2_CONTROL_COPY_RESET_DIC {
-                        self.need_init_level = 0xC0;
-                    } else if b > 2 || self.need_init_level == 0xE0 {
-                        return Lzma2State::Error;
-                    }
-                } else {
-                    if b < self.need_init_level {
-                        return Lzma2State::Error;
-                    }
-                    self.need_init_level = 0;
-                    self.unpack_size = u32::from(b & 0x1F) << 16;
-                }
-                Lzma2State::Unpack0
-            }
-
-            Lzma2State::Unpack0 => {
-                self.unpack_size |= u32::from(b) << 8;
-                Lzma2State::Unpack1
-            }
-
-            Lzma2State::Unpack1 => {
-                self.unpack_size |= u32::from(b);
-                self.unpack_size += 1;
-                if is_uncompressed_state(self.control) {
-                    Lzma2State::Data
-                } else {
-                    Lzma2State::Pack0
-                }
-            }
-
-            Lzma2State::Pack0 => {
-                self.pack_size = u32::from(b) << 8;
-                Lzma2State::Pack1
-            }
-
-            Lzma2State::Pack1 => {
-                self.pack_size |= u32::from(b);
-                self.pack_size += 1;
-                if self.control & 0x40 != 0 {
-                    Lzma2State::Prop
-                } else {
-                    Lzma2State::Data
-                }
-            }
-
-            Lzma2State::Prop => {
-                let mut b = b;
-                if b >= (9 * 5 * 5) {
-                    return Lzma2State::Error;
-                }
-                let lc = b % 9;
-                b /= 9;
-                let pb = b / 5;
-                let lp = b % 5;
-                if lc + lp > LZMA2_LCLP_MAX {
-                    return Lzma2State::Error;
-                }
-                self.decoder.prop.set_lclppb(lc, lp, pb);
-                Lzma2State::Data
-            }
-
-            _ => Lzma2State::Error,
-        }
+        self.frame.update_state(b, &mut self.decoder.prop)
     }
 
     /// C: `Lzma2Dec_DecodeToDic`.
@@ -207,8 +106,8 @@ impl Lzma2Decoder {
         let mut src_len = 0usize;
         *status = Status::NotSpecified;
 
-        while self.state != Lzma2State::Error {
-            if self.state == Lzma2State::Finished {
+        while self.frame.state != Lzma2State::Error {
+            if self.frame.state == Lzma2State::Finished {
                 *status = Status::FinishedWithMark;
                 return Ok(src_len);
             }
@@ -220,15 +119,15 @@ impl Lzma2Decoder {
                 return Ok(src_len);
             }
 
-            if self.state != Lzma2State::Data && self.state != Lzma2State::DataCont {
+            if self.frame.state != Lzma2State::Data && self.frame.state != Lzma2State::DataCont {
                 if src_len == in_size {
                     *status = Status::NeedsMoreInput;
                     return Ok(src_len);
                 }
                 let b = src[src_len];
                 src_len += 1;
-                self.state = self.update_state(b);
-                if dic_pos == dic_limit && self.state != Lzma2State::Finished {
+                self.frame.state = self.update_state(b);
+                if dic_pos == dic_limit && self.frame.state != Lzma2State::Finished {
                     break;
                 }
                 continue;
@@ -239,19 +138,19 @@ impl Lzma2Decoder {
                 let mut out_cur = dic_limit - dic_pos;
                 let mut cur_finish_mode = FinishMode::Any;
 
-                if out_cur >= self.unpack_size as usize {
-                    out_cur = self.unpack_size as usize;
+                if out_cur >= self.frame.unpack_size as usize {
+                    out_cur = self.frame.unpack_size as usize;
                     cur_finish_mode = FinishMode::End;
                 }
 
-                if is_uncompressed_state(self.control) {
+                if is_uncompressed_state(self.frame.control) {
                     if in_cur == 0 {
                         *status = Status::NeedsMoreInput;
                         return Ok(src_len);
                     }
 
-                    if self.state == Lzma2State::Data {
-                        let init_dic = self.control == LZMA2_CONTROL_COPY_RESET_DIC;
+                    if self.frame.state == Lzma2State::Data {
+                        let init_dic = self.frame.control == LZMA2_CONTROL_COPY_RESET_DIC;
                         self.decoder.init_dic_and_state(init_dic, false);
                     }
 
@@ -275,22 +174,22 @@ impl Lzma2Decoder {
                     p.processed_pos = p.processed_pos.wrapping_add(in_cur as u32);
 
                     src_len += in_cur;
-                    self.unpack_size -= in_cur as u32;
-                    self.state = if self.unpack_size == 0 {
+                    self.frame.unpack_size -= in_cur as u32;
+                    self.frame.state = if self.frame.unpack_size == 0 {
                         Lzma2State::Control
                     } else {
                         Lzma2State::DataCont
                     };
                 } else {
-                    if self.state == Lzma2State::Data {
-                        let init_dic = self.control >= 0xE0;
-                        let init_state = self.control >= 0xA0;
+                    if self.frame.state == Lzma2State::Data {
+                        let init_dic = self.frame.control >= 0xE0;
+                        let init_state = self.frame.control >= 0xA0;
                         self.decoder.init_dic_and_state(init_dic, init_state);
-                        self.state = Lzma2State::DataCont;
+                        self.frame.state = Lzma2State::DataCont;
                     }
 
-                    if in_cur > self.pack_size as usize {
-                        in_cur = self.pack_size as usize;
+                    if in_cur > self.frame.pack_size as usize {
+                        in_cur = self.frame.pack_size as usize;
                     }
 
                     let res = lzma_dec_decode_to_dic(
@@ -304,12 +203,12 @@ impl Lzma2Decoder {
                     let in_cur = res?;
 
                     src_len += in_cur;
-                    self.pack_size -= in_cur as u32;
+                    self.frame.pack_size -= in_cur as u32;
                     let out_cur = self.decoder.dic_pos - dic_pos;
-                    self.unpack_size -= out_cur as u32;
+                    self.frame.unpack_size -= out_cur as u32;
 
                     if *status == Status::NeedsMoreInput {
-                        if self.pack_size == 0 {
+                        if self.frame.pack_size == 0 {
                             break;
                         }
                         return Ok(src_len);
@@ -317,12 +216,12 @@ impl Lzma2Decoder {
 
                     if in_cur == 0 && out_cur == 0 {
                         if *status != Status::MaybeFinishedWithoutMark
-                            || self.unpack_size != 0
-                            || self.pack_size != 0
+                            || self.frame.unpack_size != 0
+                            || self.frame.pack_size != 0
                         {
                             break;
                         }
-                        self.state = Lzma2State::Control;
+                        self.frame.state = Lzma2State::Control;
                     }
 
                     *status = Status::NotSpecified;
@@ -331,7 +230,7 @@ impl Lzma2Decoder {
         }
 
         *status = Status::NotSpecified;
-        self.state = Lzma2State::Error;
+        self.frame.state = Lzma2State::Error;
         Err(Error::CorruptData)
     }
 
@@ -389,5 +288,106 @@ impl Lzma2Decoder {
                 });
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks for the multi-threaded decoder.
+//
+// C: `Lzma2DecMt_MtCallback_PreCode` points `t->dec.decoder.dic` straight at
+// the thread's output block and sets `dicBufSize` to the block's size, so the
+// worker decodes into the buffer that is later written out, with no copy and
+// with no dictionary of its own. `Lzma2Dec_AllocateProbs` is what it calls
+// instead of `Lzma2Dec_Allocate`, for the same reason.
+// ---------------------------------------------------------------------------
+
+impl Lzma2Decoder {
+    /// C: `Lzma2Dec_AllocateProbs`. Builds a decoder with the probability
+    /// table but no dictionary of its own; the caller supplies one per block
+    /// with [`Lzma2Decoder::set_block_dic`].
+    #[cfg(feature = "std")]
+    pub(crate) fn new_probs_only(dict_prop: u8) -> Result<Self, Error> {
+        if dict_prop > 40 {
+            return Err(Error::UnsupportedProps);
+        }
+        let dic_size = frame::dic_size_from_prop_full(dict_prop);
+        let prop = LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))?;
+        let mut p = Lzma2Decoder {
+            frame: Lzma2Frame::new(),
+            decoder: LzmaDec::new_probs_only(prop)?,
+        };
+        p.reset();
+        Ok(p)
+    }
+
+    /// Installs `buf` as this decoder's dictionary for one block and declares
+    /// the block `size` bytes long, then re-initialises the decoder.
+    ///
+    /// `buf.len()` may exceed `size`: the buffer is reused across blocks and
+    /// only ever grows, and the decoder reads and writes strictly below
+    /// `dic_buf_size`.
+    ///
+    /// C: the three assignments at the end of `Lzma2DecMt_MtCallback_PreCode`
+    /// plus the `Lzma2Dec_Init` that `..._Code` does on `needInit`.
+    #[cfg(feature = "std")]
+    pub(crate) fn set_block_dic(&mut self, buf: alloc::vec::Vec<u8>, size: usize) {
+        debug_assert!(buf.len() >= size);
+        self.decoder.dic = buf;
+        self.decoder.dic_buf_size = size;
+        self.reset();
+    }
+
+    /// Hands the block buffer back, so the caller can write it out and then
+    /// return it for the next block.
+    #[cfg(feature = "std")]
+    pub(crate) fn take_block_dic(&mut self) -> alloc::vec::Vec<u8> {
+        self.decoder.dic_buf_size = 0;
+        self.decoder.dic_pos = 0;
+        core::mem::take(&mut self.decoder.dic)
+    }
+
+    /// C: `p->decoder.dicPos`. How much of the current block has been decoded.
+    #[cfg(feature = "std")]
+    pub(crate) fn dic_pos(&self) -> usize {
+        self.decoder.dic_pos
+    }
+
+    /// C: `Lzma2Dec_DecodeToDic`, exposed for the multi-threaded decoder,
+    /// which decodes a whole block into its own dictionary and never needs the
+    /// copy-out step of [`Lzma2Decoder::decode`].
+    #[cfg(feature = "std")]
+    pub(crate) fn decode_block(
+        &mut self,
+        dic_limit: usize,
+        src: &[u8],
+        finish_mode: FinishMode,
+    ) -> Result<(usize, Status), Error> {
+        let mut status = Status::NotSpecified;
+        let read = self.decode_to_dic(dic_limit, src, finish_mode, &mut status)?;
+        Ok((read, status))
+    }
+}
+
+/// Accessors the single-threaded tail of the multi-threaded decoder needs, so
+/// that it can stream out of the dictionary the way `Lzma2Dec_Decode_ST` does
+/// instead of copying through an intermediate buffer.
+#[cfg(feature = "std")]
+impl Lzma2Decoder {
+    /// C: `p->decoder.dicBufSize`.
+    pub(crate) fn dic_buf_size(&self) -> usize {
+        self.decoder.dic_buf_size
+    }
+
+    /// C: the `if (dec->decoder.dicPos == dec->decoder.dicBufSize) dicPos = 0`
+    /// wrap of `Lzma2Dec_Decode_ST`.
+    pub(crate) fn wrap_dic_pos(&mut self) {
+        if self.decoder.dic_pos == self.decoder.dic_buf_size {
+            self.decoder.dic_pos = 0;
+        }
+    }
+
+    /// The decoded bytes between two dictionary positions.
+    pub(crate) fn dic_slice(&self, from: usize, to: usize) -> &[u8] {
+        &self.decoder.dic[from..to]
     }
 }

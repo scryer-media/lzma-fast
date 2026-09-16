@@ -48,6 +48,8 @@ mod lzma2;
 mod lzma_alone;
 
 #[cfg(feature = "std")]
+mod mt;
+#[cfg(feature = "std")]
 mod reader;
 
 pub use error::{Error, FinishMode, Progress, Status};
@@ -56,6 +58,8 @@ pub use lzma::{LzmaDecoder, LzmaProps};
 pub use lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
 pub use lzma2::Lzma2Decoder;
 
+#[cfg(feature = "std")]
+pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memory_estimate};
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 
