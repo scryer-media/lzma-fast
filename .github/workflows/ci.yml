@@ -106,8 +106,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - run: cargo test --locked --workspace --all-features --no-fail-fast
-      - name: Test without default features
+      - name: Test with the assembly decode loop (default)
+        run: cargo test --locked --workspace --all-features --no-fail-fast
+      - name: Test with the portable decode loop
+        run: cargo test --locked -p lzma-fast --no-default-features --features std --no-fail-fast
+      - name: Test without std
         run: cargo test --locked -p lzma-fast --no-default-features --no-fail-fast
 
   msrv:

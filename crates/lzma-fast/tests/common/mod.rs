@@ -34,6 +34,7 @@ pub const LZMA_VARIANTS: &[&str] = &["p1", "p9e", "lc0lp2pb0", "lc4pb1"];
 pub const XZ_VARIANTS: &[&str] = &["p1", "lc1lp1pb0"];
 
 /// Outcome of a streaming decode: the bytes and the last status seen.
+#[derive(Debug)]
 pub struct Decoded {
     pub bytes: Vec<u8>,
     pub status: Status,
@@ -42,12 +43,27 @@ pub struct Decoded {
 /// Drives [`LzmaDecoder::decode`] over a `.lzma` stream in fixed-size input
 /// and output slices, which is what makes the `tempBuf` / `TryDummy` paths run.
 pub fn decode_lzma(data: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Decoded, Error> {
+    decode_lzma_with(data, in_chunk, out_chunk, false)
+}
+
+/// As [`decode_lzma`], but `portable` forces the Rust port of the C fast loop
+/// even on a target whose build has an assembly one.
+pub fn decode_lzma_with(
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+    portable: bool,
+) -> Result<Decoded, Error> {
     if data.len() < 13 {
         return Err(Error::CorruptData);
     }
     let header: [u8; 13] = data[..13].try_into().expect("13 bytes");
     let header = LzmaAloneHeader::parse(&header)?;
-    let mut dec = LzmaDecoder::new(header.props)?;
+    let mut dec = if portable {
+        LzmaDecoder::new_portable(header.props)?
+    } else {
+        LzmaDecoder::new(header.props)?
+    };
 
     let mut input = &data[13..];
     let mut out = Vec::new();
@@ -97,7 +113,23 @@ pub fn decode_lzma2(
     in_chunk: usize,
     out_chunk: usize,
 ) -> Result<Decoded, Error> {
-    let mut dec = Lzma2Decoder::new(dict_prop)?;
+    decode_lzma2_with(dict_prop, data, in_chunk, out_chunk, false)
+}
+
+/// As [`decode_lzma2`], but `portable` forces the Rust port of the C fast
+/// loop.
+pub fn decode_lzma2_with(
+    dict_prop: u8,
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+    portable: bool,
+) -> Result<Decoded, Error> {
+    let mut dec = if portable {
+        Lzma2Decoder::new_portable(dict_prop)?
+    } else {
+        Lzma2Decoder::new(dict_prop)?
+    };
     let mut input = data;
     let mut out = Vec::new();
     let mut buf = vec![0u8; out_chunk.max(1)];

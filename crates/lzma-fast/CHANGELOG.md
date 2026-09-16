@@ -11,4 +11,11 @@
   `LzmaReader` / `Lzma2Reader` `std::io::Read` adapters behind the default
   `std` feature. The crate also builds `--no-default-features` as `no_std` +
   `alloc`.
-- No dependencies, no C, no assembly, no build script. Decode only.
+- The `asm` feature (on by default): the hand-written decode loops from the
+  SDK's `Asm/arm64/LzmaDecOpt.S` and `Asm/x86/LzmaDecOpt.asm`, translated line
+  by line into Rust `naked_asm!` and used on `aarch64` and `x86_64`. Every
+  other target, and `--no-default-features --features std`, get the portable
+  Rust port of the C loop, which stays the differential reference for the
+  assembly.
+- No dependencies, no C and no build script: the assembly is `core::arch`
+  inline assembly in the crate itself. Decode only.

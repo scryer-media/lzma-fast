@@ -4,12 +4,13 @@
 
 pub(crate) mod consts;
 pub(crate) mod decode;
+pub(crate) mod decode_opt;
 pub(crate) mod dummy;
 pub(crate) mod state;
 
 use crate::error::{Error, FinishMode, Progress, Status};
 use consts::*;
-use decode::lzma_dec_decode_real;
+use decode_opt::decode_real;
 use dummy::{Dummy, lzma_dec_try_dummy};
 pub(crate) use state::LzmaDec;
 pub use state::LzmaProps;
@@ -86,7 +87,7 @@ unsafe fn lzma_dec_decode_real2(
     {
         // SAFETY: forwarded verbatim from this function's own contract; `limit`
         // was only lowered, which keeps `p.dic_pos <= limit <= dic_buf_size`.
-        let res = unsafe { lzma_dec_decode_real(p, limit, buf_start, buf_limit) };
+        let res = unsafe { decode_real(p, limit, buf_start, buf_limit) };
         if p.check_dic_size == 0 && p.processed_pos >= p.prop.dict_size() {
             p.check_dic_size = p.prop.dict_size();
         }
@@ -378,6 +379,22 @@ impl LzmaDecoder {
         Ok(LzmaDecoder {
             p: LzmaDec::new(props)?,
         })
+    }
+
+    /// Same as [`LzmaDecoder::new`], but always runs the portable decode loop
+    /// even where an assembly one is compiled in.
+    ///
+    /// This exists so the two loops can be run against each other; there is no
+    /// reason to prefer it otherwise, and it is not part of the supported API.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaDecoder::new`].
+    #[doc(hidden)]
+    pub fn new_portable(props: LzmaProps) -> Result<Self, Error> {
+        let mut d = Self::new(props)?;
+        d.p.force_portable = true;
+        Ok(d)
     }
 
     /// The properties this decoder was built for.

@@ -138,6 +138,10 @@ pub(crate) struct LzmaDec {
     pub(crate) remain_len: u32,
     pub(crate) temp_buf_size: usize,
     pub(crate) temp_buf: [u8; LZMA_REQUIRED_INPUT_MAX],
+    /// Forces the portable decode loop even on a target that has an assembly
+    /// one. Only [`crate::LzmaDecoder::new_portable`] sets it, so that the two
+    /// loops can be run against each other in tests.
+    pub(crate) force_portable: bool,
 }
 
 impl LzmaDec {
@@ -173,6 +177,7 @@ impl LzmaDec {
             remain_len: 0,
             temp_buf_size: 0,
             temp_buf: [0; LZMA_REQUIRED_INPUT_MAX],
+            force_portable: false,
         };
         p.init();
         Ok(p)

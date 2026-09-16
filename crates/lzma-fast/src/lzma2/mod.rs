@@ -99,6 +99,19 @@ impl Lzma2Decoder {
         Ok(p)
     }
 
+    /// Same as [`Lzma2Decoder::new`], but always runs the portable decode
+    /// loop. See [`crate::LzmaDecoder::new_portable`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2Decoder::new`].
+    #[doc(hidden)]
+    pub fn new_portable(dict_prop: u8) -> Result<Self, Error> {
+        let mut d = Self::new(dict_prop)?;
+        d.decoder.force_portable = true;
+        Ok(d)
+    }
+
     /// C: `Lzma2Dec_Init`.
     pub fn reset(&mut self) {
         self.state = Lzma2State::Control;

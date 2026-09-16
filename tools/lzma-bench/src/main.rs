@@ -32,11 +32,13 @@ const HELP: &str = "\
 usage: lzma-bench [--runs N] [--no-oracles] <file.lzma|file.xz> ...
 
   --runs N       repetitions per decoder (default 3); the median is reported
-  --no-oracles   time only this crate, skip 7zz / xz / 7lzma";
+  --no-oracles   time only this crate, skip 7zz / xz / 7lzma
+  --portable     force the portable decode loop instead of the assembly one";
 
 fn main() {
     let mut runs = 3usize;
     let mut oracles = true;
+    let mut portable = false;
     let mut files: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -49,6 +51,7 @@ fn main() {
                     .unwrap_or_else(|| fail("--runs needs a number"));
             }
             "--no-oracles" | "--only-ours" => oracles = false,
+            "--portable" => portable = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 return;
@@ -63,13 +66,18 @@ fn main() {
         std::process::exit(2);
     }
 
+    let loop_name = if portable || !lzma_fast::ASM_LOOP {
+        "portable"
+    } else {
+        "asm"
+    };
     println!(
-        "lzma-bench (lzma-fast {}), {runs} run(s), median",
+        "lzma-bench (lzma-fast {}, {loop_name} loop), {runs} run(s), median",
         lzma_fast::VERSION
     );
 
     for file in &files {
-        bench_one(file, runs, oracles);
+        bench_one(file, runs, oracles, portable);
     }
 }
 
@@ -85,7 +93,7 @@ struct Run {
     crc: u32,
 }
 
-fn bench_one(path: &Path, runs: usize, oracles: bool) {
+fn bench_one(path: &Path, runs: usize, oracles: bool, portable: bool) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -94,16 +102,40 @@ fn bench_one(path: &Path, runs: usize, oracles: bool) {
         }
     };
 
+    // The decoders are interleaved, one run of each per round, rather than
+    // run in blocks. On a machine that is not idle - and this one rarely is -
+    // a block schedule charges whichever decoder happened to run during a
+    // busy stretch, and the ratio the acceptance gate is stated in is exactly
+    // the quantity that distortion moves. Interleaving spreads any load over
+    // all of them, and the median then compares like with like.
+    let cmds = if oracles {
+        oracle_commands(path)
+    } else {
+        Vec::new()
+    };
     let mut ours: Vec<Run> = Vec::new();
+    let mut oracle_times: Vec<Option<Vec<Duration>>> =
+        cmds.iter().map(|_| Some(Vec::new())).collect();
+
     for _ in 0..runs {
-        match decode_file(path, &data) {
+        match decode_file(path, &data, portable) {
             Ok(r) => ours.push(r),
             Err(e) => {
                 eprintln!("lzma-bench: {}: {e}", path.display());
                 return;
             }
         }
+        for (i, (_, cmd)) in cmds.iter().enumerate() {
+            let Some(slot) = oracle_times[i].as_mut() else {
+                continue;
+            };
+            match time_command(cmd) {
+                Some(t) => slot.push(t),
+                None => oracle_times[i] = None,
+            }
+        }
     }
+
     let bytes = ours[0].bytes;
     let crc = ours[0].crc;
     for r in &ours {
@@ -131,8 +163,8 @@ fn bench_one(path: &Path, runs: usize, oracles: bool) {
 
     let mut baseline: Option<Duration> = None;
     let mut c_baseline: Option<Duration> = None;
-    for (label, cmd) in oracle_commands(path) {
-        let Some(times) = time_command(&cmd, runs) else {
+    for (i, (label, _)) in cmds.iter().enumerate() {
+        let Some(times) = oracle_times[i].take() else {
             println!("  {label:<28} {:>9}", "n/a");
             continue;
         };
@@ -143,7 +175,7 @@ fn bench_one(path: &Path, runs: usize, oracles: bool) {
         if label.starts_with("7lzma") {
             c_baseline = Some(t);
         }
-        print_row(&label, t, bytes);
+        print_row(label, t, bytes);
     }
 
     if let Some(b) = c_baseline {
@@ -185,30 +217,40 @@ fn human(n: u64) -> String {
 // Decoding
 // ---------------------------------------------------------------------------
 
-fn decode_file(path: &Path, data: &[u8]) -> Result<Run, String> {
+fn decode_file(path: &Path, data: &[u8], portable: bool) -> Result<Run, String> {
     match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "lzma" => decode_lzma1(data),
-        "xz" => decode_lzma2(data),
+        "lzma" => decode_lzma1(data, portable),
+        "xz" => decode_lzma2(data, portable),
         ext => Err(format!("unsupported input extension {ext:?}")),
     }
 }
 
-fn decode_lzma1(data: &[u8]) -> Result<Run, String> {
+fn decode_lzma1(data: &[u8], portable: bool) -> Result<Run, String> {
     if data.len() < 13 {
         return Err("truncated .lzma header".into());
     }
     let header: [u8; 13] = data[..13].try_into().unwrap();
     let header = LzmaAloneHeader::parse(&header).map_err(|e| e.to_string())?;
-    let mut dec = LzmaDecoder::new(header.props).map_err(|e| e.to_string())?;
+    let mut dec = if portable {
+        LzmaDecoder::new_portable(header.props)
+    } else {
+        LzmaDecoder::new(header.props)
+    }
+    .map_err(|e| e.to_string())?;
     drive(&data[13..], &mut crc_sink(), |input, out| {
         dec.decode(input, out, FinishMode::Any)
             .map_err(|e| e.to_string())
     })
 }
 
-fn decode_lzma2(data: &[u8]) -> Result<Run, String> {
+fn decode_lzma2(data: &[u8], portable: bool) -> Result<Run, String> {
     let (dict_prop, payload) = xz_lzma2_block(data).ok_or("not a single-block LZMA2 .xz")?;
-    let mut dec = Lzma2Decoder::new(dict_prop).map_err(|e| e.to_string())?;
+    let mut dec = if portable {
+        Lzma2Decoder::new_portable(dict_prop)
+    } else {
+        Lzma2Decoder::new(dict_prop)
+    }
+    .map_err(|e| e.to_string())?;
     drive(payload, &mut crc_sink(), |input, out| {
         dec.decode(input, out, FinishMode::Any)
             .map_err(|e| e.to_string())
@@ -349,23 +391,16 @@ fn reference_c_decoder() -> Option<String> {
     p.exists().then(|| p.display().to_string())
 }
 
-fn time_command(cmd: &[String], runs: usize) -> Option<Vec<Duration>> {
-    let mut out = Vec::new();
-    for _ in 0..runs {
-        let t0 = Instant::now();
-        let status = Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok()?;
-        let dt = t0.elapsed();
-        if !status.success() {
-            return None;
-        }
-        out.push(dt);
-    }
-    (!out.is_empty()).then_some(out)
+fn time_command(cmd: &[String]) -> Option<Duration> {
+    let t0 = Instant::now();
+    let status = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    let dt = t0.elapsed();
+    status.success().then_some(dt)
 }
 
 // ---------------------------------------------------------------------------

@@ -12,8 +12,12 @@ categories = ["compression", "no-std"]
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
 [features]
-default = ["std"]
+default = ["std", "asm"]
 std = []
+# The hand-written decode loops ported from the LZMA SDK's Asm/ tree, used on
+# aarch64 and x86_64. Turning it off falls back to the portable Rust port of
+# the C loop, which is what every other target gets anyway.
+asm = []
 
 [dependencies]
 

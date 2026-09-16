@@ -4,7 +4,8 @@
 [![docs.rs](https://docs.rs/lzma-fast/badge.svg)](https://docs.rs/lzma-fast)
 
 LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for
-its speed. No C bindings, no assembly, no encoder.
+its speed, including its hand-written `aarch64` and `x86_64` decode loops. No
+C bindings, no build script, no encoder.
 
 ```toml
 [dependencies]
@@ -27,6 +28,13 @@ function by function from the reference decoder. It is byte-identical to
 `xz -dc` on the repository's fixtures (256 MiB LZMA1, 1 GiB LZMA1, 256 MiB
 LZMA2) and on the committed vectors, including non-default `lc`/`lp`/`pb`, and
 it is fuzzed for panics and out-of-bounds reads.
+
+On `aarch64` and `x86_64` the inner loop is 7-Zip's own assembly, translated
+into Rust inline assembly and selected by the default `asm` feature; turning
+that feature off (`--no-default-features --features std`) falls back to the
+portable Rust port of the C loop, which is what every other target uses. Both
+paths are held to the same tests, and a differential test decodes every vector
+with each and compares.
 
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](../../docs/perf-log.md);
