@@ -116,8 +116,16 @@ fn arbitrary_bytes_never_panic() {
         for b in &mut data {
             *b = rng.next() as u8;
         }
+        // Keep the dictionary small. A random header asks for a random
+        // `dicSize` up to 4 GiB, and a decoder allocates it before it can
+        // reject anything; 2000 of those is an out-of-memory test, not a
+        // robustness one. The same clamp is in the fuzz targets.
+        if data.len() >= 13 {
+            data[3] = 0;
+            data[4] = 0;
+        }
         let _ = decode_lzma(&data, usize::MAX, 4096);
-        let _ = decode_lzma2((rng.next() % 41) as u8, &data, usize::MAX, 4096);
+        let _ = decode_lzma2((rng.next() % 21) as u8, &data, usize::MAX, 4096);
     }
 }
 
