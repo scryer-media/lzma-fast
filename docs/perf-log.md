@@ -223,3 +223,196 @@ gcc 15 compiling that inner loop about twice as badly as clang does. It is
 worth recording because it makes "within 3% of 7-Zip" and "2x the reference C
 decoder" the same sentence on this box, and only the first of those is a claim
 about this crate.
+
+## LZMA2 MT
+
+The multi-threaded LZMA2 decoder (`Lzma2ParallelDecoder`, the port of
+`C/Lzma2DecMt.c` over `C/MtDec.c`). Commits on `feature/lzma2-mt`: `3ecfa1f`
+the MtDec/Lzma2DecMt port, `eedde6b` the run scanner, `a9efe4a` the adaptive
+decoder, `5420779` and `161db14` the crypto trim and backend swap, `81c1de8` the
+harness and `48a9a48` the fuzz target. The numbers below were taken with
+the working tree at `161db14` plus the `std` gating fix that follows it,
+which touches no decode path.
+
+Fixtures: `mt.7z` and `st.7z` are the same 1 GiB payload, encoded by `7zz`
+with `-mx5 -m0=lzma2` and `-mmt=on` / `-mmt=1`. Both are single-file,
+single-folder archives, so the raw LZMA2 stream is one byte range; the
+dictionary property byte (26, a 32 MiB dictionary, which `7zz l -slt` renders
+as `LZMA2:25`) comes from the archive's own coder properties rather than from
+that rendered string. `lzma-bench --index` prints what the encoder actually
+produced:
+
+| fixture | runs | unpacked per run |
+| --- | --- | --- |
+| `mt.7z` | 8 | 128 MiB |
+| `st.7z` | 1 | 1 GiB |
+
+**Eight runs is the ceiling.** A run is what is independently decodable, so
+`mt.7z` cannot use more than eight threads no matter how many are asked for,
+and both this crate and `7zz` stop scaling at eight. `st.7z` has one run, so
+the parallel decoder has to notice that and decode it single-threaded,
+streaming, without buffering the gigabyte.
+
+### macOS, Apple M5 Max
+
+`cargo run --release -p lzma-bench -- --runs 3 --threads sweep`, median of 3,
+interleaved with the oracles. `7zz` 26.01. Load average 3.5 (a stray debug
+test binary from an earlier session was pinned to a core throughout and could
+not be killed from this session; it is one of eighteen, and it is charged to
+every decoder equally by the interleaving).
+
+`mt.7z` (8 runs), ours against `7zz t -mmt=N` and lzma-rust2 0.20.1's
+`Lzma2ReaderMt` at the same thread count:
+
+| threads | ours | MiB/s | peak RAM | `7zz t -mmt=N` | lzma-rust2 | vs 7zz | vs lzma-rust2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 14.928 s | 68.6 | 33.0 MiB | 15.051 s | 24.252 s | **0.992** | **0.616** |
+| 2 | 7.512 s | 136.3 | 481.3 MiB | 7.566 s | 24.234 s | **0.993** | **0.310** |
+| 4 | 3.859 s | 265.4 | 962.1 MiB | 3.876 s | 24.220 s | **0.996** | **0.159** |
+| 8 | 2.098 s | 488.0 | 1.9 GiB | 2.095 s | 24.220 s | **1.002** | **0.087** |
+| 16 | 2.077 s | 493.1 | 1.9 GiB | 2.103 s | 24.629 s | **0.988** | **0.084** |
+| 18 (all) | 2.087 s | 490.7 | 1.9 GiB | 2.095 s | 24.462 s | **0.996** | **0.085** |
+
+lzma-rust2's peak was 610.9 MiB at every thread count, and its time did not
+move with the thread count at all: it decodes this stream at one thread's
+speed whatever it is asked for.
+
+`st.7z` (1 run) — the no-overhead check. The parallel decoder must fall back
+to the single-threaded path and pay nothing for having been asked for threads:
+
+| threads | ours | peak RAM | `7zz t -mmt=N` | lzma-rust2 | vs 7zz | vs lzma-rust2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 15.062 s | 33.0 MiB | 15.150 s | 24.665 s | **0.994** | 0.611 |
+| 2 | 15.035 s | 144.3 MiB | 15.064 s | 24.329 s | **0.998** | 0.618 |
+| 4 | 15.059 s | 144.3 MiB | 16.009 s | 25.357 s | **0.941** | 0.594 |
+| 8 | 15.157 s | 144.3 MiB | 15.166 s | 24.566 s | **0.999** | 0.617 |
+| 16 | 14.890 s | 144.3 MiB | 15.005 s | 24.144 s | **0.992** | 0.617 |
+| 18 (all) | 14.965 s | 144.3 MiB | 15.090 s | 24.226 s | **0.992** | 0.618 |
+
+144.3 MiB is what the threaded pass has allocated by the time the parse tells
+it there is no second run: one thread's input chain and the 32 MiB dictionary
+the single-threaded tail then runs with. lzma-rust2 buffers the whole run and
+peaks at 2.8 GiB — a 19x difference on the case a chasing consumer meets most.
+
+### The single-threaded gate, re-measured
+
+Same session, same machine, `--runs 3`:
+
+| fixture | ours | `7zz t -mmt=1` | `7lzma d` (C) | `xz -T1` | vs 7zz |
+| --- | --- | --- | --- | --- | --- |
+| `p256.bin.lzma` | 3.729 s | 3.728 s | 5.614 s | 5.799 s | **1.000** |
+| `payload.bin.lzma` | 14.872 s | 14.886 s | 22.504 s | 23.095 s | **0.999** |
+| `p256.bin.xz` (LZMA2) | 3.723 s | 3.805 s | n/a | 6.003 s | **0.978** |
+
+The gate still holds, and on this run all three are at or on the fast side of
+parity.
+
+### What mattered
+
+Nothing in the decoder. The first complete measurement had the parallel path
+at 1.10 of `7zz` at eight threads and above, while being at 1.02 at one and
+two — an overhead that grew with the thread count, which is the signature of a
+serial section rather than of slow decoding.
+
+Instrumenting the ring's five phases (wait for the read token, read and parse,
+decode, wait for the write token, write) settled it in one run. Summed over
+eight threads of a 2.35 s decode: decode 15.74 s, wait-read 1.28 s, wait-write
+1.03 s, **write 0.37 s**, read and parse 0.07 s. The write is the only
+serialised section in the ring — one thread holds the write token at a time —
+and 0.37 s of it against a 2.35 s wall is 16%, with the wait-write column
+being the other threads queued behind it.
+
+That 0.37 s was the **benchmark harness's own CRC32**, a slicing-by-8 table
+implementation, running inside the sink. `7zz t` checksums its output too, but
+with a fast one. Replacing the harness's CRC with the crate's `crc-fast` one
+took the eight-thread figure from 2.336 s to 2.078 s and the ratio from 1.097
+to 0.993, with no change to the decoder at all.
+
+Two things follow, and the second is the reason this is written down.
+Measuring a push decoder charges the sink to the decoder, so the sink has to
+be as fast as the oracle's; and the expected culprits from the brief — output
+copy on the writer thread, the parser starving workers, allocation per run,
+channel wakeups per chunk — were all absent from the profile. Read and parse
+was 0.4% of thread time. A tried change to allocate the ring's buffers with
+`calloc` semantics instead of `try_reserve` + `resize` (saving a memset of
+every input buffer and every output block) moved the eight-thread time by
+nothing at all, 2.336 s to 2.336 s, and was reverted rather than kept: it
+bought an `unsafe` block for no measurement.
+
+### linux-x86_64 (x86-box)
+
+Same commits, same harness, `--runs 3`, on the x86_64 bench box:
+`12th Gen Intel(R) Core(TM) i5-1240P`, 16 logical CPUs, Ubuntu 26.04.1. The
+box was idle before the series (load average 0.5) and nothing was left running
+after it. `7zz` is `bin-asm/7zz`, the reference tree built with
+`-DZ7_LZMA_DEC_OPT` and `Asm/x86/LzmaDecOpt.asm` — see the note above about
+why a stock `makefile.gcc` build is not the right oracle. Fixtures were
+regenerated on the box, so their CRCs differ from the macOS tables; the run
+layout is identical (8 runs of 128 MiB in `mt.7z`, 1 in `st.7z`).
+
+This is an Alder Lake-P part: 4 P-cores with SMT on CPUs 0-7, 8 E-cores on
+CPUs 8-15. Both lanes are recorded, because on this machine they say different
+things.
+
+`mt.7z`, **unpinned** (what an application gets):
+
+| threads | ours | MiB/s | peak RAM | `7zz t -mmt=N` | lzma-rust2 | vs 7zz | vs lzma-rust2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 20.397 s | 50.2 | 33.0 MiB | 20.511 s | 29.615 s | **0.994** | **0.689** |
+| 2 | 10.816 s | 94.7 | 481.3 MiB | 10.753 s | 29.216 s | **1.006** | **0.370** |
+| 4 | 6.535 s | 156.7 | 962.1 MiB | 6.515 s | 29.254 s | **1.003** | **0.223** |
+| 8 | 4.257 s | 240.5 | 1.9 GiB | 3.921 s | 29.297 s | 1.086 | **0.145** |
+| 16 (all) | 4.167 s | 245.7 | 1.9 GiB | 3.943 s | 29.040 s | 1.057 | **0.143** |
+
+`mt.7z`, **pinned to the P-cores** (`taskset -c 0-7`, ours and every oracle
+alike):
+
+| threads | ours | MiB/s | `7zz t -mmt=N` | lzma-rust2 | vs 7zz | vs lzma-rust2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 19.764 s | 51.8 | 20.085 s | 28.616 s | **0.984** | **0.691** |
+| 2 | 10.385 s | 98.6 | 10.653 s | 28.605 s | **0.975** | **0.363** |
+| 4 | 6.394 s | 160.2 | 6.388 s | 28.598 s | **1.001** | **0.224** |
+| 8 | 4.332 s | 236.4 | 4.141 s | 28.596 s | **1.046** | **0.151** |
+
+`st.7z`, the no-overhead check, unpinned and pinned:
+
+| lane | threads | ours | peak RAM | `7zz t -mmt=N` | vs 7zz |
+| --- | --- | --- | --- | --- | --- |
+| unpinned | 1 | 19.739 s | 33.0 MiB | 20.034 s | **0.985** |
+| unpinned | 4 | 19.798 s | 144.3 MiB | 20.072 s | **0.986** |
+| unpinned | 16 | 19.817 s | 144.3 MiB | 20.041 s | **0.989** |
+| `-c 0-7` | 1 | 19.758 s | 33.0 MiB | 20.024 s | **0.987** |
+| `-c 0-7` | 8 | 19.812 s | 144.3 MiB | 19.996 s | **0.991** |
+
+The single-threaded gate, re-measured in the same series with `taskset -c 0-5`
+as the tables above it use:
+
+| fixture | ours | `7zz t -mmt=1` | `7lzma d` (C) | `xz -T1` | vs 7zz |
+| --- | --- | --- | --- | --- | --- |
+| `p256.bin.lzma` | 4.856 s | 4.921 s | 10.347 s | 5.122 s | **0.987** |
+| `payload.bin.lzma` | 19.551 s | 19.614 s | 41.183 s | 20.481 s | **0.997** |
+| `p256.bin.xz` (LZMA2) | 4.870 s | 5.101 s | n/a | 5.148 s | **0.955** |
+
+**The two rows that miss the gate, and why.** Unpinned at 8 and 16 threads
+this crate is 8.6% and 5.7% behind `7zz`, while every other row on this box —
+and every row on the Mac — is inside 5%, most of them on the fast side. The
+pinned lane at 8 threads is 1.046, inside it.
+
+`mt.7z` has exactly 8 runs, and the ring gives each worker one of them, so the
+decode finishes when the *slowest* worker finishes. On a hybrid part a worker
+that lands on an E-core takes about 1.7x as long as one on a P-core, and with
+eight equal 128 MiB blocks and no way to shed work, that worker sets the wall
+clock. Both decoders are exposed to this identically — it is the same
+structure in both, and `7zz` also stops scaling past 8 — so what is being
+measured in those two rows is which process the kernel's placement happened to
+favour, over a window the size of one block. Pinning removes the asymmetry and
+the difference goes with it. It is recorded rather than explained away because
+it is what an application on this machine will see, and the honest statement
+is: on a homogeneous machine this crate is at parity with 7-Zip across the
+whole curve, and on a hybrid one the 8-thread point depends on core placement
+to the tune of a few per cent in either direction.
+
+Note the `7lzma` column, as in the single-threaded table above it: gcc 15
+compiles the reference C loop about twice as badly here as clang does on the
+Mac, so "within 3% of 7-Zip" and "2.1x the reference C decoder" are the same
+sentence on this box. Only the first is a claim about this crate.

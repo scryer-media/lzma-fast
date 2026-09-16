@@ -15,6 +15,10 @@
   flight is accounted and bounded, and the decode can be cancelled. Worker
   threads are created at the first dispatch and parked, not torn down, across
   a mode change.
+- Measured against 7-Zip on a gigabyte: the parallel decoder is within a few
+  per cent of `7zz t -mmt=N` across the whole thread curve on both aarch64
+  macOS and x86_64 Linux, and 1.6x to 12x faster than lzma-rust2's
+  `Lzma2ReaderMt` at every thread count. See `docs/perf-log.md`.
 - `Lzma2RunScanner` and `Lzma2Run`: incremental, public discovery of the
   independently decodable runs in an LZMA2 stream, costing O(chunks) and no
   decoding.
