@@ -13,12 +13,27 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 
 [features]
 default = ["std", "asm"]
-std = []
+std = ["crc-fast?/std"]
 # The hand-written decode loops ported from the LZMA SDK's Asm/ tree, used on
 # aarch64 and x86_64. Turning it off falls back to the portable Rust port of
 # the C loop, which is what every other target gets anyway.
 asm = []
+# CRC-32 (the 7z checksum) and CRC-64/XZ (the xz one), from `crc-fast`, which
+# uses the carry-less multiply units. Needed by container readers, never by
+# the decoder itself.
+crc = ["std", "dep:crc-fast"]
+# SHA-256 and unpadded AES-256-CBC decryption, as 7-Zip's `7zAes.c` uses them.
+# The default backend is RustCrypto; `aws-lc` adds the AWS-LC one and takes
+# precedence when both are on. The features are additive: either, or both,
+# builds and passes the same tests.
+crypto = ["dep:sha2", "dep:aes", "dep:cbc"]
+aws-lc = ["std", "dep:aws-lc-rs"]
 
 [dependencies]
+aes = { version = "0.9.3", default-features = false, optional = true }
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+cbc = { version = "0.2.1", default-features = false, optional = true }
+crc-fast = { version = "1.10.0", default-features = false, optional = true }
+sha2 = { version = "0.11.0", default-features = false, optional = true }
 
 [dev-dependencies]

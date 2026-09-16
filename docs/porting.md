@@ -84,3 +84,64 @@ Single-threaded decode wall time on `bench/fixtures/*.lzma` and the
 same file on the same idle machine. Until the port is at parity with the C
 fast loop (`7lzma d`, no asm), the 3% number against `7zz` is not the
 question; get to C parity first, then close on the asm.
+
+## The container layer
+
+The decoder is deliberately format-free: it decodes raw LZMA1 and raw LZMA2
+and knows nothing about the files those streams arrive in. The layer above it
+is not written yet; this section fixes its shape so that when it is, it is
+ported from the same tree with the same discipline.
+
+Two things that layer needs first, and which the crate already has: the
+checksums in [`crate::crc`] (`crc` feature, `crc-fast`) and the cryptography
+in [`crate::crypto`] (`crypto` / `aws-lc` features). Both are optional, off by
+default, and unreachable from the decoder.
+
+### xz
+
+C: `C/Xz.h`, `C/XzIn.c`, `C/XzDec.c`.
+
+A stream is a 12-byte header (magic `FD 37 7A 58 5A 00`, then two flag bytes
+whose low nibble is the check type and whose CRC-32 covers the pair), a series
+of blocks, an index, and a 12-byte footer. A block is a header naming one to
+four filters — for this crate the only interesting chain is a single LZMA2
+filter, id `0x21`, whose one property byte is the dictionary size — followed
+by the filter output, padding to a multiple of four, and the check. The check
+is CRC-32, CRC-64/XZ or SHA-256 depending on the stream flags, or absent.
+`tests/common/mod.rs` already contains the minimum of this reader, in the
+strictest possible form: it rejects everything it does not understand rather
+than guessing, and the real one should keep that habit.
+
+The index is what makes random access possible: it records, for every block,
+the compressed and uncompressed size, so a reader can seek to a block boundary
+without decoding what precedes it. The footer repeats the index size and its
+CRC-32 so the index can be found from the end of the file.
+
+### 7z
+
+C: `C/7zIn.c` (header), `C/7zDec.c` (folder decoding), `C/7zAes.c`
+(encryption), driven by `C/7zArcIn.c`.
+
+A `.7z` file is a 32-byte signature header pointing at an encoded header at
+the end of the file, which is itself often a compressed stream that must be
+decoded before it can be parsed. The parsed header describes *folders*: a
+folder is a small dataflow graph of coders (LZMA, LZMA2, BCJ, delta, AES, …)
+with bind pairs joining outputs to inputs, packed streams feeding the leaves,
+and one unpacked stream coming out. `7zDec.c`'s `SzFolder_Decode` is the
+function to port, and its shape — decode the coder chain from the outside in,
+one folder at a time, with the substream sizes and CRCs applied afterwards —
+is the shape to keep.
+
+Encryption is coder id `06F10701`: AES-256-CBC over the folder's packed
+stream, with the key derived from the UTF-16LE password and the coder's salt
+by the iterated SHA-256 in `7zAes.c`. [`crate::crypto::sevenz_key`] is that
+derivation, and [`crate::crypto::Aes256Cbc`] is the unpadded CBC the folder
+needs; the reader has only to feed them. Note the two special cycle counts
+(`0x3F` means the salt and password *are* the key; `0x40` and above are
+rejected), because they are easy to miss and impossible to guess from a
+stream.
+
+None of this is implemented. When it is: the same rules as the decoder — port
+rather than redesign, cite the C function, prove it differentially against
+`7zz x` and `xz -dc`, and keep it behind features so that a caller who only
+wants raw LZMA still gets a crate with no dependencies.

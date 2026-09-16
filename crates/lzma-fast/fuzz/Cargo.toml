@@ -9,7 +9,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-lzma-fast = { path = ".." }
+lzma-fast = { path = "..", default-features = false }
+
+# The fuzz targets run against both decode loops: the default carries the
+# crate's own defaults (assembly where there is one), and `--no-default-
+# features --features portable` fuzzes the portable Rust loop.
+[features]
+default = ["lzma-fast/default"]
+portable = ["lzma-fast/std"]
 
 [[bin]]
 name = "decode_lzma"

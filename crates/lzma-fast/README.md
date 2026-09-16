@@ -40,6 +40,24 @@ Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](../../docs/perf-log.md);
 see [docs/porting.md](../../docs/porting.md) for the plan.
 
+## Features
+
+| feature | default | what it adds |
+| --- | --- | --- |
+| `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
+| `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
+| `crc` | no | CRC-32 and CRC-64/XZ, from `crc-fast` |
+| `crypto` | no | SHA-256, unpadded AES-256-CBC and the 7z key derivation, from RustCrypto |
+| `aws-lc` | no | the same crypto API over `aws-lc-rs`, taking precedence over `crypto` |
+
+The decoder itself has no dependencies under any combination of these; `crc`
+and `crypto` exist for the container layer described in
+[docs/porting.md](../../docs/porting.md), and nothing in `src/lzma/` or
+`src/lzma2/` can reach them.
+
+`aws-lc` builds AWS-LC, which needs a C toolchain and CMake; `crypto` needs
+neither and works wherever the decoder does.
+
 ## Provenance and license
 
 The decoder is derived from `C/LzmaDec.c` and `C/Lzma2Dec.c` in the

@@ -19,8 +19,14 @@ the reference decoder. Readability that costs throughput is not wanted.
 3. `unsafe` is allowed where the C relies on the margin invariant, and only
    there. Every `unsafe` block carries a `// SAFETY:` comment stating the
    invariant that makes it sound and which check established it.
-4. No new dependencies in `crates/lzma-fast`. Dev-dependencies and the bench
-   tool may pull what they need.
+4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
+   everything they reach must build from `core` and `alloc` alone. The only
+   library dependencies the crate may take are `crc-fast`, behind the `crc`
+   feature, and the crypto backends — `sha2`/`aes`/`cbc` behind `crypto`,
+   `aws-lc-rs` behind `aws-lc` — all optional, all off by default, and all
+   confined to `src/crc.rs` and `src/crypto/`. Anything else needs a decision
+   from the maintainer, not from an agent. Dev-dependencies and the bench tool
+   may pull what they need.
 5. Correctness is proven differentially: decoded bytes must equal what
    `xz -dc` / `7zz` produce for the same input, byte for byte, and malformed
    input must return an error rather than panic or read out of bounds.

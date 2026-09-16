@@ -55,6 +55,11 @@ pub use lzma2::Lzma2Decoder;
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 
+#[cfg(feature = "crc")]
+pub mod crc;
+#[cfg(any(feature = "crypto", feature = "aws-lc"))]
+pub mod crypto;
+
 /// Whether this build decodes with the assembly loop ported from the LZMA
 /// SDK's `Asm/` tree rather than with the portable Rust port of the C loop.
 /// False without the `asm` feature and on every target that has no such loop.

@@ -107,11 +107,19 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Test with the assembly decode loop (default)
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: cargo test --locked --workspace --no-fail-fast
+      - name: Test the checksum and crypto modules
+        run: cargo test --locked -p lzma-fast --features crc,crypto --no-fail-fast
       - name: Test with the portable decode loop
         run: cargo test --locked -p lzma-fast --no-default-features --features std --no-fail-fast
       - name: Test without std
         run: cargo test --locked -p lzma-fast --no-default-features --no-fail-fast
+      # aws-lc-rs builds AWS-LC, which needs CMake; it is present on the Linux
+      # and macOS runners and not on the Windows one, so that lane is skipped
+      # there rather than given a toolchain this crate does not otherwise need.
+      - name: Test the AWS-LC crypto backend
+        if: matrix.platform != 'windows-x86_64'
+        run: cargo test --locked -p lzma-fast --features crc,crypto,aws-lc --no-fail-fast
 
   msrv:
     name: msrv

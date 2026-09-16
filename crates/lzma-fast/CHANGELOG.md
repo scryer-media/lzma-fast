@@ -17,5 +17,12 @@
   other target, and `--no-default-features --features std`, get the portable
   Rust port of the C loop, which stays the differential reference for the
   assembly.
-- No dependencies, no C and no build script: the assembly is `core::arch`
+- Optional, off-by-default support for what a container reader around LZMA
+  needs: `crc` gives CRC-32 and CRC-64/XZ from `crc-fast`, and `crypto` gives
+  SHA-256, unpadded AES-256-CBC and the 7z key derivation from `7zAes.c`. The
+  crypto backend is RustCrypto (`sha2`, `aes`, `cbc`) by default; the `aws-lc`
+  feature adds an `aws-lc-rs` one and takes precedence when both are enabled.
+  The features are additive, and with both backends compiled a test requires
+  them to agree.
+- No dependencies in the decoder itself, no C and no build script: the assembly is `core::arch`
   inline assembly in the crate itself. Decode only.
