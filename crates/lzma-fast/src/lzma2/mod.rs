@@ -20,6 +20,7 @@
 
 pub(crate) mod frame;
 pub(crate) mod parse;
+pub mod scan;
 
 use crate::error::{Error, FinishMode, Progress, Status};
 use crate::lzma::consts::LZMA_DIC_MIN;
