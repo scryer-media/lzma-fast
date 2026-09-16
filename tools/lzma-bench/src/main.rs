@@ -34,15 +34,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use lzma_fast::{
-    FinishMode, Lzma2Decoder, Lzma2MtOptions, Lzma2ParallelDecoder, LzmaAloneHeader, LzmaDecoder,
-    Status,
+    Checksum, ChecksumPlan, FinishMode, Lzma2Decoder, Lzma2MtOptions, Lzma2ParallelDecoder,
+    LzmaAloneHeader, LzmaDecoder, Status,
 };
 
 const OUT_CHUNK: usize = 1 << 20;
 const REFERENCE_C_DECODER: &str = "supporting-codebases/7zip/C/Util/Lzma/_o/7lzma";
 
 const HELP: &str = "\
-usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] <file> ...
+usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <file> ...
 
   inputs         .lzma, .xz, or a single-folder LZMA2 .7z
   --runs N       repetitions per decoder (default 3); the median is reported
@@ -52,7 +52,13 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] <file> ...
                  which is what bounds how far the parallel decode can scale
   --threads LIST multi-threaded LZMA2: a comma-separated list of thread counts,
                  where \"all\" means this machine's available parallelism.
-                 \"--threads sweep\" is shorthand for 1,2,4,8,16,all";
+                 \"--threads sweep\" is shorthand for 1,2,4,8,16,all
+  --checksum K   have the decoder's own workers checksum their output:
+                 none (default), crc32, crc64 or sha256. The CRCs are cut into
+                 segments every 16 MiB, so the row also shows what splitting
+                 costs. This is the measurement that matters for a consumer:
+                 a checksum computed by the worker is parallel, one computed
+                 by the sink runs inside the ring's serialised write section.";
 
 fn main() {
     let mut runs = 3usize;
@@ -60,6 +66,7 @@ fn main() {
     let mut portable = false;
     let mut threads: Vec<usize> = Vec::new();
     let mut index = false;
+    let mut checksum = Checksum::None;
     let mut files: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -74,6 +81,18 @@ fn main() {
             "--no-oracles" | "--only-ours" => oracles = false,
             "--portable" => portable = true,
             "--index" => index = true,
+            "--checksum" => {
+                let v = args
+                    .next()
+                    .unwrap_or_else(|| fail("--checksum needs a kind"));
+                checksum = match v.as_str() {
+                    "none" => Checksum::None,
+                    "crc32" => Checksum::Crc32,
+                    "crc64" | "crc64xz" => Checksum::Crc64Xz,
+                    "sha256" => Checksum::Sha256,
+                    other => fail(&format!("unknown checksum {other}")),
+                };
+            }
             "--threads" => {
                 let v = args
                     .next()
@@ -110,7 +129,7 @@ fn main() {
         } else if threads.is_empty() {
             bench_one(file, runs, oracles, portable);
         } else {
-            bench_mt(file, runs, oracles, &threads);
+            bench_mt(file, runs, oracles, &threads, checksum);
         }
     }
 }
@@ -577,7 +596,7 @@ struct MtRun {
     crc: u32,
 }
 
-fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize]) {
+fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize], checksum: Checksum) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -616,7 +635,7 @@ fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize]) {
         let mut sevenz: Option<Vec<Duration>> = sevenz_oracle.then(Vec::new);
 
         for _ in 0..runs {
-            match mt_decode(dict_prop, payload, t) {
+            match mt_decode(dict_prop, payload, t, checksum) {
                 Ok(r) => ours.push(r),
                 Err(e) => {
                     eprintln!("lzma-bench: {} at {t} threads: {e}", path.display());
@@ -697,7 +716,17 @@ fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize]) {
     println!("  (ratios are ours/oracle; below 1.000 means lzma-fast is faster)");
 }
 
-fn mt_decode(dict_prop: u8, payload: &[u8], threads: usize) -> Result<MtRun, String> {
+/// One segment per 16 MiB, so a checksummed run is also a segmented one: the
+/// row is meant to answer "what does asking for per-file CRCs cost?", and a
+/// single segment per 128 MiB block would not.
+const SPLIT_STRIDE: u64 = 16 << 20;
+
+fn mt_decode(
+    dict_prop: u8,
+    payload: &[u8],
+    threads: usize,
+    checksum: Checksum,
+) -> Result<MtRun, String> {
     let opts = Lzma2MtOptions {
         threads,
         memory_limit: u64::MAX,
@@ -706,7 +735,23 @@ fn mt_decode(dict_prop: u8, payload: &[u8], threads: usize) -> Result<MtRun, Str
     let mut sink = CrcWriter::new();
     let base = alloc_watch_reset();
     let t0 = Instant::now();
-    let bytes = dec.decode(payload, &mut sink).map_err(|e| e.to_string())?;
+    let bytes = if checksum == Checksum::None {
+        dec.decode(payload, &mut sink).map_err(|e| e.to_string())?
+    } else {
+        let plan = ChecksumPlan::new(checksum)
+            .with_split_points((1..).map(|i| i * SPLIT_STRIDE).take_while(|&p| p < 1 << 31));
+        let (n, checks) = dec
+            .decode_checksummed(payload, &mut sink, &plan)
+            .map_err(|e| e.to_string())?;
+        // Fold on the caller's thread, as a consumer would, so the cost of
+        // that is in the measurement too.
+        let mut segs = 0usize;
+        for c in &checks {
+            segs += c.segments.len();
+        }
+        let _ = segs;
+        n
+    };
     let time = t0.elapsed();
     Ok(MtRun {
         time,
