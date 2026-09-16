@@ -90,3 +90,78 @@ the same step; on their own they were worth nothing measurable on this payload
 (50.1 vs 48.1 MiB/s is inside the noise), because a payload that compresses to
 0.88 is nearly all literals. They are kept for shape consistency and for
 match-heavy inputs.
+
+## Step 2: the SDK's own assembly loop
+
+Commit `da2e5dd` (`feat(lzma): decode with the SDK's hand-written aarch64 and
+x86_64 loops`),
+`cargo run --release -p lzma-bench -- --runs 5`, load average around 3.
+
+The harness changed with this step: it now **interleaves** decoders, running
+one timed run of each per round instead of all N runs of one decoder before
+moving to the next. On a shared machine a block schedule gives whichever
+decoder happened to run during a quiet minute an advantage that no number of
+repetitions removes, because the median is taken within the block. Round-robin
+spreads the same load over every decoder. This is why the `7zz` column moves
+between the tables below and the ones above.
+
+| fixture | ours (asm) | ours (portable) | `7lzma d` (C) | `7zz t -mmt=1` (asm) | `xz -T1` | asm vs 7zz |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p256.bin.lzma` | 3.746 s | 5.126 s | 5.680 s | 3.771 s | 5.868 s | **0.993** |
+| `payload.bin.lzma` | 15.248 s | 20.376 s | 22.726 s | 15.032 s | 23.339 s | **1.014** |
+| `p256.bin.xz` (LZMA2) | 3.748 s | 5.109 s | n/a | 3.834 s | 6.059 s | **0.978** |
+
+That is the acceptance gate: 0.978, 0.993 and 1.014 against `7zz t -mmt=1`,
+all inside 3%, two of the three faster than 7-Zip. The portable loop is at
+0.90 of the reference C decoder and 1.36 of `7zz`; the difference between the
+two columns is entirely the inner loop.
+
+### What was ported
+
+`Asm/arm64/LzmaDecOpt.S` and `Asm/x86/LzmaDecOpt.asm` (the latter with
+`Asm/x86/7zAsm.asm` spliced in), translated line by line into
+`src/lzma/decode_opt/lzma_dec_opt_aarch64.S`,
+`lzma_dec_opt_x86_64_sysv.S` and `lzma_dec_opt_x86_64_win64.S`, each included
+verbatim into a `#[unsafe(naked)]` Rust function by
+`decode_opt/{aarch64,x86_64}.rs`. A naked function is the right vehicle: these
+are whole C-ABI functions with their own prologue, frame and callee-saved
+register handling, so there is nothing for the register allocator to do and
+nothing to declare but the symbol.
+
+The assembly reads `CLzmaDec` through hardcoded offsets, so `AsmLzmaDec` is a
+`#[repr(C)]` mirror of it whose every offset and whose total size are asserted
+at compile time with `offset_of!`. Nothing about the Rust state layout can
+drift away from the assembly without failing the build.
+
+Three mechanical differences from the reference files, listed in each file's
+header and nowhere else:
+
+- the C preprocessor and the MASM macro assembler are resolved by hand, for
+  the same configuration the reference builds use (16-bit probabilities,
+  `LZMA_USE_4BYTES_FILL` on, `_LZMA_SIZE_OPT` off);
+- every label gains an `L` prefix, because Mach-O refuses a conditional branch
+  to a label that is not assembler-local;
+- on x86, every constant expression is folded to a plain integer.
+
+That last one is not cosmetic. LLVM's GNU-Intel parser silently drops the
+index register of a memory operand whose scale is parenthesised:
+`[probs + sym * (2)]` assembles as `[probs]`, with no diagnostic. The first
+translation had that in every literal tree load, which is exactly the sort of
+bug a differential test catches and a reading does not.
+
+### How the translation was checked
+
+Beyond the differential tests, the x86 translation was checked against the
+reference at the instruction level. `llvm-ml64` will assemble MASM, so the
+reference file was assembled (after removing four textual `equ`s it does not
+support, which is a smaller change than the translation itself) and both
+objects disassembled and diffed. They agree instruction for instruction; the
+only differences are alignment padding, and one instruction the *oracle* was
+missing because of a flaw in its own preparation.
+
+`tests/asm_parity.rs` then decodes every committed vector, every truncation
+prefix of every vector, and 400 random single-bit corruptions of each, with
+both loops, and requires identical bytes and identical errors. The full suite
+passes with the `asm` feature, with `--no-default-features --features std`,
+and as `no_std` + `alloc`, on aarch64 macOS, on x86_64 macOS under Rosetta and
+on x86_64 Linux.
