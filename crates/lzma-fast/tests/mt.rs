@@ -1,5 +1,9 @@
 //! The multi-threaded LZMA2 decoder: it must agree with the single-threaded
 //! one, byte for byte, whatever the thread count and however the input is fed.
+//!
+//! The threaded decoders live behind the `std` feature, so this whole file
+//! does with them.
+#![cfg(feature = "std")]
 
 mod common;
 

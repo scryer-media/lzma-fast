@@ -178,6 +178,7 @@ fn the_seven_z_fixtures_are_one_lzma2_pack_stream() {
 
 /// Runs a command that writes the decoded bytes to stdout and returns the
 /// length and CRC32 of what came out.
+#[cfg(feature = "std")]
 fn stdout_oracle(prog: &str, args: &[&str]) -> Option<(u64, u32)> {
     let mut child = Command::new(prog)
         .args(args)
@@ -207,6 +208,7 @@ fn stdout_oracle(prog: &str, args: &[&str]) -> Option<(u64, u32)> {
 /// runs; `st.7z` was written with `-mmt=1` and has exactly one, which is the
 /// case the parallel decoder has to fall back to single-threaded without
 /// buffering the stream.
+#[cfg(feature = "std")]
 #[test]
 fn lzma2_mt_fixtures_match_the_single_threaded_path() {
     use lzma_fast::{Lzma2MtOptions, Lzma2ParallelDecoder};
@@ -247,11 +249,13 @@ fn lzma2_mt_fixtures_match_the_single_threaded_path() {
 
 /// A [`std::io::Write`] that keeps only the length and CRC32, so a gigabyte of
 /// output never has to be resident.
+#[cfg(feature = "std")]
 #[derive(Default)]
 struct CrcSink {
     crc: u32,
 }
 
+#[cfg(feature = "std")]
 impl std::io::Write for CrcSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.crc = crc32(buf, self.crc);

@@ -61,6 +61,7 @@ pub use lzma2::scan::{Lzma2Run, Lzma2RunScanner};
 
 #[cfg(feature = "std")]
 pub use mt::adaptive::{DrainStatus, Lzma2AdaptiveDecoder};
+#[cfg(feature = "std")]
 pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memory_estimate};
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};

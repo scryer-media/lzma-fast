@@ -19,6 +19,10 @@
 //! ```
 
 pub(crate) mod frame;
+// The chunk-header walker exists for the multi-threaded decoder, which is
+// itself behind `std`; without it nothing in the crate parses without
+// decoding.
+#[cfg(feature = "std")]
 pub(crate) mod parse;
 pub mod scan;
 

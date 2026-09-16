@@ -1,6 +1,10 @@
 //! The adaptive decoder: fed input, switchable mid-stream, bounded.
 //!
 //! One test per constraint the consumer's "adaptive chase" places on it.
+//!
+//! The threaded decoders live behind the `std` feature, so this whole file
+//! does with them.
+#![cfg(feature = "std")]
 
 mod common;
 
