@@ -237,7 +237,7 @@ fn lzma2_mt_fixtures_match_the_single_threaded_path() {
             let dec = Lzma2ParallelDecoder::new(ps.dict_prop, &opts).unwrap();
             let mut sink = CrcSink::default();
             let n = dec.decode(payload, &mut sink).expect("fixture decodes");
-            assert_eq!((n, sink.crc), expected, "{name} at {threads} threads");
+            assert_eq!((n, sink.finish()), expected, "{name} at {threads} threads");
         }
 
         match stdout_oracle("7zz", &["x", "-so", path.to_str().unwrap()]) {
@@ -253,16 +253,342 @@ fn lzma2_mt_fixtures_match_the_single_threaded_path() {
 #[derive(Default)]
 struct CrcSink {
     crc: u32,
+    #[cfg(feature = "crc")]
+    digest: Option<lzma_fast::crc::Crc32>,
 }
 
 #[cfg(feature = "std")]
 impl std::io::Write for CrcSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.crc = crc32(buf, self.crc);
+        // Deliberately the crate's own carry-less CRC when it is compiled in,
+        // not the bitwise `crc32` above. On the parallel path this sink runs
+        // inside the ring's one serialised write section, so a slow checksum
+        // here is charged to the decoder *and* stalls every other worker - the
+        // exact effect measured in docs/perf-log.md, and the reason
+        // `Checksum`/`ChecksumPlan` exist. A bitwise CRC here made this file
+        // take twelve minutes.
+        #[cfg(feature = "crc")]
+        {
+            self.digest
+                .get_or_insert_with(lzma_fast::crc::Crc32::new)
+                .update(buf);
+        }
+        #[cfg(not(feature = "crc"))]
+        {
+            self.crc = crc32(buf, self.crc);
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+impl CrcSink {
+    /// The CRC of everything written, consuming the sink.
+    fn finish(mut self) -> u32 {
+        #[cfg(feature = "crc")]
+        {
+            self.crc = self
+                .digest
+                .take()
+                .map_or(0, lzma_fast::crc::Crc32::finalize);
+        }
+        self.crc
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker-side checksums on the gigabyte fixtures
+// ---------------------------------------------------------------------------
+
+/// A sink that reproduces, serially and in order, exactly what the workers are
+/// supposed to have computed in parallel: a CRC-32 and a CRC-64/XZ of every
+/// piece between `splits`, and a SHA-256 of every span between `block_ends`.
+///
+/// This is the oracle the parallel path is checked against, and it is built
+/// the slow, obvious way on purpose - one pass, one thread, no folding.
+#[cfg(all(feature = "std", feature = "crc"))]
+#[derive(Default)]
+struct RefSink {
+    splits: Vec<u64>,
+    block_ends: Vec<u64>,
+    pos: u64,
+    split_at: usize,
+    block_at: usize,
+    seg_start: u64,
+    c32: Option<lzma_fast::crc::Crc32>,
+    c64: Option<lzma_fast::crc::Crc64Xz>,
+    segments: Vec<(u64, u64, u32, u64)>,
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+    sha: Option<lzma_fast::crypto::Sha256>,
+    digests: Vec<(u64, u64, [u8; 32])>,
+    sha_start: u64,
+}
+
+#[cfg(all(feature = "std", feature = "crc"))]
+impl RefSink {
+    fn new(splits: Vec<u64>, block_ends: Vec<u64>) -> Self {
+        RefSink {
+            splits,
+            block_ends,
+            c32: Some(lzma_fast::crc::Crc32::new()),
+            c64: Some(lzma_fast::crc::Crc64Xz::new()),
+            #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+            sha: Some(lzma_fast::crypto::Sha256::new()),
+            ..Default::default()
+        }
+    }
+
+    /// The next absolute offset at which something must be closed off.
+    /// Both lists are sorted, and `pos` only ever moves forward, so the cursors
+    /// do too: this is a merge, not a search.
+    fn next_cut(&self) -> Option<u64> {
+        let a = self.splits.get(self.split_at).copied();
+        let b = self.block_ends.get(self.block_at).copied();
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (x, y) => x.or(y),
+        }
+    }
+
+    fn close_segment(&mut self) {
+        if self.pos == self.seg_start {
+            return;
+        }
+        let c32 = self.c32.take().expect("open").finalize();
+        let c64 = self.c64.take().expect("open").finalize();
+        self.segments
+            .push((self.seg_start, self.pos - self.seg_start, c32, c64));
+        self.c32 = Some(lzma_fast::crc::Crc32::new());
+        self.c64 = Some(lzma_fast::crc::Crc64Xz::new());
+        self.seg_start = self.pos;
+    }
+
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+    fn close_block(&mut self) {
+        if self.pos == self.sha_start {
+            return;
+        }
+        let d = self.sha.take().expect("open").finalize();
+        self.digests
+            .push((self.sha_start, self.pos - self.sha_start, d));
+        self.sha = Some(lzma_fast::crypto::Sha256::new());
+        self.sha_start = self.pos;
+    }
+
+    #[cfg(not(any(feature = "crypto", feature = "native-crypto")))]
+    fn close_block(&mut self) {
+        self.sha_start = self.pos;
+    }
+
+    fn finish(mut self) -> Self {
+        self.close_segment();
+        self.close_block();
+        self
+    }
+}
+
+#[cfg(all(feature = "std", feature = "crc"))]
+impl std::io::Write for RefSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let total = buf.len();
+        let mut buf = buf;
+        while !buf.is_empty() {
+            let take = match self.next_cut() {
+                Some(c) if c < self.pos + buf.len() as u64 => (c - self.pos) as usize,
+                _ => buf.len(),
+            };
+            let (head, tail) = buf.split_at(take);
+            self.c32.as_mut().expect("open").update(head);
+            self.c64.as_mut().expect("open").update(head);
+            #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+            self.sha.as_mut().expect("open").update(head);
+            self.pos += take as u64;
+            buf = tail;
+
+            // Close off whatever ends exactly here. A block end is also a
+            // segment end, because a worker never produces a segment that
+            // spans two blocks.
+            let mut cut = false;
+            while self.splits.get(self.split_at) == Some(&self.pos) {
+                self.split_at += 1;
+                cut = true;
+            }
+            let mut block = false;
+            while self.block_ends.get(self.block_at) == Some(&self.pos) {
+                self.block_at += 1;
+                block = true;
+            }
+            if cut || block {
+                self.close_segment();
+            }
+            if block {
+                self.close_block();
+            }
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The parallel decoder's worker-side checksums, on a gigabyte, against a
+/// serial oracle over the same bytes.
+///
+/// The point of the feature is that the CRCs are computed by the workers and
+/// folded afterwards; the point of the test is that folding them gives exactly
+/// what checksumming the whole thing serially would have, for every range a
+/// consumer could ask about - including ranges that straddle the decoder's own
+/// block boundaries, which is the case a 7z sub-stream hits.
+#[cfg(all(feature = "std", feature = "crc"))]
+#[test]
+fn lzma2_mt_fixture_checksums_fold_to_the_serial_answer() {
+    use lzma_fast::crc::CrcFolder;
+    use lzma_fast::{Checksum, ChecksumPlan, Lzma2MtOptions, Lzma2ParallelDecoder};
+
+    let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let path = repo_root().join("bench/fixtures/mt.7z");
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("skipping: mt.7z absent (run scripts/make-fixtures.sh)");
+        return;
+    };
+    let ps = sevenz::pack_stream(&data).expect("single-folder LZMA2 archive");
+    let payload = &data[ps.offset as usize..(ps.offset + ps.packed_len) as usize];
+    let total = ps.unpacked_len;
+
+    let opts = |threads: usize| Lzma2MtOptions {
+        threads,
+        memory_limit: u64::MAX,
+    };
+    let decode = |threads: usize, plan: &ChecksumPlan| {
+        let dec = Lzma2ParallelDecoder::new(ps.dict_prop, &opts(threads)).unwrap();
+        // A counting sink, not a checksumming one: the oracle for these bytes
+        // is `RefSink` on its own pass, and anything done in this sink would be
+        // done inside the ring's serialised section.
+        let sink = std::io::sink();
+        let (n, checks) = dec
+            .decode_checksummed(payload, sink, plan)
+            .expect("fixture decodes");
+        assert_eq!(n, total, "{threads} threads: short decode");
+        checks
+    };
+
+    // Awkward on purpose: 1 is inside the first run, the 12.5 MiB stride lands
+    // all over the inside of every run, and 128 MiB is exactly a run boundary
+    // in this fixture - the place an off-by-one between a block's start and a
+    // segment's start would hide.
+    let mut splits = vec![1u64, 3];
+    let mut p = 13_107_200u64;
+    while p < total {
+        splits.push(p);
+        p += 13_107_200;
+    }
+    let run = 128u64 << 20;
+    let mut b = run;
+    while b < total {
+        splits.push(b - 1);
+        splits.push(b);
+        splits.push(b + 1);
+        b += run;
+    }
+    splits.sort_unstable();
+    splits.dedup();
+
+    // What the workers produced, at four thread counts. Block boundaries are
+    // taken from the widest run, which is the one with the most of them.
+    let mut per_threads = Vec::new();
+    for t in [1, 2, 8, all.max(16)] {
+        per_threads.push((
+            t,
+            decode(
+                t,
+                &ChecksumPlan::new(Checksum::Crc32).with_split_points(splits.clone()),
+            ),
+            decode(
+                t,
+                &ChecksumPlan::new(Checksum::Crc64Xz).with_split_points(splits.clone()),
+            ),
+        ));
+    }
+    let sha_blocks = decode(all.max(16), &ChecksumPlan::new(Checksum::Sha256));
+    let block_ends: Vec<u64> = sha_blocks
+        .iter()
+        .map(|c| c.unpacked_offset + c.len)
+        .collect();
+    assert!(
+        block_ends.len() > 1,
+        "mt.7z should decode as several blocks, got {}",
+        block_ends.len()
+    );
+
+    // One serial pass over the same bytes for the oracle.
+    let reference = {
+        let dec = Lzma2ParallelDecoder::new(ps.dict_prop, &opts(1)).unwrap();
+        let mut sink = RefSink::new(splits.clone(), block_ends.clone());
+        dec.decode(payload, &mut sink).expect("serial decode");
+        sink.finish()
+    };
+    assert_eq!(reference.pos, total, "oracle saw the whole stream");
+
+    // Every range the split points bound must fold to the serial answer, at
+    // every thread count, at both widths.
+    let mut edges = splits.clone();
+    edges.insert(0, 0);
+    edges.push(total);
+    for (t, c32, c64) in &per_threads {
+        let mut f32 = CrcFolder::<u32>::new();
+        for s in c32.iter().flat_map(|c| c.segments.iter()) {
+            f32.push(s.offset, s.len, s.check.crc32().expect("crc32"));
+        }
+        let mut f64 = CrcFolder::<u64>::new();
+        for s in c64.iter().flat_map(|c| c.segments.iter()) {
+            f64.push(s.offset, s.len, s.check.crc64().expect("crc64"));
+        }
+
+        // Piece by piece against the oracle's own pieces...
+        let mut pos = 0u64;
+        for &(off, len, want32, want64) in &reference.segments {
+            assert_eq!(off, pos, "oracle segments do not tile");
+            assert_eq!(
+                f32.range(off, len),
+                Some(want32),
+                "{t} threads: crc32 {off}"
+            );
+            assert_eq!(
+                f64.range(off, len),
+                Some(want64),
+                "{t} threads: crc64 {off}"
+            );
+            pos += len;
+        }
+        assert_eq!(pos, total);
+
+        // ...and over ranges that straddle several of them, including the
+        // decoder's block boundaries.
+        for w in edges.windows(5) {
+            let (a, b) = (w[0], w[4]);
+            assert!(f32.range(a, b - a).is_some(), "{t} threads: gap {a}..{b}");
+            assert!(f64.range(a, b - a).is_some(), "{t} threads: gap {a}..{b}");
+        }
+        assert!(
+            f32.range(0, total).is_some() && f64.range(0, total).is_some(),
+            "{t} threads: the whole output must fold"
+        );
+    }
+
+    // SHA-256 is per block and must match a serial digest of the same span.
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+    {
+        assert_eq!(sha_blocks.len(), reference.digests.len());
+        for (c, &(off, len, want)) in sha_blocks.iter().zip(reference.digests.iter()) {
+            assert_eq!((c.unpacked_offset, c.len), (off, len), "block spans");
+            assert!(c.segments.is_empty(), "sha256 must not segment");
+            assert_eq!(c.digest, Some(want), "digest of the block at {off}");
+        }
     }
 }
