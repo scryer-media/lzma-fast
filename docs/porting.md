@@ -230,6 +230,42 @@ How each constraint is met:
    first byte. (`tests/adaptive.rs::a_run_decodes_before_its_tail_arrives`,
    `the_threaded_path_never_claims_a_run_the_chase_started`.)
 
+8. **Checksums are computed where the bytes are.** `Checksum::{Crc32,
+   Crc64Xz, Sha256}` with `ChecksumPlan`, `set_checksum` on the adaptive
+   decoder and `decode_checksummed` / `Lzma2ParallelReader::with_checksums` on
+   the throughput one. Each worker checksums the block it just produced,
+   before it queues for the write token; the chase decoder and the
+   single-threaded fallback do the same for the runs they take, so the
+   segments tile the whole output whichever path produced it.
+
+   This is a *performance* feature, and the measurement that motivated it is
+   in `docs/perf-log.md`: a table-driven CRC-32 in the benchmark's own sink
+   cost 16% of an eight-thread decode, because the ring's write callback is
+   its one serialised section and a checksum computed by the consumer runs
+   inside it. Moving the same work into the workers is what took this crate
+   from 1.10 of `7zz` to parity.
+
+   Because a consumer's boundaries (the sub-streams of a 7z folder, say) do
+   not line up with the decoder's blocks, the caller passes the absolute
+   unpacked offsets where its boundaries fall and each worker emits one CRC
+   per piece of its block between them, in one pass. The pieces are folded
+   into whatever ranges the consumer wants with `crc::CrcFolder`, over
+   `crc32_combine` / `crc64_xz_combine` — `crc-fast`'s `checksum_combine` at
+   both widths, so there is no GF(2) matrix here. A worker only ever sees its
+   own block, so the threaded path always cuts at block boundaries as well;
+   that is a refinement of the caller's cuts and folds away.
+
+   SHA-256 has no combine, so it is offered per whole block only and split
+   points are ignored for it. That is the shape xz needs: an xz block *is* the
+   unit being checked. A consumer wanting SHA-256 over an arbitrary range must
+   hash that range itself, on its own thread.
+
+   C: nothing. 7-Zip checksums a folder's sub-streams in `CFolderOutStream`,
+   on the consuming thread, which is the arrangement this deliberately does
+   not copy. (`tests/checksum.rs` for the whole surface;
+   `tests/fixtures.rs::lzma2_mt_fixture_checksums_fold_to_the_serial_answer`
+   folds a gigabyte's worth against a serial oracle.)
+
 One further deviation, in the ring itself: `Lzma2DecMt_Decode` never reads
 `p->mtc.codeRes`, so a worker's `SZ_ERROR_DATA` is silently swallowed and the
 decode reports success. The port returns the error and does not write the

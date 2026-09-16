@@ -46,6 +46,19 @@ rather than read, output is polled, and the thread count can be changed
 mid-stream at run boundaries. See the "Adaptive use" section of
 [docs/porting.md](../../docs/porting.md).
 
+Either threaded decoder will also checksum its own output, in the worker that
+produced it rather than on the thread draining it — `Checksum::Crc32`,
+`Crc64Xz` or `Sha256`, with a `ChecksumPlan` carrying the absolute offsets
+where the consumer's own boundaries (a 7z folder's sub-streams, say) fall.
+Each worker emits one CRC per piece of its block between those offsets, in one
+pass, and `crc::CrcFolder` folds the pieces into any range the consumer asks
+about without re-reading a byte. This is not a convenience: the ring's write
+callback is its one serialised section, so a CRC computed by the consumer as
+it receives the output costs the decode both its own time and the queueing it
+induces on every other worker — measured at 16% of an eight-thread decode.
+SHA-256 cannot be folded, so it is offered per whole block only, which is the
+unit an xz stream checks.
+
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](../../docs/perf-log.md);
 see [docs/porting.md](../../docs/porting.md) for the plan.
@@ -56,7 +69,7 @@ see [docs/porting.md](../../docs/porting.md) for the plan.
 | --- | --- | --- |
 | `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
 | `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
-| `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast` |
+| `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders |
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 

@@ -15,6 +15,23 @@
   flight is accounted and bounded, and the decode can be cancelled. Worker
   threads are created at the first dispatch and parked, not torn down, across
   a mode change.
+- Worker-side checksums for both threaded decoders: `Checksum::{None, Crc32,
+  Crc64Xz, Sha256}` with `ChecksumPlan`, `Lzma2ParallelDecoder::decode_checksummed`,
+  `Lzma2ParallelReader::with_checksums` / `take_checks` / `take_segments` and
+  `Lzma2AdaptiveDecoder::set_checksum` / `take_checks`. Each worker checksums
+  the block it produced before it queues for the write token, so the work is
+  parallel; a checksum computed by the consumer as it drains runs inside the
+  ring's one serialised section instead, which measured at 16% of an
+  eight-thread decode. The caller passes the absolute unpacked offsets where
+  its own boundaries fall (a 7z folder's sub-streams, say) and gets one CRC
+  per piece between them, in a single pass. SHA-256 is per whole block and
+  ignores split points, because it cannot be folded. Behind `crc`, with
+  SHA-256 additionally behind `crypto` or `native-crypto`; opting out of all
+  of it leaves the decode paths exactly as they were.
+- `crc::CrcFolder`, `crc::Foldable`, `crc::crc32_combine` and
+  `crc::crc64_xz_combine`: fold the checksums of pieces of a stream, pushed in
+  any order, into the checksum of any contiguous range they tile, without
+  re-reading a byte. Available without `std`.
 - Measured against 7-Zip on a gigabyte: the parallel decoder is within a few
   per cent of `7zz t -mmt=N` across the whole thread curve on both aarch64
   macOS and x86_64 Linux, and 1.6x to 12x faster than lzma-rust2's
