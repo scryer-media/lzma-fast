@@ -353,3 +353,8 @@ pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     }
     v
 }
+
+/// The `.7z` pack-stream helper, shared with the benchmark harness so there is
+/// one implementation of it and it lives outside the library.
+#[path = "../../../../tools/lzma-bench/src/sevenz.rs"]
+pub mod sevenz;

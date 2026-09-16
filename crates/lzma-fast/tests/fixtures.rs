@@ -152,3 +152,113 @@ fn lzma2_fixtures_match_xz() {
         assert_eq!(got, expected, "{name} ({in_chunk},{out_chunk})");
     }
 }
+
+/// The `.7z` fixtures are single-file, single-folder archives, so the LZMA2
+/// pack stream is one byte range and the dictionary property byte is in the
+/// coder properties. Nothing here parses a real 7z; see the helper's own
+/// module docs.
+#[test]
+fn the_seven_z_fixtures_are_one_lzma2_pack_stream() {
+    for name in ["mt.7z", "st.7z"] {
+        let path = repo_root().join("bench/fixtures").join(name);
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("skipping {name}: fixture absent (run scripts/make-fixtures.sh)");
+            continue;
+        };
+        let ps = sevenz::pack_stream(&data)
+            .unwrap_or_else(|| panic!("{name}: not a single-folder LZMA2 archive"));
+        // 32 is the size of the signature header, which is where a 7z archive
+        // written in one pass puts the first pack stream.
+        assert_eq!(ps.offset, 32, "{name}");
+        assert_eq!(ps.unpacked_len, 1 << 30, "{name}");
+        assert_eq!(ps.dict_prop, 26, "{name}");
+        assert!(ps.offset + ps.packed_len <= data.len() as u64, "{name}");
+    }
+}
+
+/// Runs a command that writes the decoded bytes to stdout and returns the
+/// length and CRC32 of what came out.
+fn stdout_oracle(prog: &str, args: &[&str]) -> Option<(u64, u32)> {
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut buf = vec![0u8; 1 << 20];
+    let (mut len, mut crc) = (0u64, 0u32);
+    loop {
+        use std::io::Read;
+        let n = stdout.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        crc = crc32(&buf[..n], crc);
+    }
+    child.wait().ok()?.success().then_some((len, crc))
+}
+
+/// The gigabyte fixtures through the parallel decoder, at several thread
+/// counts, against both this crate's single-threaded path and 7-Zip itself.
+///
+/// `mt.7z` was written with `-mmt=on` and so has many independently decodable
+/// runs; `st.7z` was written with `-mmt=1` and has exactly one, which is the
+/// case the parallel decoder has to fall back to single-threaded without
+/// buffering the stream.
+#[test]
+fn lzma2_mt_fixtures_match_the_single_threaded_path() {
+    use lzma_fast::{Lzma2MtOptions, Lzma2ParallelDecoder};
+
+    let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    for name in ["mt.7z", "st.7z"] {
+        let path = repo_root().join("bench/fixtures").join(name);
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("skipping {name}: fixture absent (run scripts/make-fixtures.sh)");
+            continue;
+        };
+        let ps = sevenz::pack_stream(&data).expect("single-folder LZMA2 archive");
+        let payload = &data[ps.offset as usize..(ps.offset + ps.packed_len) as usize];
+
+        let expected = ours_lzma2(ps.dict_prop, payload, 1 << 20, 1 << 20);
+        assert_eq!(expected.0, ps.unpacked_len, "{name}: declared size");
+
+        // The full 1/2/3/8/16 sweep is the small-vector differential test's
+        // job; at a gigabyte a run each, three points are enough to show the
+        // large-input path agrees.
+        for threads in [1, 2, all] {
+            let opts = Lzma2MtOptions {
+                threads,
+                memory_limit: u64::MAX,
+            };
+            let dec = Lzma2ParallelDecoder::new(ps.dict_prop, &opts).unwrap();
+            let mut sink = CrcSink::default();
+            let n = dec.decode(payload, &mut sink).expect("fixture decodes");
+            assert_eq!((n, sink.crc), expected, "{name} at {threads} threads");
+        }
+
+        match stdout_oracle("7zz", &["x", "-so", path.to_str().unwrap()]) {
+            Some(o) => assert_eq!(o, expected, "{name}: 7zz disagrees"),
+            None => eprintln!("skipping the 7zz oracle for {name}: unavailable"),
+        }
+    }
+}
+
+/// A [`std::io::Write`] that keeps only the length and CRC32, so a gigabyte of
+/// output never has to be resident.
+#[derive(Default)]
+struct CrcSink {
+    crc: u32,
+}
+
+impl std::io::Write for CrcSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.crc = crc32(buf, self.crc);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

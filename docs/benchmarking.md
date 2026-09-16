@@ -35,9 +35,43 @@ cargo run --release -p lzma-bench -- bench/fixtures/p256.bin.lzma
 - For profiling use `cargo build --profile profiling` (symbols kept) and
   `samply` / `perf`.
 
+### Multi-threaded LZMA2
+
+```bash
+cargo run --release -p lzma-bench -- --threads sweep bench/fixtures/mt.7z
+```
+
+`--threads` takes a comma-separated list of thread counts, or `sweep` for
+`1,2,4,8,16,all`; `all` is this machine's available parallelism. At each
+count the harness interleaves three decoders in one schedule - this crate's
+`Lzma2ParallelDecoder`, `7zz t -mmt=N`, and lzma-rust2's `Lzma2ReaderMt` -
+and reports the median of each and the ratio ours/oracle, so a value below
+1.000 means this crate is faster. lzma-rust2 is a dependency of the harness
+only; the library has none.
+
+The in-process decoders are also measured for peak allocated bytes, through a
+counting global allocator that is reset at the start of each timed decode.
+`7zz` is a subprocess and is not accounted for this way.
+
+`.7z` inputs are read by the harness's own pack-stream helper, which handles
+exactly the shape the fixtures have - one file, one folder, one LZMA2 coder -
+and takes the dictionary property byte from the archive's coder properties.
+It is deliberately not a 7z reader: 7z is out of scope for this crate.
+
+The two gigabyte fixtures are the two cases that matter. `mt.7z` was written
+with `-mmt=on`, so it has many independently decodable runs and should scale.
+`st.7z` was written with `-mmt=1`, so it has exactly one run: the parallel
+decoder has to fall back to decoding it single-threaded, streaming, with no
+penalty against `7zz t -mmt=1`.
+
 ## Differential correctness
 
 `cargo test -p lzma-fast` decodes every fixture it can find under
 `bench/fixtures` and small committed vectors under `crates/lzma-fast/tests`,
 and compares the bytes with `xz -dc`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.
+
+The `decode_lzma2_mt` fuzz target is stronger than that: it decodes the same
+arbitrary bytes with the single-threaded, parallel and adaptive decoders and
+requires them to agree - the same output for a stream that ends at an end
+marker, and a refusal from all three for one that does not.

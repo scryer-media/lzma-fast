@@ -10,3 +10,4 @@ publish = false
 
 [dependencies]
 lzma-fast = { workspace = true }
+lzma-rust2 = "0.20.1"

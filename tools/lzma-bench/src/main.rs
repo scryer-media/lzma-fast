@@ -13,32 +13,53 @@
 //!
 //! Containers: `.lzma` is the LZMA-alone format (13-byte header). `.xz` is
 //! parsed just far enough to find a single LZMA2 block's filter property byte
-//! and its compressed data; anything more elaborate (multi-block, filter
-//! chains, `.7z` folders) is out of scope for a harness that only needs one
-//! long single-threaded stream to time. `st.7z` is therefore not a bench
-//! input: the LZMA2 lane uses `p256.bin.xz`, which is the same kind of single
-//! LZMA2 stream in a container this tool can read without a 7z header parser.
+//! and its compressed data. `.7z` is read by [`sevenz`], which finds the
+//! LZMA2 stream of a single-file, single-folder archive and nothing else.
+//! Anything more elaborate — multi-block xz, filter chains, real 7z folder
+//! graphs — is out of scope for a harness that only needs one long LZMA2
+//! stream to time.
+//!
+//! With `--threads` the LZMA2 lane runs multi-threaded instead, sweeping
+//! thread counts and timing `7zz t -mmt=N` and lzma-rust2's `Lzma2ReaderMt`
+//! at each of them. lzma-rust2 is a dependency of this harness only; the
+//! library has none.
 
+mod sevenz;
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use lzma_fast::{FinishMode, Lzma2Decoder, LzmaAloneHeader, LzmaDecoder, Status};
+use lzma_fast::{
+    FinishMode, Lzma2Decoder, Lzma2MtOptions, Lzma2ParallelDecoder, LzmaAloneHeader, LzmaDecoder,
+    Status,
+};
 
 const OUT_CHUNK: usize = 1 << 20;
 const REFERENCE_C_DECODER: &str = "supporting-codebases/7zip/C/Util/Lzma/_o/7lzma";
 
 const HELP: &str = "\
-usage: lzma-bench [--runs N] [--no-oracles] <file.lzma|file.xz> ...
+usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] <file> ...
 
+  inputs         .lzma, .xz, or a single-folder LZMA2 .7z
   --runs N       repetitions per decoder (default 3); the median is reported
-  --no-oracles   time only this crate, skip 7zz / xz / 7lzma
-  --portable     force the portable decode loop instead of the assembly one";
+  --no-oracles   time only this crate, skip 7zz / xz / 7lzma / lzma-rust2
+  --portable     force the portable decode loop instead of the assembly one
+  --index        print the stream's independently decodable runs and exit,
+                 which is what bounds how far the parallel decode can scale
+  --threads LIST multi-threaded LZMA2: a comma-separated list of thread counts,
+                 where \"all\" means this machine's available parallelism.
+                 \"--threads sweep\" is shorthand for 1,2,4,8,16,all";
 
 fn main() {
     let mut runs = 3usize;
     let mut oracles = true;
     let mut portable = false;
+    let mut threads: Vec<usize> = Vec::new();
+    let mut index = false;
     let mut files: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -52,6 +73,13 @@ fn main() {
             }
             "--no-oracles" | "--only-ours" => oracles = false,
             "--portable" => portable = true,
+            "--index" => index = true,
+            "--threads" => {
+                let v = args
+                    .next()
+                    .unwrap_or_else(|| fail("--threads needs a list"));
+                threads = parse_threads(&v);
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 return;
@@ -77,8 +105,73 @@ fn main() {
     );
 
     for file in &files {
-        bench_one(file, runs, oracles, portable);
+        if index {
+            run_index(file);
+        } else if threads.is_empty() {
+            bench_one(file, runs, oracles, portable);
+        } else {
+            bench_mt(file, runs, oracles, &threads);
+        }
     }
+}
+
+/// Prints the run index of a stream: how many independently decodable runs it
+/// has, and how big they are. A decode cannot use more threads than there are
+/// runs, so this is the first thing to look at when a scaling curve flattens.
+fn run_index(path: &Path) {
+    let Ok(data) = std::fs::read(path) else {
+        eprintln!("lzma-bench: cannot read {}", path.display());
+        return;
+    };
+    let Ok((_, payload)) = lzma2_payload(path, &data) else {
+        eprintln!("lzma-bench: {}: not an LZMA2 stream", path.display());
+        return;
+    };
+    let mut scanner = lzma_fast::Lzma2RunScanner::new();
+    if let Err(e) = scanner.feed(payload) {
+        eprintln!("lzma-bench: {}: {e}", path.display());
+        return;
+    }
+    println!();
+    println!("{}: runs", path.display());
+    let (mut n, mut min, mut max) = (0u64, u64::MAX, 0u64);
+    while let Some(r) = scanner.next_run() {
+        if n < 8 {
+            println!(
+                "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {}",
+                r.in_offset, r.packed_len, r.out_offset, r.unpacked_len, r.has_dict_reset
+            );
+        }
+        n += 1;
+        min = min.min(r.unpacked_len);
+        max = max.max(r.unpacked_len);
+    }
+    if n > 8 {
+        println!("  ... {} more", n - 8);
+    }
+    println!("  {n} runs, unpacked {} to {}", human(min), human(max));
+}
+
+/// `1,2,4,all` or `sweep`.
+fn parse_threads(spec: &str) -> Vec<usize> {
+    let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let spec = if spec == "sweep" {
+        "1,2,4,8,16,all"
+    } else {
+        spec
+    };
+    let mut v: Vec<usize> = spec
+        .split(',')
+        .map(|t| match t.trim() {
+            "all" => all,
+            other => other
+                .parse()
+                .unwrap_or_else(|_| fail("--threads takes numbers or \"all\"")),
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 fn fail(msg: &str) -> ! {
@@ -220,7 +313,10 @@ fn human(n: u64) -> String {
 fn decode_file(path: &Path, data: &[u8], portable: bool) -> Result<Run, String> {
     match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
         "lzma" => decode_lzma1(data, portable),
-        "xz" => decode_lzma2(data, portable),
+        "xz" | "7z" => {
+            let (prop, payload) = lzma2_payload(path, data)?;
+            decode_lzma2(prop, payload, portable)
+        }
         ext => Err(format!("unsupported input extension {ext:?}")),
     }
 }
@@ -243,8 +339,29 @@ fn decode_lzma1(data: &[u8], portable: bool) -> Result<Run, String> {
     })
 }
 
-fn decode_lzma2(data: &[u8], portable: bool) -> Result<Run, String> {
-    let (dict_prop, payload) = xz_lzma2_block(data).ok_or("not a single-block LZMA2 .xz")?;
+/// The raw LZMA2 stream of an `.xz` or `.7z` input, with its dictionary
+/// property byte.
+///
+/// For `.7z` the property byte comes out of the archive's own coder
+/// properties rather than out of `7zz l -slt`'s method string: the header
+/// carries the byte the encoder wrote, whereas the method string is a
+/// rendered dictionary size that has to be mapped back, and the two
+/// disagree for odd-mantissa sizes (prop 26 prints as "LZMA2:25").
+fn lzma2_payload<'a>(path: &Path, data: &'a [u8]) -> Result<(u8, &'a [u8]), String> {
+    match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+        "7z" => {
+            let s = sevenz::pack_stream(data).ok_or("not a single-folder LZMA2 .7z")?;
+            let end = s.offset + s.packed_len;
+            if end > data.len() as u64 {
+                return Err("7z pack stream runs past the end of the file".into());
+            }
+            Ok((s.dict_prop, &data[s.offset as usize..end as usize]))
+        }
+        _ => xz_lzma2_block(data).ok_or_else(|| "not a single-block LZMA2 .xz".into()),
+    }
+}
+
+fn decode_lzma2(dict_prop: u8, payload: &[u8], portable: bool) -> Result<Run, String> {
     let mut dec = if portable {
         Lzma2Decoder::new_portable(dict_prop)
     } else {
@@ -414,62 +531,314 @@ fn time_command(cmd: &[String]) -> Option<Duration> {
 }
 
 // ---------------------------------------------------------------------------
-// CRC32 (IEEE), slicing-by-8. Only used outside the timed region.
+// CRC32 (IEEE)
 // ---------------------------------------------------------------------------
 
-struct Crc32 {
-    state: u32,
-    table: Box<[[u32; 256]; 8]>,
-}
+/// The output checksum, from the crate's own `crc` module, which is
+/// `crc-fast` over the carry-less multiply units.
+///
+/// The single-threaded lane keeps this outside the timed region, but the
+/// multi-threaded one cannot: a push decoder hands its output to a sink, and
+/// the sink is where the bytes are. On the parallel path that sink runs
+/// inside the ring's serialised write section, so a slow checksum is charged
+/// to the decoder *and* serialises it. A table-driven CRC32 here cost 0.37 s
+/// of serial time on a gigabyte - 15% of the whole decode - which is about
+/// what the gap against `7zz t` was before it was replaced. `7zz t` checksums
+/// its output too, with its own fast implementation; this is what makes the
+/// comparison a comparison of decoders.
+struct Crc32(Option<lzma_fast::crc::Crc32>);
 
 impl Crc32 {
     fn new() -> Self {
-        let mut table = Box::new([[0u32; 256]; 8]);
-        for i in 0..256usize {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            table[0][i] = c;
-        }
-        for i in 0..256usize {
-            for k in 1..8 {
-                let prev = table[k - 1][i];
-                table[k][i] = (prev >> 8) ^ table[0][(prev & 0xFF) as usize];
-            }
-        }
-        Crc32 {
-            state: 0xFFFF_FFFF,
-            table,
-        }
+        Crc32(Some(lzma_fast::crc::Crc32::new()))
     }
 
     fn update(&mut self, buf: &[u8]) {
-        let mut crc = self.state;
-        let mut chunks = buf.chunks_exact(8);
-        for c in &mut chunks {
-            let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
-            let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            crc = self.table[7][(lo & 0xFF) as usize]
-                ^ self.table[6][((lo >> 8) & 0xFF) as usize]
-                ^ self.table[5][((lo >> 16) & 0xFF) as usize]
-                ^ self.table[4][(lo >> 24) as usize]
-                ^ self.table[3][(hi & 0xFF) as usize]
-                ^ self.table[2][((hi >> 8) & 0xFF) as usize]
-                ^ self.table[1][((hi >> 16) & 0xFF) as usize]
-                ^ self.table[0][(hi >> 24) as usize];
+        if let Some(c) = self.0.as_mut() {
+            c.update(buf);
         }
-        for &b in chunks.remainder() {
-            crc = (crc >> 8) ^ self.table[0][((crc ^ u32::from(b)) & 0xFF) as usize];
-        }
-        self.state = crc;
     }
 
-    fn finish(&self) -> u32 {
-        self.state ^ 0xFFFF_FFFF
+    fn finish(&mut self) -> u32 {
+        self.0.take().map_or(0, lzma_fast::crc::Crc32::finalize)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded LZMA2 lane
+// ---------------------------------------------------------------------------
+
+/// One timed multi-threaded decode: wall time, and the high-water mark of
+/// bytes this process had allocated while it ran.
+struct MtRun {
+    time: Duration,
+    peak: u64,
+    bytes: u64,
+    crc: u32,
+}
+
+fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize]) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lzma-bench: {}: {e}", path.display());
+            return;
+        }
+    };
+    let (dict_prop, payload) = match lzma2_payload(path, &data) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lzma-bench: {}: {e}", path.display());
+            return;
+        }
+    };
+    // `7zz t -mmt=N` only understands the container, so the oracle is only
+    // available for inputs 7-Zip reads.
+    let sevenz_oracle = oracles && path.extension().and_then(|s| s.to_str()) == Some("7z");
+
+    println!();
+    println!(
+        "{}  ({} packed, dict prop {dict_prop} = {})",
+        path.display(),
+        human(data.len() as u64),
+        human(u64::from(dict_size_from_prop(dict_prop)))
+    );
+    println!(
+        "  {:>7} {:>9} {:>10} {:>10} {:>9} {:>9} {:>9}",
+        "threads", "ours", "MiB/s", "peak RAM", "7zz", "rust2", "ratios"
+    );
+
+    let mut first: Option<(u64, u32)> = None;
+    for &t in threads {
+        let mut ours: Vec<MtRun> = Vec::new();
+        let mut rust2: Option<Vec<Duration>> = Some(Vec::new());
+        let mut rust2_peak = 0u64;
+        let mut sevenz: Option<Vec<Duration>> = sevenz_oracle.then(Vec::new);
+
+        for _ in 0..runs {
+            match mt_decode(dict_prop, payload, t) {
+                Ok(r) => ours.push(r),
+                Err(e) => {
+                    eprintln!("lzma-bench: {} at {t} threads: {e}", path.display());
+                    return;
+                }
+            }
+            if oracles && let Some(slot) = rust2.as_mut() {
+                match rust2_decode(dict_prop, payload, t) {
+                    Ok(r) => {
+                        rust2_peak = rust2_peak.max(r.peak);
+                        slot.push(r.time);
+                    }
+                    Err(e) => {
+                        eprintln!("lzma-bench: lzma-rust2 at {t} threads: {e}");
+                        rust2 = None;
+                    }
+                }
+            } else {
+                rust2 = None;
+            }
+            if let Some(slot) = sevenz.as_mut() {
+                let cmd = [
+                    "7zz".to_string(),
+                    "t".into(),
+                    format!("-mmt={t}"),
+                    path.display().to_string(),
+                ];
+                match time_command(&cmd) {
+                    Some(d) => slot.push(d),
+                    None => sevenz = None,
+                }
+            }
+        }
+
+        let bytes = ours[0].bytes;
+        let crc = ours[0].crc;
+        for r in &ours {
+            assert_eq!(
+                (r.bytes, r.crc),
+                (bytes, crc),
+                "MT decode is not deterministic"
+            );
+        }
+        match first {
+            Some(prev) => assert_eq!(prev, (bytes, crc), "thread count changed the output"),
+            None => first = Some((bytes, crc)),
+        }
+
+        let t_ours = median(ours.iter().map(|r| r.time).collect());
+        let peak = ours.iter().map(|r| r.peak).max().unwrap_or(0);
+        let t_7zz = sevenz.map(median);
+        let t_r2 = rust2.map(median);
+
+        let secs = t_ours.as_secs_f64();
+        let mibs = (bytes as f64 / (1024.0 * 1024.0)) / secs;
+        let mut ratios = String::new();
+        if let Some(b) = t_7zz {
+            let r = secs / b.as_secs_f64();
+            ratios.push_str(&format!("7zz {r:.3}"));
+        }
+        if let Some(b) = t_r2 {
+            let r = secs / b.as_secs_f64();
+            if !ratios.is_empty() {
+                ratios.push_str(", ");
+            }
+            ratios.push_str(&format!("rust2 {r:.3}"));
+        }
+        println!(
+            "  {t:>7} {secs:>8.3}s {mibs:>10.1} {:>10} {:>9} {:>9}  {ratios}",
+            human(peak),
+            t_7zz.map_or("n/a".to_string(), |d| format!("{:.3}s", d.as_secs_f64())),
+            t_r2.map_or("n/a".to_string(), |d| format!("{:.3}s", d.as_secs_f64())),
+        );
+        if rust2_peak != 0 {
+            println!("  {:>7} lzma-rust2 peak RAM {}", "", human(rust2_peak));
+        }
+    }
+    println!("  (ratios are ours/oracle; below 1.000 means lzma-fast is faster)");
+}
+
+fn mt_decode(dict_prop: u8, payload: &[u8], threads: usize) -> Result<MtRun, String> {
+    let opts = Lzma2MtOptions {
+        threads,
+        memory_limit: u64::MAX,
+    };
+    let dec = Lzma2ParallelDecoder::new(dict_prop, &opts).map_err(|e| e.to_string())?;
+    let mut sink = CrcWriter::new();
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let bytes = dec.decode(payload, &mut sink).map_err(|e| e.to_string())?;
+    let time = t0.elapsed();
+    Ok(MtRun {
+        time,
+        peak: alloc_watch_peak(base),
+        bytes,
+        crc: sink.crc.finish(),
+    })
+}
+
+fn rust2_decode(dict_prop: u8, payload: &[u8], threads: usize) -> Result<MtRun, String> {
+    let dict = dict_size_from_prop(dict_prop);
+    let mut sink = CrcWriter::new();
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let mut r = lzma_rust2::Lzma2ReaderMt::new(payload, dict, None, threads as u32);
+    let mut buf = vec![0u8; OUT_CHUNK];
+    let mut bytes = 0u64;
+    loop {
+        let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        sink.crc.update(&buf[..n]);
+    }
+    let time = t0.elapsed();
+    Ok(MtRun {
+        time,
+        peak: alloc_watch_peak(base),
+        bytes,
+        crc: sink.crc.finish(),
+    })
+}
+
+/// C: `LZMA2_DIC_SIZE_FROM_PROP_FULL`.
+fn dict_size_from_prop(p: u8) -> u32 {
+    if p == 40 {
+        u32::MAX
+    } else {
+        (2 | (u32::from(p) & 1)) << (u32::from(p) / 2 + 11)
+    }
+}
+
+/// CRC-32 behind a [`Write`], so the MT decoders can be driven through their
+/// real sinks. The hashing is inside the timed region here - unlike the
+/// single-threaded lane, which separates them - because a push decoder has no
+/// way to hand its output over without someone consuming it.
+struct CrcWriter {
+    crc: Crc32,
+}
+
+impl CrcWriter {
+    fn new() -> Self {
+        CrcWriter { crc: Crc32::new() }
+    }
+}
+
+impl Write for CrcWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.crc.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allocation high-water mark
+// ---------------------------------------------------------------------------
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wraps the system allocator and tracks live bytes. The counters are
+/// relaxed: they are a high-water mark for a report, not a synchronisation
+/// mechanism, and the input file is already resident before any of them is
+/// read, so what the decoders add is what shows up.
+struct Counting;
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn note_alloc(n: usize) {
+    let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            note_alloc(l.size());
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc_zeroed(l) };
+        if !p.is_null() {
+            note_alloc(l.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(p, l) };
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        let q = unsafe { System.realloc(p, l, new) };
+        if !q.is_null() {
+            if new >= l.size() {
+                note_alloc(new - l.size());
+            } else {
+                LIVE.fetch_sub(l.size() - new, Ordering::Relaxed);
+            }
+        }
+        q
+    }
+}
+
+/// Starts a measurement: returns the live-bytes baseline and pulls the peak
+/// down to it.
+fn alloc_watch_reset() -> usize {
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    base
+}
+
+fn alloc_watch_peak(base: usize) -> u64 {
+    PEAK.load(Ordering::Relaxed).saturating_sub(base) as u64
 }
