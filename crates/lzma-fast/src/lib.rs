@@ -11,7 +11,11 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! The reader adapters need `std`; without it the example below cannot run, so
+//! it is compiled only when the `std` feature is on.
+//!
+#![cfg_attr(feature = "std", doc = "```no_run")]
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
 //! use std::fs::File;
 //! use std::io::Read;
 //! use lzma_fast::LzmaReader;

@@ -6,6 +6,7 @@
 
 mod common;
 
+#[cfg(feature = "std")]
 use std::io::Read;
 
 use common::*;
@@ -95,6 +96,8 @@ fn lzma1_with_known_size_finishes_in_end_mode() {
     }
 }
 
+/// The reader adapters are `std`-only, so this only exists when `std` is on.
+#[cfg(feature = "std")]
 #[test]
 fn reader_adapters_round_trip() {
     for stem in SOURCES {
