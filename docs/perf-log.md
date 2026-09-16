@@ -307,6 +307,110 @@ Same session, same machine, `--runs 3`:
 The gate still holds, and on this run all three are at or on the fast side of
 parity.
 
+### Worker-side checksums, what they cost
+
+`--runs 3 --threads 16 --checksum K` on `mt.7z`, one segment cut every
+16 MiB, median of 3. The machine was the quietest it got in this session
+(load average 4.1, a Docker VM and an unrelated e2e run owned the rest); the
+`none` row is the control taken in the same series, not the 2.077 s from the
+table above.
+
+| checksum | ours | MiB/s | peak RAM | vs `none` |
+| --- | --- | --- | --- | --- |
+| none | 2.010 s | 509.4 | 1.9 GiB | — |
+| CRC-32 | 1.997 s | 512.7 | 1.9 GiB | **0.994** |
+| CRC-64/XZ | 2.051 s | 499.2 | 1.9 GiB | 1.020 |
+| SHA-256 (AWS-LC) | 2.063 s | 496.4 | 1.9 GiB | 1.026 |
+
+CRC-32 is free at this resolution; CRC-64/XZ costs 2% and SHA-256 2.6%, and
+both numbers are what the per-byte rates below predict. Peak memory does not
+move: a checksum is a few hundred bytes of state per worker.
+
+Earlier, on a machine under load average 12, the same four runs came out
+2.112 / 2.133 / 2.160 / 2.194 s — the same ordering and roughly the same
+spreads, which is the useful check that these are real costs and not noise.
+
+#### The per-byte rates underneath
+
+`cargo run --release -p lzma-fast --example checksum_cost --features
+native-crypto`, a 256 MiB buffer, best of three passes, one core. The example
+was deleted after the measurement; it is reproduced here because the numbers
+are the answer to four separate questions.
+
+```
+crc-fast picked:
+  CRC-32/ISO-HDLC  aarch64-neon-pmull-sha3
+  CRC-64/XZ        aarch64-neon-pmull-sha3
+
+one pass over the whole buffer:
+  crc32             94205.7 MiB/s
+  crc64_xz          69521.1 MiB/s
+  sha256 (aws-lc)    3215.6 MiB/s
+  sha256 (sha2)      3230.7 MiB/s
+```
+
+* `crc-fast` 1.10 selects `aarch64-neon-pmull-sha3` on its own, at runtime.
+  Its optional `optimize_crc32_*` and `vpclmulqdq` cargo features are
+  vestigial in 1.10 — nothing in its sources reads them — and its
+  `feature_detection.rs` picks the tier from `OnceLock<ArchOpsInstance>`
+  under `std`, which this crate already turns on. There is nothing to enable.
+* Both SHA-256 backends run at ~3.2 GiB/s per core, well past the ~2 GB/s the
+  ARMv8 SHA2 extensions were expected to give, so both are on them.
+  RustCrypto's `sha2` 0.11 has no `asm` feature to turn on any more — it
+  detects at runtime through `cpufeatures`, and matching AWS-LC to within 0.5%
+  is the proof it found the instructions.
+
+Cutting segments is free at any resolution this decoder uses:
+
+```
+cut into segments (crc32), to price the finalize/restart at each cut:
+  268435456 B/segment (     1 segments)   92203.8 MiB/s
+   67108864 B/segment (     4 segments)   93843.1 MiB/s
+   16777216 B/segment (    16 segments)   94404.0 MiB/s
+    1048576 B/segment (   256 segments)   89385.5 MiB/s
+      65536 B/segment (  4096 segments)   55162.0 MiB/s
+       4096 B/segment ( 65536 segments)   48425.6 MiB/s
+```
+
+A cut costs a finalize and a restart, nothing more, and that only starts to
+show below about 1 MiB per segment. The 16 MiB stride the harness uses is
+indistinguishable from one segment over the whole block. A consumer splitting
+per 7z sub-stream — files, which are usually far bigger than a megabyte — pays
+nothing for it.
+
+Folding, by contrast, is not free, which is why the folder folds on query and
+never eagerly:
+
+```
+      16 pieces  305.417µs  (19.09 us/piece)
+     256 pieces  3.288708ms  (12.85 us/piece)
+    4096 pieces  39.37825ms  (9.61 us/piece)
+```
+
+Each `crc_fast::checksum_combine` builds a GF(2) matrix, ~10-19 µs. That is
+per *piece folded*, not per byte, and a consumer asking for one range per file
+folds a handful of pieces — but it is why `CrcFolder` answers a range by
+walking the pieces it needs rather than maintaining a running combination.
+
+#### Which lever helped
+
+None of them, and that is the finding: every one was already in the state the
+operator asked for.
+
+1. The checksum phase already runs on the worker thread, on its own still-warm
+   output, immediately after the code loop and *before* `can_write.wait()` —
+   see `mt/mtdec.rs`. No other worker's write can intervene, because the
+   worker does not hold and is not waiting on a token while it checksums.
+2. `crc-fast` is on the carry-less path with no feature work (above).
+3. Segment cuts are free at this resolution (above).
+4. Both SHA-256 backends are on the CPU's SHA extensions (above).
+5. The only sync the feature adds is one `Mutex` push of a `BlockChecks` per
+   output block, inside the write section that was already serialised — a
+   pointer-sized move under an uncontended lock, next to a 128 MiB
+   `write_all`. It cannot delay the next dispatch measurably, and the `none`
+   and CRC-32 rows above are within noise of each other, which is the
+   end-to-end version of the same statement.
+
 ### What mattered
 
 Nothing in the decoder. The first complete measurement had the parallel path
