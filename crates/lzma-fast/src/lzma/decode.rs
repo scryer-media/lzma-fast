@@ -48,97 +48,135 @@ macro_rules! update_1 {
     }};
 }
 
-/// C: `TREE_GET_BIT(probs, i)`, i.e. `GET_BIT2(probs + i, i, ;, ;)`.
-macro_rules! tree_get_bit {
-    ($probs:expr, $i:ident, $ttt:ident, $bound:ident, $range:ident, $code:ident, $buf:ident) => {{
-        let prob_ = $probs.add($i as usize);
-        $ttt = *prob_ as u32;
+/// Branch-free select: returns `a` when `mask` is all ones and `b` when it is
+/// zero.
+///
+/// C: the `csel` / `cmov*` pairs in `Asm/arm64/LzmaDecOpt.S`. Written as
+/// arithmetic rather than as an `if`, because LLVM re-forms a conditional
+/// branch out of an `if` whose arms are this cheap, which is exactly the
+/// mispredict the assembly exists to avoid.
+#[inline(always)]
+fn csel(mask: u32, a: u32, b: u32) -> u32 {
+    b ^ ((a ^ b) & mask)
+}
+
+/// Branchless single tree bit, with the two possible next probabilities
+/// loaded before the bit is known.
+///
+/// C: `NORMAL_LITER_DEC` / `TREE_GET_BIT`, restructured into the shape of
+/// `BIT_0_R` / `BIT_1_R` in `Asm/arm64/LzmaDecOpt.S`. The bit a range coder
+/// produces is close to a coin flip, so the reference assembly spends
+/// conditional selects (`csel`) instead of a branch, and issues both child
+/// loads speculatively so the next level's load latency overlaps this level's
+/// arithmetic. `UPDATE_0` and `UPDATE_1` collapse into one expression the way
+/// `CMOV_code_Model_Pre` + `PUP_BASE_2` do: with `t = bit ? ttt : ttt -
+/// kBitModelTotal`, both updates are `ttt - (t >> kNumMoveBits)` under an
+/// arithmetic shift.
+///
+/// `$pv` carries the probability for the current level, loaded by the previous
+/// expansion; `$probs` is the base of the tree.
+macro_rules! bit_tree {
+    ($probs:expr, $sym:ident, $pv:ident, $range:ident, $code:ident, $buf:ident) => {{
         normalize!($range, $code, $buf);
-        $bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $ttt;
-        if $code < $bound {
-            update_0!(prob_, $range, $bound, $ttt);
-            $i = $i + $i;
-        } else {
-            update_1!(prob_, $range, $code, $bound, $ttt);
-            $i = $i + $i + 1;
-        }
+        let bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $pv;
+        let m = (($code >= bound) as u32).wrapping_neg();
+        // C: PLOAD_LSL of probs[sym * 2] and probs_PMULT[sym * 2], i.e. both
+        // children, loaded before the select that picks one.
+        let c0 = u32::from(*$probs.add(($sym + $sym) as usize));
+        let c1 = u32::from(*$probs.add(($sym + $sym + 1) as usize));
+        let t = $pv.wrapping_sub(K_BIT_MODEL_OFFSET & !m) as i32;
+        *$probs.add($sym as usize) = ($pv as i32 - (t >> K_NUM_MOVE_BITS)) as u16;
+        $range = csel(m, $range - bound, bound);
+        $code -= bound & m;
+        $sym = $sym + $sym + (m & 1);
+        $pv = csel(m, c1, c0);
     }};
 }
 
-/// C: `MATCHED_LITER_DEC`.
+/// Last bit of a tree: [`bit_tree`] without the speculative child loads, which
+/// have no consumer and would address one level past the sub-table.
+macro_rules! bit_tree_last {
+    ($probs:expr, $sym:ident, $pv:ident, $range:ident, $code:ident, $buf:ident) => {{
+        normalize!($range, $code, $buf);
+        let bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $pv;
+        let m = (($code >= bound) as u32).wrapping_neg();
+        let t = $pv.wrapping_sub(K_BIT_MODEL_OFFSET & !m) as i32;
+        *$probs.add($sym as usize) = ($pv as i32 - (t >> K_NUM_MOVE_BITS)) as u16;
+        $range = csel(m, $range - bound, bound);
+        $code -= bound & m;
+        $sym = $sym + $sym + (m & 1);
+    }};
+}
+
+/// C: `MATCHED_LITER_DEC`, in the branchless form of `LITM` in
+/// `Asm/arm64/LzmaDecOpt.S`. Unlike [`bit_tree`] it cannot prefetch both
+/// children: the next index depends on `offs`, which the current bit decides.
 macro_rules! matched_liter_dec {
     ($prob:expr, $symbol:ident, $match_byte:ident, $offs:ident,
-     $ttt:ident, $bound:ident, $range:ident, $code:ident, $buf:ident) => {{
+     $range:ident, $code:ident, $buf:ident) => {{
         $match_byte += $match_byte;
         let bit = $offs;
         $offs &= $match_byte;
         let prob_lit = $prob.add(($offs + bit + $symbol) as usize);
-        $ttt = *prob_lit as u32;
+        let pv = u32::from(*prob_lit);
         normalize!($range, $code, $buf);
-        $bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $ttt;
-        if $code < $bound {
-            update_0!(prob_lit, $range, $bound, $ttt);
-            $symbol = $symbol + $symbol;
-            $offs ^= bit;
-        } else {
-            update_1!(prob_lit, $range, $code, $bound, $ttt);
-            $symbol = $symbol + $symbol + 1;
-        }
+        let bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * pv;
+        let m = (($code >= bound) as u32).wrapping_neg();
+        let t = pv.wrapping_sub(K_BIT_MODEL_OFFSET & !m) as i32;
+        *prob_lit = (pv as i32 - (t >> K_NUM_MOVE_BITS)) as u16;
+        $range = csel(m, $range - bound, bound);
+        $code -= bound & m;
+        $symbol = $symbol + $symbol + (m & 1);
+        // C: `offs ^= bit` on the 0 branch only; `cmovae offs, bit` in LITM.
+        $offs ^= bit & !m;
     }};
 }
 
-/// C: `REV_BIT_VAR(p, i, m)`.
-macro_rules! rev_bit_var {
-    ($probs:expr, $i:ident, $m:ident, $ttt:ident, $bound:ident,
-     $range:ident, $code:ident, $buf:ident) => {{
+/// Branchless core of `REV_BIT`: decodes one bit, updates the probability,
+/// and returns the all-ones/zero mask for the decoded bit so the caller can
+/// apply whichever of `REV_BIT_VAR` / `REV_BIT_CONST` / `REV_BIT_LAST`'s index
+/// arithmetic it needs.
+///
+/// C: `REV_BIT` in `C/LzmaDec.c`, in the conditional-select shape of `REV_1`
+/// in `Asm/arm64/LzmaDecOpt.S`.
+macro_rules! rev_bit_mask {
+    ($probs:expr, $i:expr, $range:ident, $code:ident, $buf:ident) => {{
         let prob_ = $probs.add($i as usize);
-        $ttt = *prob_ as u32;
+        let pv = u32::from(*prob_);
         normalize!($range, $code, $buf);
-        $bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $ttt;
-        if $code < $bound {
-            update_0!(prob_, $range, $bound, $ttt);
-            $i += $m;
-            $m += $m;
-        } else {
-            update_1!(prob_, $range, $code, $bound, $ttt);
-            $m += $m;
-            $i += $m;
-        }
+        let bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * pv;
+        let m_ = (($code >= bound) as u32).wrapping_neg();
+        let t = pv.wrapping_sub(K_BIT_MODEL_OFFSET & !m_) as i32;
+        *prob_ = (pv as i32 - (t >> K_NUM_MOVE_BITS)) as u16;
+        $range = csel(m_, $range - bound, bound);
+        $code -= bound & m_;
+        m_
+    }};
+}
+
+/// C: `REV_BIT_VAR(p, i, m)` — `i += m` then `m += m`, or `m += m` then
+/// `i += m`, which is `i += m + (bit ? m : 0)` with `m` doubled either way.
+macro_rules! rev_bit_var {
+    ($probs:expr, $i:ident, $m:ident, $range:ident, $code:ident, $buf:ident) => {{
+        let m_ = rev_bit_mask!($probs, $i, $range, $code, $buf);
+        $i += $m + ($m & m_);
+        $m += $m;
     }};
 }
 
 /// C: `REV_BIT_CONST(p, i, m)`.
 macro_rules! rev_bit_const {
-    ($probs:expr, $i:ident, $m:expr, $ttt:ident, $bound:ident,
-     $range:ident, $code:ident, $buf:ident) => {{
-        let prob_ = $probs.add($i as usize);
-        $ttt = *prob_ as u32;
-        normalize!($range, $code, $buf);
-        $bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $ttt;
-        if $code < $bound {
-            update_0!(prob_, $range, $bound, $ttt);
-            $i += $m;
-        } else {
-            update_1!(prob_, $range, $code, $bound, $ttt);
-            $i += $m * 2;
-        }
+    ($probs:expr, $i:ident, $m:expr, $range:ident, $code:ident, $buf:ident) => {{
+        let m_ = rev_bit_mask!($probs, $i, $range, $code, $buf);
+        $i += $m + ($m & m_);
     }};
 }
 
-/// C: `REV_BIT_LAST(p, i, m)`.
+/// C: `REV_BIT_LAST(p, i, m)` — `i -= m` on the 0 branch only.
 macro_rules! rev_bit_last {
-    ($probs:expr, $i:ident, $m:expr, $ttt:ident, $bound:ident,
-     $range:ident, $code:ident, $buf:ident) => {{
-        let prob_ = $probs.add($i as usize);
-        $ttt = *prob_ as u32;
-        normalize!($range, $code, $buf);
-        $bound = ($range >> K_NUM_BIT_MODEL_TOTAL_BITS) * $ttt;
-        if $code < $bound {
-            update_0!(prob_, $range, $bound, $ttt);
-            $i -= $m;
-        } else {
-            update_1!(prob_, $range, $code, $bound, $ttt);
-        }
+    ($probs:expr, $i:ident, $m:expr, $range:ident, $code:ident, $buf:ident) => {{
+        let m_ = rev_bit_mask!($probs, $i, $range, $code, $buf);
+        $i -= $m & !m_;
     }};
 }
 
@@ -262,14 +300,15 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                         state -= if state < 4 { state } else { 3 };
                         symbol = 1;
                         // C: NORMAL_LITER_DEC x8
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, symbol, ttt, bound, range, code, buf);
+                        let mut pv = u32::from(*prob.add(1));
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree!(prob, symbol, pv, range, code, buf);
+                        bit_tree_last!(prob, symbol, pv, range, code, buf);
                     } else {
                         let mut match_byte =
                             u32::from(*dic.add(dic_pos.wrapping_sub(rep0 as usize).wrapping_add(
@@ -283,30 +322,14 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                         state -= if state < 10 { 3 } else { 6 };
                         symbol = 1;
                         // C: MATCHED_LITER_DEC x8
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
-                        matched_liter_dec!(
-                            prob, symbol, match_byte, offs, ttt, bound, range, code, buf
-                        );
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
+                        matched_liter_dec!(prob, symbol, match_byte, offs, range, code, buf);
                     }
 
                     *dic.add(dic_pos) = symbol as u8;
@@ -401,9 +424,10 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                             update_0!(prob_len, range, bound, ttt);
                             prob_len = prob.add(LEN_LOW + pos_state as usize);
                             len = 1;
-                            tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
-                            tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
-                            tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
+                            let mut pv = u32::from(*prob_len.add(1));
+                            bit_tree!(prob_len, len, pv, range, code, buf);
+                            bit_tree!(prob_len, len, pv, range, code, buf);
+                            bit_tree_last!(prob_len, len, pv, range, code, buf);
                             len -= 8;
                         } else {
                             update_1!(prob_len, range, code, bound, ttt);
@@ -416,20 +440,20 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                                 prob_len = prob
                                     .add(LEN_LOW + pos_state as usize + (1 << K_LEN_NUM_LOW_BITS));
                                 len = 1;
-                                tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
-                                tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
-                                tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
+                                let mut pv = u32::from(*prob_len.add(1));
+                                bit_tree!(prob_len, len, pv, range, code, buf);
+                                bit_tree!(prob_len, len, pv, range, code, buf);
+                                bit_tree_last!(prob_len, len, pv, range, code, buf);
                             } else {
                                 update_1!(prob_len, range, code, bound, ttt);
                                 prob_len = prob.add(LEN_HIGH);
                                 // C: TREE_DECODE(probLen, (1 << kLenNumHighBits), len)
                                 len = 1;
-                                loop {
-                                    tree_get_bit!(prob_len, len, ttt, bound, range, code, buf);
-                                    if len >= (1 << K_LEN_NUM_HIGH_BITS) {
-                                        break;
-                                    }
+                                let mut pv = u32::from(*prob_len.add(1));
+                                for _ in 0..K_LEN_NUM_HIGH_BITS - 1 {
+                                    bit_tree!(prob_len, len, pv, range, code, buf);
                                 }
+                                bit_tree_last!(prob_len, len, pv, range, code, buf);
                                 len -= 1 << K_LEN_NUM_HIGH_BITS;
                                 len += K_LEN_NUM_LOW_SYMBOLS * 2;
                             }
@@ -448,12 +472,13 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                         }
                         // C: TREE_6_DECODE(prob, distance)
                         distance = 1;
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
-                        tree_get_bit!(prob, distance, ttt, bound, range, code, buf);
+                        let mut pv = u32::from(*prob.add(1));
+                        bit_tree!(prob, distance, pv, range, code, buf);
+                        bit_tree!(prob, distance, pv, range, code, buf);
+                        bit_tree!(prob, distance, pv, range, code, buf);
+                        bit_tree!(prob, distance, pv, range, code, buf);
+                        bit_tree!(prob, distance, pv, range, code, buf);
+                        bit_tree_last!(prob, distance, pv, range, code, buf);
                         distance -= 0x40;
 
                         if distance >= K_START_POS_MODEL_INDEX {
@@ -467,9 +492,7 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                                     let mut m: u32 = 1;
                                     distance += 1;
                                     loop {
-                                        rev_bit_var!(
-                                            prob, distance, m, ttt, bound, range, code, buf
-                                        );
+                                        rev_bit_var!(prob, distance, m, range, code, buf);
                                         num_direct_bits -= 1;
                                         if num_direct_bits == 0 {
                                             break;
@@ -507,10 +530,10 @@ pub(crate) unsafe fn lzma_dec_decode_real(
                                 distance <<= K_NUM_ALIGN_BITS;
                                 {
                                     let mut i: u32 = 1;
-                                    rev_bit_const!(prob, i, 1, ttt, bound, range, code, buf);
-                                    rev_bit_const!(prob, i, 2, ttt, bound, range, code, buf);
-                                    rev_bit_const!(prob, i, 4, ttt, bound, range, code, buf);
-                                    rev_bit_last!(prob, i, 8, ttt, bound, range, code, buf);
+                                    rev_bit_const!(prob, i, 1, range, code, buf);
+                                    rev_bit_const!(prob, i, 2, range, code, buf);
+                                    rev_bit_const!(prob, i, 4, range, code, buf);
+                                    rev_bit_last!(prob, i, 8, range, code, buf);
                                     distance |= i;
                                 }
                                 if distance == 0xFFFF_FFFF {

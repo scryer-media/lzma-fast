@@ -10,6 +10,13 @@ pub(crate) const K_TOP_VALUE: u32 = 1 << 24;
 pub(crate) const K_NUM_BIT_MODEL_TOTAL_BITS: u32 = 11;
 /// C: `kBitModelTotal`.
 pub(crate) const K_BIT_MODEL_TOTAL: u32 = 1 << K_NUM_BIT_MODEL_TOTAL_BITS;
+/// C: `kBitModelOffset` in `Asm/arm64/LzmaDecOpt.S`. Subtracting it before an
+/// arithmetic right shift by `kNumMoveBits` makes one expression serve as both
+/// `UPDATE_0` and `UPDATE_1`: with `t = bit ? ttt : ttt - kBitModelOffset`,
+/// `ttt - (t >> kNumMoveBits)` reproduces `ttt + ((kBitModelTotal - ttt) >>
+/// kNumMoveBits)` and `ttt - (ttt >> kNumMoveBits)` exactly, rounding
+/// included.
+pub(crate) const K_BIT_MODEL_OFFSET: u32 = K_BIT_MODEL_TOTAL - (1 << K_NUM_MOVE_BITS) + 1;
 /// C: `kNumMoveBits`.
 pub(crate) const K_NUM_MOVE_BITS: u32 = 5;
 
