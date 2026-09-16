@@ -41,3 +41,5 @@
 **/fuzz/coverage/
 **/fuzz/Cargo.lock
 **/*.pyc
+asm-lab/build/
+asm-lab/__pycache__/
