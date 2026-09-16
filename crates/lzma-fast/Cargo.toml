@@ -7,7 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords = ["lzma", "lzma2", "7z", "xz", "decompression"]
+keywords = ["lzma", "lzma2", "xz", "decompression"]
 categories = ["compression", "no-std"]
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
@@ -26,13 +26,11 @@ crc = ["std", "dep:crc-fast"]
 # The default backend is RustCrypto; `aws-lc` adds the AWS-LC one and takes
 # precedence when both are on. The features are additive: either, or both,
 # builds and passes the same tests.
-crypto = ["dep:sha2", "dep:aes", "dep:cbc"]
+crypto = ["dep:sha2"]
 aws-lc = ["std", "dep:aws-lc-rs"]
 
 [dependencies]
-aes = { version = "0.9.3", default-features = false, optional = true }
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
-cbc = { version = "0.2.1", default-features = false, optional = true }
 crc-fast = { version = "1.10.0", default-features = false, optional = true }
 sha2 = { version = "0.11.0", default-features = false, optional = true }
 

@@ -20,6 +20,11 @@
   decoding.
 - `Error::CorruptRun` locates corruption by run index and output offset, and
   `Error::Cancelled` reports a cancelled decode.
+- Removed `crypto::Aes256Cbc` and `crypto::sevenz_key`, and with them the
+  `aes` and `cbc` dependencies. The crate is LZMA, LZMA2 and xz; 7z archives
+  are a separate crate's job. `crypto` now provides SHA-256 alone, which is
+  what an xz stream with check type 10 needs, and `crc` is unchanged because
+  CRC-32 and CRC-64/XZ are xz check types 1 and 4.
 - `Lzma2Dec_Parse` is ported as `lzma2::parse`, and the LZMA2 chunk-header
   state machine it shares with the decoder is factored out into `lzma2::frame`
   so the parser and the decoder cannot drift apart.

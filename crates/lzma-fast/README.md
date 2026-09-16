@@ -57,11 +57,14 @@ see [docs/porting.md](../../docs/porting.md) for the plan.
 | `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
 | `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
 | `crc` | no | CRC-32 and CRC-64/XZ, from `crc-fast` |
-| `crypto` | no | SHA-256, unpadded AES-256-CBC and the 7z key derivation, from RustCrypto |
+| `crypto` | no | SHA-256, xz check type 10, from RustCrypto |
 | `aws-lc` | no | the same crypto API over `aws-lc-rs`, taking precedence over `crypto` |
 
+This crate is LZMA, LZMA2 and the xz container, and nothing else: 7z archives
+are handled by a fork of `sevenz-rust2` that depends on it.
+
 The decoder itself has no dependencies under any combination of these; `crc`
-and `crypto` exist for the container layer described in
+and `crypto` exist for the xz layer described in
 [docs/porting.md](../../docs/porting.md), and nothing in `src/lzma/` or
 `src/lzma2/` can reach them.
 

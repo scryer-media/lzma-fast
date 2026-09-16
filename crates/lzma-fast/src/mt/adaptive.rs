@@ -203,6 +203,15 @@ impl Lzma2AdaptiveDecoder {
         self.pool.as_ref().map_or(0, Pool::spawned)
     }
 
+    /// How many worker threads are running right now.
+    ///
+    /// Equal to [`Lzma2AdaptiveDecoder::spawned_threads`] until the decoder is
+    /// cancelled or dropped, at which point it must fall to zero.
+    #[must_use]
+    pub fn live_threads(&self) -> usize {
+        self.pool.as_ref().map_or(0, Pool::live)
+    }
+
     /// Delivers blocks in stream order (the default), or as soon as they are
     /// decoded.
     ///

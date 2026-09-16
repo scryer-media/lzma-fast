@@ -215,13 +215,15 @@ impl Lzma2ParallelDecoder {
             );
         }
 
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let props = Lzma2CoderProps {
             prop: self.dict_prop,
             out_block_max: self.plan.out_block_max,
             out_size: None,
             finish_mode: false,
+            finished: std::sync::Arc::clone(&finished),
         };
-        let make = move || Lzma2Coder::new(props);
+        let make = || Lzma2Coder::new(props.clone());
 
         let (replay, read_was_finished, mut written) = {
             let mt: MtDec<'_, Lzma2Coder> =
@@ -234,6 +236,11 @@ impl Lzma2ParallelDecoder {
         };
 
         if replay.is_empty() && read_was_finished {
+            if !finished.load(std::sync::atomic::Ordering::Relaxed) {
+                // The threaded pass consumed the whole stream without reaching
+                // an end marker, so there was no end marker.
+                return Err(to_io(Error::CorruptData));
+            }
             return Ok(written);
         }
 

@@ -5,6 +5,8 @@
 //! `C/Lzma2DecMt.c`.
 
 use alloc::vec::Vec;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
@@ -17,7 +19,7 @@ use crate::mt::mtdec::{CallbackInfo, Coder, MtError, ParseState, WriteCtx};
 const SMALL_BLOCK: usize = 1 << 14;
 
 /// The parameters every worker needs, copied into each one.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Lzma2CoderProps {
     /// The LZMA2 dictionary-size property byte.
     pub(crate) prop: u8,
@@ -27,6 +29,13 @@ pub(crate) struct Lzma2CoderProps {
     pub(crate) out_size: Option<u64>,
     /// C: `p->finishMode`.
     pub(crate) finish_mode: bool,
+    /// Set by whichever worker writes the block that ends the stream.
+    ///
+    /// C: nothing. `Lzma2DecMt_Decode` returns `SZ_OK` whether or not the
+    /// threaded pass reached the end marker, so a stream that stops early
+    /// decodes to a prefix and reports success. The caller checks this
+    /// instead.
+    pub(crate) finished: Arc<AtomicBool>,
 }
 
 /// C: `CLzma2DecMtThread`.
@@ -57,6 +66,8 @@ pub(crate) struct Lzma2Coder {
     out_code_size: u64,
     /// C: `t->codeRes`.
     code_res: Option<Error>,
+    /// The parse walked into a byte the format does not allow.
+    parse_failed: bool,
 }
 
 impl Lzma2Coder {
@@ -65,9 +76,10 @@ impl Lzma2Coder {
     /// `Lzma2Dec_Allocate`): a worker never owns a dictionary, because its
     /// dictionary is the output block it is about to fill.
     pub(crate) fn new(props: Lzma2CoderProps) -> Result<Self, Error> {
+        let dec = Lzma2Decoder::new_probs_only(props.prop)?;
         Ok(Lzma2Coder {
             props,
-            dec: Lzma2Decoder::new_probs_only(props.prop)?,
+            dec,
             parser: Lzma2Parser::new(),
             out_buf: Vec::new(),
             state: ParseState::Continue,
@@ -77,6 +89,7 @@ impl Lzma2Coder {
             in_code_size: 0,
             out_code_size: 0,
             code_res: None,
+            parse_failed: false,
         })
     }
 
@@ -104,6 +117,7 @@ impl Coder for Lzma2Coder {
             self.in_code_size = 0;
             self.out_code_size = 0;
             self.code_res = None;
+            self.parse_failed = false;
             // (cc->srcSize == 0) is allowed
         }
 
@@ -190,6 +204,9 @@ impl Coder for Lzma2Coder {
 
         self.in_pre_size += cc.src_size as u64;
         self.parse_status = status;
+        if self.parser.errored() {
+            self.parse_failed = true;
+        }
 
         if overflow {
             cc.state = ParseState::Overflow;
@@ -327,6 +344,9 @@ impl Coder for Lzma2Coder {
     ) -> Result<(), MtError> {
         self.reclaim_out_buf();
         let size = self.out_code_size as usize;
+        if self.parse_failed {
+            return Err(MtError::Lzma(Error::CorruptData));
+        }
 
         let mut need_continue2 = true;
         *need_continue = false;
@@ -356,6 +376,9 @@ impl Coder for Lzma2Coder {
         ctx.out.write_all(&self.out_buf[..size])?;
         *ctx.out_processed += size as u64;
         *need_continue = need_continue2;
+        if self.parse_status == ParseStatus::FinishedWithMark {
+            self.props.finished.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 }

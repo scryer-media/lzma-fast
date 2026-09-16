@@ -19,7 +19,7 @@
 
 use alloc::vec::Vec;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -62,6 +62,10 @@ pub(crate) struct Pool {
     done_tx: Sender<Done>,
     job_rx: Arc<std::sync::Mutex<Receiver<Job>>>,
     cancel: Arc<AtomicBool>,
+    /// Workers that have started and not yet returned. Only a test reads it,
+    /// but it is what makes "no thread is left behind" checkable rather than
+    /// asserted.
+    live: Arc<AtomicUsize>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -76,6 +80,7 @@ impl Pool {
             done_tx,
             job_rx: Arc::new(std::sync::Mutex::new(job_rx)),
             cancel: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(AtomicUsize::new(0)),
             handles: Vec::new(),
         }
     }
@@ -83,6 +88,11 @@ impl Pool {
     /// How many threads have actually been spawned.
     pub(crate) fn spawned(&self) -> usize {
         self.handles.len()
+    }
+
+    /// How many worker threads are running right now.
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// Spawns one more worker, if the pool is still accepting work.
@@ -96,11 +106,14 @@ impl Pool {
         let rx = Arc::clone(&self.job_rx);
         let tx = self.done_tx.clone();
         let cancel = Arc::clone(&self.cancel);
+        let live = Arc::clone(&self.live);
         let prop = self.dict_prop;
         let name = alloc::format!("lzma2-mt-{}", self.handles.len());
-        let spawned = std::thread::Builder::new()
-            .name(name)
-            .spawn(move || worker(prop, &rx, &tx, &cancel));
+        let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            live.fetch_add(1, Ordering::Relaxed);
+            worker(prop, &rx, &tx, &cancel);
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
         // A thread that will not start is not an error: the work is simply
         // done by the threads that did, or on the caller's own stack.
         // A thread that will not start is not an error: the work is simply

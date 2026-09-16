@@ -82,7 +82,7 @@ pub enum Error { UnsupportedProps, CorruptData, /* … */ }
 ```
 
 `std::io::Read` adapters (`LzmaReader`, `Lzma2Reader`) sit on top of that in
-the `std` feature and are what a 7z/xz container parser consumes.
+the `std` feature and are what a container parser consumes.
 
 ## Acceptance gate
 
@@ -99,9 +99,15 @@ and knows nothing about the files those streams arrive in. The layer above it
 is not written yet; this section fixes its shape so that when it is, it is
 ported from the same tree with the same discipline.
 
-Two things that layer needs first, and which the crate already has: the
-checksums in [`crate::crc`] (`crc` feature, `crc-fast`) and the cryptography
-in [`crate::crypto`] (`crypto` / `aws-lc` features). Both are optional, off by
+The container this crate covers is xz, and only xz. 7z — its header, folders
+and coder graphs, its BCJ and delta filters, its AES-256 and the `7zAes` key
+derivation — is out of scope here and is handled by a fork of `sevenz-rust2`
+that depends on this crate.
+
+Two things the xz layer needs first, and which the crate already has: the
+checksums in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check
+type 1 and CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`]
+(`crypto` / `aws-lc` features; check type 10). Both are optional, off by
 default, and unreachable from the decoder.
 
 ### xz
@@ -123,30 +129,6 @@ The index is what makes random access possible: it records, for every block,
 the compressed and uncompressed size, so a reader can seek to a block boundary
 without decoding what precedes it. The footer repeats the index size and its
 CRC-32 so the index can be found from the end of the file.
-
-### 7z
-
-C: `C/7zIn.c` (header), `C/7zDec.c` (folder decoding), `C/7zAes.c`
-(encryption), driven by `C/7zArcIn.c`.
-
-A `.7z` file is a 32-byte signature header pointing at an encoded header at
-the end of the file, which is itself often a compressed stream that must be
-decoded before it can be parsed. The parsed header describes *folders*: a
-folder is a small dataflow graph of coders (LZMA, LZMA2, BCJ, delta, AES, …)
-with bind pairs joining outputs to inputs, packed streams feeding the leaves,
-and one unpacked stream coming out. `7zDec.c`'s `SzFolder_Decode` is the
-function to port, and its shape — decode the coder chain from the outside in,
-one folder at a time, with the substream sizes and CRCs applied afterwards —
-is the shape to keep.
-
-Encryption is coder id `06F10701`: AES-256-CBC over the folder's packed
-stream, with the key derived from the UTF-16LE password and the coder's salt
-by the iterated SHA-256 in `7zAes.c`. [`crate::crypto::sevenz_key`] is that
-derivation, and [`crate::crypto::Aes256Cbc`] is the unpadded CBC the folder
-needs; the reader has only to feed them. Note the two special cycle counts
-(`0x3F` means the salt and password *are* the key; `0x40` and above are
-rejected), because they are easy to miss and impossible to guess from a
-stream.
 
 None of this is implemented. When it is: the same rules as the decoder — port
 rather than redesign, cite the C function, prove it differentially against

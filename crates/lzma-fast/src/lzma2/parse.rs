@@ -66,6 +66,18 @@ impl Lzma2Parser {
 
     /// C: `p->unpackSize`, the declared output size of the chunk whose header
     /// was just read. Only meaningful right after [`ParseStatus::NewChunk`].
+    /// Whether the walk has run into something the format does not allow.
+    ///
+    /// C: `p->state == LZMA2_STATE_ERROR`. `Lzma2Dec_Parse` reports this only
+    /// by returning `LZMA_STATUS_NOT_SPECIFIED`, which it also returns for a
+    /// block that simply did not finish, and `Lzma2DecMt` does not tell the
+    /// two apart — so a stream whose very first control byte is invalid
+    /// decodes to nothing and reports success. The port keeps the C's return
+    /// values and adds this, so its caller can.
+    pub(crate) fn errored(&self) -> bool {
+        self.frame.state == Lzma2State::Error
+    }
+
     pub(crate) fn unpack_size(&self) -> u32 {
         self.frame.unpack_size
     }
