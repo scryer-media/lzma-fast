@@ -22,9 +22,19 @@
   `Error::Cancelled` reports a cancelled decode.
 - Removed `crypto::Aes256Cbc` and `crypto::sevenz_key`, and with them the
   `aes` and `cbc` dependencies. The crate is LZMA, LZMA2 and xz; 7z archives
-  are a separate crate's job. `crypto` now provides SHA-256 alone, which is
-  what an xz stream with check type 10 needs, and `crc` is unchanged because
-  CRC-32 and CRC-64/XZ are xz check types 1 and 4.
+  — the header, folders, coder graphs, BCJ and delta filters, AES-256 and the
+  `7zAes.c` key derivation — are a separate crate's job, a fork of
+  `sevenz-rust2` that depends on this one. `crypto` now provides SHA-256
+  alone, which is what an xz stream with check type 10 needs.
+- Crypto backends swapped round, and both checks turned on by default:
+  `crypto` (now default) is SHA-256 over `aws-lc-rs`, and the new
+  `native-crypto` is the RustCrypto `sha2` one, taking precedence when both
+  are enabled so that opting out of the C build cannot be undone by another
+  crate in the graph. The `aws-lc` feature name is gone. `crc` is also default
+  now, because every xz stream carries a check and two of the three check
+  types are CRC-32 and CRC-64/XZ. `--no-default-features` still builds as
+  `no_std` + `alloc` with none of it, and nothing in `src/lzma/` or
+  `src/lzma2/` can reach any of it either way.
 - `Lzma2Dec_Parse` is ported as `lzma2::parse`, and the LZMA2 chunk-header
   state machine it shares with the decoder is factored out into `lzma2::frame`
   so the parser and the decoder cannot drift apart.
@@ -46,12 +56,10 @@
   other target, and `--no-default-features --features std`, get the portable
   Rust port of the C loop, which stays the differential reference for the
   assembly.
-- Optional, off-by-default support for what a container reader around LZMA
-  needs: `crc` gives CRC-32 and CRC-64/XZ from `crc-fast`, and `crypto` gives
-  SHA-256, unpadded AES-256-CBC and the 7z key derivation from `7zAes.c`. The
-  crypto backend is RustCrypto (`sha2`, `aes`, `cbc`) by default; the `aws-lc`
-  feature adds an `aws-lc-rs` one and takes precedence when both are enabled.
-  The features are additive, and with both backends compiled a test requires
-  them to agree.
+- Optional support for what a container reader around LZMA needs: `crc` gives
+  CRC-32 and CRC-64/XZ from `crc-fast`, and `crypto` gives SHA-256 with a
+  choice of backend. The features are additive, and with both crypto backends
+  compiled a test requires them to agree. (See 0.2.0 for the backend and
+  default-feature layout these ended up with.)
 - No dependencies in the decoder itself, no C and no build script: the assembly is `core::arch`
   inline assembly in the crate itself. Decode only.

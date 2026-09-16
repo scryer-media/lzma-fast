@@ -107,8 +107,11 @@ that depends on this crate.
 Two things the xz layer needs first, and which the crate already has: the
 checksums in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check
 type 1 and CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`]
-(`crypto` / `aws-lc` features; check type 10). Both are optional, off by
-default, and unreachable from the decoder.
+(check type 10), which is `aws-lc-rs` under the `crypto` feature and
+RustCrypto's `sha2` under `native-crypto`, the latter winning when both are
+on. All three are on by default, because every xz stream carries one of the
+three checks; all three are unreachable from the decoder, and
+`--no-default-features` has none of them.
 
 ### xz
 

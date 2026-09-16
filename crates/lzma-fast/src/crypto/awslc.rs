@@ -1,4 +1,4 @@
-//! The AWS-LC backend, behind the `aws-lc` feature: `aws-lc-rs` over AWS-LC,
+//! The AWS-LC backend, behind the default `crypto` feature: `aws-lc-rs` over AWS-LC,
 //! for callers who already have it in the build or who need its FIPS story.
 
 use super::SHA256_LEN;

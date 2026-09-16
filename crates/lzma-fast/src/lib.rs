@@ -67,7 +67,7 @@ pub use reader::{Lzma2Reader, LzmaReader};
 
 #[cfg(feature = "crc")]
 pub mod crc;
-#[cfg(any(feature = "crypto", feature = "aws-lc"))]
+#[cfg(any(feature = "crypto", feature = "native-crypto"))]
 pub mod crypto;
 
 /// Whether this build decodes with the assembly loop ported from the LZMA

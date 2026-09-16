@@ -113,20 +113,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The default features now include `crypto`, which builds AWS-LC, so
+      # this lane needs CMake - present on all four runners - and, on Windows
+      # x86-64, an assembler for the NASM sources. `aws-lc-sys` is pulled with
+      # its `prebuilt-nasm` feature and without `fips`, which is exactly the
+      # combination its README says ships prebuilt NASM objects for Windows
+      # x86-64, so no NASM install is needed; it would only be used if one
+      # happened to be on PATH. That is why there is no setup-nasm step here
+      # and why Windows no longer skips the default build.
       - name: Test with the assembly decode loop (default)
         run: cargo test --locked --workspace --no-fail-fast
-      - name: Test the checksum and crypto modules
-        run: cargo test --locked -p lzma-fast --features crc,crypto --no-fail-fast
       - name: Test with the portable decode loop
         run: cargo test --locked -p lzma-fast --no-default-features --features std --no-fail-fast
       - name: Test without std
         run: cargo test --locked -p lzma-fast --no-default-features --no-fail-fast
-      # aws-lc-rs builds AWS-LC, which needs CMake; it is present on the Linux
-      # and macOS runners and not on the Windows one, so that lane is skipped
-      # there rather than given a toolchain this crate does not otherwise need.
-      - name: Test the AWS-LC crypto backend
-        if: matrix.platform != 'windows-x86_64'
-        run: cargo test --locked -p lzma-fast --features crc,crypto,aws-lc --no-fail-fast
+      # The pure-Rust crypto backend on its own: no C toolchain involved, and
+      # the shape a consumer that wants none uses.
+      - name: Test the RustCrypto backend alone
+        run: cargo test --locked -p lzma-fast --no-default-features --features std,native-crypto --no-fail-fast
+      # Both backends compiled at once, which is what runs the differential
+      # test between them.
+      - name: Test both crypto backends against each other
+        run: cargo test --locked -p lzma-fast --features native-crypto --no-fail-fast
 
   msrv:
     name: msrv

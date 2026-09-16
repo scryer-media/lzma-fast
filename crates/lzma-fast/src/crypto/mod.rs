@@ -6,20 +6,24 @@
 //!
 //! There are two backends behind one API:
 //!
-//! - [`rustcrypto`], the default, from the `sha2` crate;
-//! - [`awslc`], from `aws-lc-rs`, behind the `aws-lc` feature.
+//! - [`awslc`], from `aws-lc-rs`, behind the default `crypto` feature;
+//! - [`rustcrypto`], from the `sha2` crate, behind `native-crypto`, for a
+//!   build that wants no C toolchain.
 //!
-//! The features are additive. With both on, both backends are compiled, the
-//! public type is the AWS-LC one, and a test checks the two agree.
+//! The features are additive, and `native-crypto` wins: with both on, both
+//! backends are compiled, the public type is the RustCrypto one, and a test
+//! checks the two agree. That is deliberate - the opt-out has to be an
+//! opt-out even when something else in the dependency graph turns `crypto`
+//! back on.
 
-#[cfg(feature = "aws-lc")]
-pub mod awslc;
 #[cfg(feature = "crypto")]
+pub mod awslc;
+#[cfg(feature = "native-crypto")]
 pub mod rustcrypto;
 
-#[cfg(feature = "aws-lc")]
+#[cfg(all(feature = "crypto", not(feature = "native-crypto")))]
 pub use awslc::Sha256;
-#[cfg(all(feature = "crypto", not(feature = "aws-lc")))]
+#[cfg(feature = "native-crypto")]
 pub use rustcrypto::Sha256;
 
 /// What can go wrong in this module. Nothing here is a decode error, so it
@@ -89,7 +93,7 @@ mod tests {
 
     /// With both backends compiled they must agree, byte for byte. This is
     /// the same differential discipline the decoder uses.
-    #[cfg(all(feature = "crypto", feature = "aws-lc"))]
+    #[cfg(all(feature = "crypto", feature = "native-crypto"))]
     #[test]
     fn the_two_backends_agree() {
         let data: alloc::vec::Vec<u8> = (0u32..5000).map(|i| (i * 31 + 7) as u8).collect();

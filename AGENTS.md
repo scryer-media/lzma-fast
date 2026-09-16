@@ -22,9 +22,10 @@ the reference decoder. Readability that costs throughput is not wanted.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only
    library dependencies the crate may take are `crc-fast`, behind the `crc`
-   feature, and the crypto backends — `sha2`/`aes`/`cbc` behind `crypto`,
-   `aws-lc-rs` behind `aws-lc` — all optional, all off by default, and all
-   confined to `src/crc.rs` and `src/crypto/`. Anything else needs a decision
+   feature, and the SHA-256 backends — `aws-lc-rs` behind `crypto`, `sha2`
+   behind `native-crypto` — all optional, all confined to `src/crc.rs` and
+   `src/crypto/`, and none of them reachable from the decoder even when the
+   default features have them on. Anything else needs a decision
    from the maintainer, not from an agent. Dev-dependencies and the bench tool
    may pull what they need.
 5. Correctness is proven differentially: decoded bytes must equal what

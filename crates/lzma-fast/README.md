@@ -56,9 +56,9 @@ see [docs/porting.md](../../docs/porting.md) for the plan.
 | --- | --- | --- |
 | `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
 | `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
-| `crc` | no | CRC-32 and CRC-64/XZ, from `crc-fast` |
-| `crypto` | no | SHA-256, xz check type 10, from RustCrypto |
-| `aws-lc` | no | the same crypto API over `aws-lc-rs`, taking precedence over `crypto` |
+| `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast` |
+| `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
+| `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 
 This crate is LZMA, LZMA2 and the xz container, and nothing else: 7z archives
 are handled by a fork of `sevenz-rust2` that depends on it.
@@ -66,10 +66,21 @@ are handled by a fork of `sevenz-rust2` that depends on it.
 The decoder itself has no dependencies under any combination of these; `crc`
 and `crypto` exist for the xz layer described in
 [docs/porting.md](../../docs/porting.md), and nothing in `src/lzma/` or
-`src/lzma2/` can reach them.
+`src/lzma2/` can reach them. `--no-default-features` builds as `no_std` +
+`alloc` with none of them.
 
-`aws-lc` builds AWS-LC, which needs a C toolchain and CMake; `crypto` needs
-neither and works wherever the decoder does.
+`crc` and `crypto` are on by default because every xz stream carries a check,
+and a check is one of CRC-32, CRC-64/XZ or SHA-256. `crypto` builds AWS-LC,
+which needs a C toolchain and CMake; a build that wants neither takes
+
+```toml
+lzma-fast = { version = "0.2", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+```
+
+which is pure Rust and works wherever the decoder does. `native-crypto` wins
+over `crypto` when both are enabled, so turning it on is an opt-out that
+another crate in the graph cannot undo; with both compiled, a test requires
+the two backends to produce the same digests.
 
 ## Provenance and license
 
