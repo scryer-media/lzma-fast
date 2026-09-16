@@ -1,0 +1,28 @@
+name: Bug report
+description: A decode produced wrong output, an error on valid input, a panic or a hang.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: lzma-fast version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the error or panic message and how the input was produced (encoder, level, container).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A small input attached or a command that generates one. Never attach private data.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform (OS, CPU, rustc version)

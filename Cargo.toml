@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/lzma-fast",
+    "tools/lzma-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-fast"
+
+[workspace.dependencies]
+lzma-fast = { path = "crates/lzma-fast", version = "0.1.0" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Benchmarks and profiling want symbols without giving up codegen.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1

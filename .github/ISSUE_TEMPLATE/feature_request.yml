@@ -1,0 +1,15 @@
+name: Feature request
+description: Something the decoder should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need and why
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope check
+      description: This crate is decode-only and container-agnostic. If the request is an encoder or a .7z/.xz parser, say why it belongs here.

@@ -1,0 +1,20 @@
+[package]
+name = "lzma-fast"
+description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["lzma", "lzma2", "7z", "xz", "decompression"]
+categories = ["compression", "no-std"]
+exclude = ["tests/fixtures/**", "fuzz/**"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]

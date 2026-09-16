@@ -1,0 +1,43 @@
+/target/
+/target-*/
+
+# Benchmark fixtures are generated locally (scripts/make-fixtures.sh) and are
+# gigabytes of synthetic data; only the generator and its README are tracked.
+/bench/fixtures/*
+!/bench/fixtures/README.md
+/bench/results/
+
+# Local CI/release artifacts
+/.ci-*.txt
+/dist/
+/package/
+/logs/
+/lzma-fast-*.tar.gz
+/lzma-fast-*.zip
+/SHA256SUMS
+
+# Rust profiling/coverage
+/coverage/
+/tarpaulin-report.html
+*.profraw
+*.profdata
+/perf.data*
+/*.trace/
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+**/.DS_Store
+._*
+
+# Cargo-fuzz build state and generated crash artifacts. Tracked corpus seeds
+# live under each fuzz/corpus directory and are intentionally not ignored.
+**/fuzz/target/
+**/fuzz/artifacts/
+**/fuzz/coverage/
+**/fuzz/Cargo.lock
+**/*.pyc
