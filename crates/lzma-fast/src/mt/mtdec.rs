@@ -132,6 +132,12 @@ pub(crate) trait Coder: Send {
         out_code_pos: &mut u64,
         stop: &mut bool,
     ) -> Result<(), MtError>;
+    /// C: nothing. Called on the worker thread once its block is decoded and
+    /// before it waits for the write token, so that anything derived from the
+    /// block's bytes is computed in parallel rather than in the ring's one
+    /// serialised section. Default: do nothing.
+    #[cfg(feature = "crc")]
+    fn checksum(&mut self) {}
     /// C: `IMtDecCallback2::Write`.
     fn write(
         &mut self,
@@ -746,6 +752,19 @@ impl<'e, C: Coder> MtDec<'e, C> {
                     link += 1;
                     is_start_block = false;
                 }
+            }
+
+            // ---------- CHECKSUM ----------
+            //
+            // Still on the worker thread, still outside the write token.
+            #[cfg(feature = "crc")]
+            if code_res.is_none()
+                && io_err.is_none()
+                && res.is_none()
+                && !was_interrupted
+                && let Some(c) = coder.as_mut()
+            {
+                c.checksum();
             }
 
             // ---------- WRITE ----------

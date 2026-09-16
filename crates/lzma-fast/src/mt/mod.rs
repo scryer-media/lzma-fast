@@ -16,6 +16,8 @@
 //! the LZMA2-specific half plus the public API and the single-threaded tail.
 
 pub mod adaptive;
+#[cfg(feature = "crc")]
+pub mod checksum;
 mod event;
 mod lzma2;
 mod mtdec;
@@ -24,6 +26,12 @@ mod pool;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+
+#[cfg(feature = "crc")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "crc")]
+use checksum::{BlockChecks, ChecksumPlan, Segmenter};
 
 use crate::error::{Error, FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
@@ -96,6 +104,15 @@ impl Default for Lzma2MtOptions {
         }
     }
 }
+
+/// Where finished [`BlockChecks`] are put by whichever thread produced them.
+///
+/// The lock is taken once per output block, inside the ring's write section,
+/// which is already serialised - so it adds a lock acquisition per 128 MiB of
+/// output and no contention. The *checksumming* is emphatically not done here;
+/// see [`crate::checksum`].
+#[cfg(feature = "crc")]
+pub(crate) type ChecksumSink = Arc<Mutex<Vec<BlockChecks>>>;
 
 /// The sizes a decode will actually run with.
 ///
@@ -195,13 +212,66 @@ impl Lzma2ParallelDecoder {
     pub fn decode<R: Read + Send, W: Write + Send>(&self, input: R, out: W) -> io::Result<u64> {
         let mut input = input;
         let mut out = out;
-        self.decode_dyn(&mut input, &mut out)
+        #[cfg(feature = "crc")]
+        return self.decode_dyn(&mut input, &mut out, &ChecksumPlan::none(), None);
+        #[cfg(not(feature = "crc"))]
+        return self.decode_dyn(&mut input, &mut out);
+    }
+
+    /// Decodes `input` to `out`, checksumming each block in the worker that
+    /// produced it, and returns the bytes written together with what was
+    /// computed.
+    ///
+    /// The returned [`BlockChecks`] are in output order and tile the whole
+    /// output: one per block the threaded pass wrote, plus one covering the
+    /// single-threaded tail if there was one. Fold their segments into the
+    /// ranges you care about with [`crate::crc::CrcFolder`].
+    ///
+    /// This costs the decode nothing that a consumer computing the same
+    /// checksum would not cost it more: see [`crate::checksum`] for why.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2ParallelDecoder::decode`].
+    #[cfg(feature = "crc")]
+    pub fn decode_checksummed<R: Read + Send, W: Write + Send>(
+        &self,
+        input: R,
+        out: W,
+        plan: &ChecksumPlan,
+    ) -> io::Result<(u64, Vec<BlockChecks>)> {
+        let mut input = input;
+        let mut out = out;
+        let sink: ChecksumSink = Arc::new(Mutex::new(Vec::new()));
+        let n = self.decode_to_sink(&mut input, &mut out, plan, &sink)?;
+        let checks = Arc::try_unwrap(sink)
+            .map(|m| m.into_inner().unwrap_or_default())
+            .unwrap_or_default();
+        Ok((n, checks))
+    }
+
+    /// As [`Lzma2ParallelDecoder::decode_checksummed`], but publishing into a
+    /// sink the caller already holds, so it can be drained while the decode is
+    /// still running.
+    #[cfg(feature = "crc")]
+    pub(crate) fn decode_to_sink<R: Read + Send, W: Write + Send>(
+        &self,
+        input: R,
+        out: W,
+        plan: &ChecksumPlan,
+        sink: &ChecksumSink,
+    ) -> io::Result<u64> {
+        let mut input = input;
+        let mut out = out;
+        self.decode_dyn(&mut input, &mut out, plan, Some(sink))
     }
 
     fn decode_dyn(
         &self,
         input: &mut (dyn Read + Send),
         out: &mut (dyn Write + Send),
+        #[cfg(feature = "crc")] plan: &ChecksumPlan,
+        #[cfg(feature = "crc")] sink: Option<&ChecksumSink>,
     ) -> io::Result<u64> {
         if self.plan.st_only {
             let mut written = 0u64;
@@ -212,6 +282,10 @@ impl Lzma2ParallelDecoder {
                 VecDeque::new(),
                 false,
                 &mut written,
+                #[cfg(feature = "crc")]
+                plan,
+                #[cfg(feature = "crc")]
+                sink,
             );
         }
 
@@ -222,6 +296,10 @@ impl Lzma2ParallelDecoder {
             out_size: None,
             finish_mode: false,
             finished: std::sync::Arc::clone(&finished),
+            #[cfg(feature = "crc")]
+            plan: plan.clone(),
+            #[cfg(feature = "crc")]
+            checks: sink.cloned(),
         };
         let make = || Lzma2Coder::new(props.clone());
 
@@ -254,6 +332,10 @@ impl Lzma2ParallelDecoder {
             replay,
             read_was_finished,
             &mut written,
+            #[cfg(feature = "crc")]
+            plan,
+            #[cfg(feature = "crc")]
+            sink,
         )?;
         Ok(written)
     }
@@ -354,6 +436,7 @@ impl StSource<'_> {
 }
 
 /// C: `Lzma2Dec_Decode_ST`.
+#[allow(clippy::too_many_arguments)]
 fn decode_st(
     dict_prop: u8,
     stream: &mut (dyn Read + Send),
@@ -361,8 +444,31 @@ fn decode_st(
     replay: VecDeque<ReplayBuf>,
     read_was_finished: bool,
     written: &mut u64,
+    #[cfg(feature = "crc")] plan: &ChecksumPlan,
+    #[cfg(feature = "crc")] sink: Option<&ChecksumSink>,
 ) -> io::Result<u64> {
     let mut dec = Lzma2Decoder::new(dict_prop).map_err(to_io)?;
+
+    // The single-threaded path checksums too, so that a stream with no
+    // dictionary resets - or the tail of one the threaded pass could not
+    // finish - still produces segments covering every byte. There is no
+    // serialised section to keep it out of here: this is the only thread.
+    #[cfg(feature = "crc")]
+    let mut seg = match sink {
+        Some(_) if !plan.is_none() => Some(Segmenter::new(plan, *written)),
+        _ => None,
+    };
+    #[cfg(feature = "crc")]
+    let publish = |seg: Option<Segmenter>| {
+        if let (Some(sink), Some(seg)) = (sink, seg) {
+            let checks = seg.finish();
+            if checks.len != 0
+                && let Ok(mut v) = sink.lock()
+            {
+                v.push(checks);
+            }
+        }
+    };
     let mut src = StSource {
         replay,
         stream,
@@ -400,12 +506,18 @@ fn decode_st(
 
         if need_stop || out_processed >= size {
             let end = dec.dic_pos();
+            #[cfg(feature = "crc")]
+            if let Some(seg) = seg.as_mut() {
+                seg.update(dec.dic_slice(wr_pos, end));
+            }
             out.write_all(dec.dic_slice(wr_pos, end))?;
             dec.wrap_dic_pos();
             wr_pos = dec.dic_pos();
 
             if need_stop {
                 if status == Status::FinishedWithMark {
+                    #[cfg(feature = "crc")]
+                    publish(seg);
                     return Ok(*written);
                 }
                 if status == Status::NeedsMoreInput {
@@ -465,6 +577,8 @@ impl Write for ChannelSink {
 /// dropping the reader stops them and joins them.
 pub struct Lzma2ParallelReader<R: Read + Send + 'static> {
     rx: Receiver<Block>,
+    #[cfg(feature = "crc")]
+    checks: Option<ChecksumSink>,
     spare_tx: SyncSender<Vec<u8>>,
     join: Option<std::thread::JoinHandle<io::Result<u64>>>,
     cur: Vec<u8>,
@@ -481,16 +595,85 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
     /// Fails if the property byte is out of range or the coordinating thread
     /// cannot be spawned.
     pub fn new(inner: R, dict_prop: u8, options: &Lzma2MtOptions) -> io::Result<Self> {
+        #[cfg(feature = "crc")]
+        return Self::build(inner, dict_prop, options, &ChecksumPlan::none());
+        #[cfg(not(feature = "crc"))]
+        return Self::build(inner, dict_prop, options);
+    }
+
+    /// Builds a reader that also checksums each block in the worker that
+    /// produced it. Drain what has been computed so far with
+    /// [`Lzma2ParallelReader::take_checks`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2ParallelReader::new`].
+    #[cfg(feature = "crc")]
+    pub fn with_checksums(
+        inner: R,
+        dict_prop: u8,
+        options: &Lzma2MtOptions,
+        plan: &ChecksumPlan,
+    ) -> io::Result<Self> {
+        Self::build(inner, dict_prop, options, plan)
+    }
+
+    /// Everything checksummed since the last call, in output order.
+    ///
+    /// Blocks appear here as soon as the worker that produced them reaches the
+    /// write section, which is generally *before* the reader has been asked
+    /// for those bytes. After the reader has returned `Ok(0)` this holds
+    /// everything the decode produced.
+    #[cfg(feature = "crc")]
+    pub fn take_checks(&mut self) -> Vec<BlockChecks> {
+        match self.checks.as_ref().and_then(|s| s.lock().ok()) {
+            Some(mut v) => core::mem::take(&mut *v),
+            None => Vec::new(),
+        }
+    }
+
+    /// Everything checksummed since the last call, flattened to segments.
+    ///
+    /// The in-order convenience over [`Lzma2ParallelReader::take_checks`] for
+    /// a consumer that only wants the CRCs.
+    #[cfg(feature = "crc")]
+    pub fn take_segments(&mut self) -> Vec<checksum::Segment> {
+        self.take_checks()
+            .into_iter()
+            .flat_map(|c| c.segments)
+            .collect()
+    }
+
+    fn build(
+        inner: R,
+        dict_prop: u8,
+        options: &Lzma2MtOptions,
+        #[cfg(feature = "crc")] plan: &ChecksumPlan,
+    ) -> io::Result<Self> {
         let dec = Lzma2ParallelDecoder::new(dict_prop, options).map_err(to_io)?;
         // One block in flight on the channel, plus the one the reader holds:
         // the same bound the ring itself uses, one unit of lookahead.
         let (tx, rx) = sync_channel::<Block>(1);
         let (spare_tx, spare) = sync_channel::<Vec<u8>>(2);
         let err_tx = tx.clone();
+        #[cfg(feature = "crc")]
+        let checks: Option<ChecksumSink> = if plan.is_none() {
+            None
+        } else {
+            Some(Arc::new(Mutex::new(Vec::new())))
+        };
+        #[cfg(feature = "crc")]
+        let (thread_checks, thread_plan) = (checks.clone(), plan.clone());
         let join = std::thread::Builder::new()
             .name("lzma2-mt-reader".into())
             .spawn(move || {
                 let mut sink = ChannelSink { tx, spare };
+                #[cfg(feature = "crc")]
+                let r = match thread_checks.as_ref() {
+                    Some(c) => dec.decode_to_sink(inner, &mut sink, &thread_plan, c),
+                    None => dec.decode(inner, &mut sink),
+                };
+                #[cfg(not(feature = "crc"))]
                 let r = dec.decode(inner, &mut sink);
                 if let Err(e) = &r {
                     let _ = err_tx.try_send(Err(io::Error::new(e.kind(), e.to_string())));
@@ -499,6 +682,8 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
             })?;
         Ok(Lzma2ParallelReader {
             rx,
+            #[cfg(feature = "crc")]
+            checks,
             spare_tx,
             join: Some(join),
             cur: Vec::new(),

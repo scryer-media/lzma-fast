@@ -29,8 +29,11 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
+
 use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner};
 use crate::mt::Lzma2MtOptions;
+#[cfg(feature = "crc")]
+use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
 use crate::mt::pool::{Done, Job, Pool, locate};
 
 /// How much of the single-threaded decoder's dictionary is filled before it is
@@ -113,6 +116,19 @@ pub struct Lzma2AdaptiveDecoder {
     spare_out: Vec<Vec<u8>>,
     spare_in: Vec<Vec<u8>>,
 
+    // What each run's decoder checksummed, worker or chase alike. See
+    // [`crate::checksum`]: this is computed where the bytes were produced,
+    // never on the caller's thread as it drains.
+    #[cfg(feature = "crc")]
+    plan: ChecksumPlan,
+    #[cfg(feature = "crc")]
+    checks: Vec<BlockChecks>,
+    /// The chase decoder's open segment run, carried across calls so a run it
+    /// decodes in many steps yields the segments the split points ask for and
+    /// not one per step.
+    #[cfg(feature = "crc")]
+    st_seg: Option<Segmenter>,
+
     /// A worker's error, held until everything before it has been delivered.
     failed: Option<(u64, Error)>,
     complete: bool,
@@ -172,6 +188,12 @@ impl Lzma2AdaptiveDecoder {
             emitted_out: 0,
             spare_out: Vec::new(),
             spare_in: Vec::new(),
+            #[cfg(feature = "crc")]
+            plan: ChecksumPlan::none(),
+            #[cfg(feature = "crc")]
+            checks: Vec::new(),
+            #[cfg(feature = "crc")]
+            st_seg: None,
             failed: None,
             complete: false,
             cancelled: false,
@@ -210,6 +232,44 @@ impl Lzma2AdaptiveDecoder {
     #[must_use]
     pub fn live_threads(&self) -> usize {
         self.pool.as_ref().map_or(0, Pool::live)
+    }
+
+    /// Sets what each decoder - worker or chase - is to checksum over the
+    /// bytes it produces, and where the consumer's boundaries fall.
+    ///
+    /// Takes effect for runs claimed after this call, so set it before the
+    /// first [`Lzma2AdaptiveDecoder::drain`]. The checksums are computed
+    /// wherever the bytes were produced and never on the thread draining the
+    /// output; see [`crate::checksum`] for why that distinction is the
+    /// whole point.
+    #[cfg(feature = "crc")]
+    pub fn set_checksum(&mut self, plan: &ChecksumPlan) {
+        self.plan = plan.clone();
+    }
+
+    /// Everything checksummed since the last call.
+    ///
+    /// Entries appear as their runs finish, which with unordered delivery is
+    /// not stream order; each carries its own absolute offset, so a
+    /// [`crate::crc::CrcFolder`] can take them as they come. After the decode
+    /// is complete this has returned one entry per run, tiling the output.
+    #[cfg(feature = "crc")]
+    pub fn take_checks(&mut self) -> Vec<BlockChecks> {
+        if self.complete {
+            self.close_st_seg();
+        }
+        core::mem::take(&mut self.checks)
+    }
+
+    /// Closes the chase decoder's open segment run, if it has one.
+    #[cfg(feature = "crc")]
+    fn close_st_seg(&mut self) {
+        if let Some(seg) = self.st_seg.take() {
+            let checks = seg.finish();
+            if checks.len != 0 {
+                self.checks.push(checks);
+            }
+        }
     }
 
     /// Delivers blocks in stream order (the default), or as soon as they are
@@ -443,6 +503,10 @@ impl Lzma2AdaptiveDecoder {
         self.spare_in.push(d.packed);
         match d.res {
             Ok(()) => {
+                #[cfg(feature = "crc")]
+                if let Some(c) = d.checks {
+                    self.checks.push(c);
+                }
                 self.ready_bytes += d.unpacked_len as u64;
                 self.ready
                     .insert(d.out_offset, (d.out_offset, d.out, d.unpacked_len));
@@ -567,6 +631,8 @@ impl Lzma2AdaptiveDecoder {
         let out = self.spare_out.pop().unwrap_or_default();
 
         pool.dispatch(Job {
+            #[cfg(feature = "crc")]
+            plan: self.plan.clone(),
             index: self.next_index,
             out_offset: run.out_offset,
             unpacked_len: unpacked,
@@ -619,6 +685,27 @@ impl Lzma2AdaptiveDecoder {
             let start = self.st_wr;
             let end = dec.dic_pos();
             let offset = self.cursor_out;
+            #[cfg(feature = "crc")]
+            if !self.plan.is_none() {
+                // A run the chase decoder takes over several steps must still
+                // be cut only where the split points say, so the segmenter is
+                // carried across steps and restarted only when the chase path
+                // resumes somewhere else.
+                if self.st_seg.as_ref().is_some_and(|s| s.pos() != offset) {
+                    // Inlined `close_st_seg`: these are disjoint fields, and
+                    // the decoder is borrowed across this block.
+                    if let Some(seg) = self.st_seg.take() {
+                        let checks = seg.finish();
+                        if checks.len != 0 {
+                            self.checks.push(checks);
+                        }
+                    }
+                }
+                let plan = self.plan.clone();
+                self.st_seg
+                    .get_or_insert_with(|| Segmenter::new(&plan, offset))
+                    .update(dec.dic_slice(start, end));
+            }
             if self.ordered && self.emitted_out != offset {
                 // Blocks dispatched earlier have not landed yet, so this one
                 // has to wait its turn in memory.

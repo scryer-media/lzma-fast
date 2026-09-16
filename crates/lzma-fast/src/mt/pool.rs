@@ -26,6 +26,9 @@ use std::thread::JoinHandle;
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
 
+#[cfg(feature = "crc")]
+use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
+
 /// One independently decodable run, on its way to a worker.
 pub(crate) struct Job {
     /// The run's index in the stream.
@@ -39,6 +42,10 @@ pub(crate) struct Job {
     pub(crate) packed: Vec<u8>,
     /// A buffer to decode into, recycled from a previous block.
     pub(crate) out: Vec<u8>,
+    /// What to checksum over the run, in this worker, before the block is
+    /// handed back. See [`crate::checksum`].
+    #[cfg(feature = "crc")]
+    pub(crate) plan: ChecksumPlan,
 }
 
 /// A finished job on its way back.
@@ -52,6 +59,10 @@ pub(crate) struct Done {
     pub(crate) out: Vec<u8>,
     /// The job's input buffer, returned for reuse.
     pub(crate) packed: Vec<u8>,
+    /// What the worker checksummed, if the run decoded and a plan asked for
+    /// it.
+    #[cfg(feature = "crc")]
+    pub(crate) checks: Option<BlockChecks>,
 }
 
 /// Worker threads shared by every decode mode.
@@ -215,6 +226,8 @@ fn worker(
                 res: Err(Error::Cancelled),
                 out: job.out,
                 packed: job.packed,
+                #[cfg(feature = "crc")]
+                checks: None,
             });
             continue;
         }
@@ -237,6 +250,8 @@ fn worker(
                             res: Err(e),
                             out: Vec::new(),
                             packed: job.packed,
+                            #[cfg(feature = "crc")]
+                            checks: None,
                         });
                         return;
                     }
@@ -244,6 +259,17 @@ fn worker(
                 Err(Error::InternalFailure)
             }
         };
+        // Checksummed here, on the worker, over the bytes it just produced -
+        // never on whoever drains the output. See [`crate::checksum`].
+        #[cfg(feature = "crc")]
+        let checks = if res.is_ok() && !job.plan.is_none() {
+            let mut seg = Segmenter::new(&job.plan, job.out_offset);
+            seg.update(dec.dic_slice(0, job.unpacked_len));
+            Some(seg.finish())
+        } else {
+            None
+        };
+
         let out = dec.take_block_dic();
         if tx
             .send(Done {
@@ -253,6 +279,8 @@ fn worker(
                 res,
                 out,
                 packed: job.packed,
+                #[cfg(feature = "crc")]
+                checks,
             })
             .is_err()
         {

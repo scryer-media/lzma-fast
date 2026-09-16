@@ -13,6 +13,11 @@ use crate::lzma2::Lzma2Decoder;
 use crate::lzma2::parse::{Lzma2Parser, ParseStatus};
 use crate::mt::mtdec::{CallbackInfo, Coder, MtError, ParseState, WriteCtx};
 
+#[cfg(feature = "crc")]
+use crate::mt::ChecksumSink;
+#[cfg(feature = "crc")]
+use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
+
 /// C: the `(1 << 14)` in `Lzma2DecMt_MtCallback_Parse`. Blocks smaller than
 /// this are coalesced into their successor rather than given a thread each:
 /// "we decode small blocks in one thread".
@@ -36,6 +41,15 @@ pub(crate) struct Lzma2CoderProps {
     /// decodes to a prefix and reports success. The caller checks this
     /// instead.
     pub(crate) finished: Arc<AtomicBool>,
+    /// What each worker is to checksum over the block it produced, and where
+    /// to put the answer.
+    ///
+    /// C: nothing; see [`crate::checksum`] for why this belongs to the
+    /// worker and not to whoever consumes the output.
+    #[cfg(feature = "crc")]
+    pub(crate) plan: ChecksumPlan,
+    #[cfg(feature = "crc")]
+    pub(crate) checks: Option<ChecksumSink>,
 }
 
 /// C: `CLzma2DecMtThread`.
@@ -68,6 +82,17 @@ pub(crate) struct Lzma2Coder {
     code_res: Option<Error>,
     /// The parse walked into a byte the format does not allow.
     parse_failed: bool,
+
+    /// Absolute unpacked offset at which this block starts, captured from the
+    /// parse's own running total while the read token is held - so it is in
+    /// read order, which is write order, and is checked against the write
+    /// side's total before any checksum derived from it is published.
+    #[cfg(feature = "crc")]
+    block_start: u64,
+    /// What [`Coder::checksum`] computed, waiting to be published by
+    /// [`Coder::write`] if this block is in fact written.
+    #[cfg(feature = "crc")]
+    checks: Option<BlockChecks>,
 }
 
 impl Lzma2Coder {
@@ -90,6 +115,10 @@ impl Lzma2Coder {
             out_code_size: 0,
             code_res: None,
             parse_failed: false,
+            #[cfg(feature = "crc")]
+            block_start: 0,
+            #[cfg(feature = "crc")]
+            checks: None,
         })
     }
 
@@ -118,6 +147,11 @@ impl Coder for Lzma2Coder {
             self.out_code_size = 0;
             self.code_res = None;
             self.parse_failed = false;
+            #[cfg(feature = "crc")]
+            {
+                self.block_start = cc.out_processed_parse;
+                self.checks = None;
+            }
             // (cc->srcSize == 0) is allowed
         }
 
@@ -330,6 +364,28 @@ impl Coder for Lzma2Coder {
         Ok(())
     }
 
+    /// C: nothing. Runs on the worker thread after its block is decoded and
+    /// *before* it queues for the write token, which is the whole point: the
+    /// bytes are checksummed where they were produced, in parallel with every
+    /// other worker, instead of on whoever drains the output.
+    #[cfg(feature = "crc")]
+    fn checksum(&mut self) {
+        let Some(props_checks) = self.props.checks.as_ref() else {
+            return;
+        };
+        let _ = props_checks;
+        if self.props.plan.is_none() || self.code_res.is_some() || self.parse_failed {
+            return;
+        }
+        // Take the block buffer back from the decoder early; `write` reclaims
+        // it too and finds it already taken, which is a no-op there.
+        self.reclaim_out_buf();
+        let size = self.out_code_size as usize;
+        let mut seg = Segmenter::new(&self.props.plan, self.block_start);
+        seg.update(&self.out_buf[..size]);
+        self.checks = Some(seg.finish());
+    }
+
     /// C: `Lzma2DecMt_MtCallback_Write`.
     ///
     /// The `LZMA2DECMT_STREAM_WRITE_STEP` chunking of the C exists only so
@@ -372,6 +428,21 @@ impl Coder for Lzma2Coder {
         }
 
         *can_recode = false;
+
+        #[cfg(feature = "crc")]
+        if let (Some(sink), Some(checks)) = (self.props.checks.as_ref(), self.checks.take()) {
+            // The segment offsets were derived from the parse's running output
+            // total. That total is maintained under the read token and blocks
+            // are written in read order, so it must equal the write side's -
+            // and if it ever did not, every offset published from here would be
+            // silently wrong, so it is checked rather than assumed.
+            if checks.unpacked_offset != *ctx.out_processed || checks.len != size as u64 {
+                return Err(MtError::Lzma(Error::InternalFailure));
+            }
+            if let Ok(mut v) = sink.lock() {
+                v.push(checks);
+            }
+        }
 
         ctx.out.write_all(&self.out_buf[..size])?;
         *ctx.out_processed += size as u64;
