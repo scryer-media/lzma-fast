@@ -32,6 +32,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "decode_lzma2_mt"
+path = "fuzz_targets/decode_lzma2_mt.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 
