@@ -10,7 +10,7 @@ See `bench/fixtures/README.md` for the list.
 | Oracle | Command | What it measures |
 | --- | --- | --- |
 | 7-Zip shipped decoder (asm loop) | `7zz t -mmt=1 st.7z` / `7zz t -mmt=1 p256.bin.lzma` | The acceptance target. `t` decodes and CRCs without writing. |
-| 7-Zip C decoder (no asm) | `~/dev/supporting-codebases/7zip/C/Util/Lzma/_o/7lzma d in.lzma /dev/null` | C parity checkpoint. Built from `C/Util/Lzma` with the default makefile (`make -f makefile.gcc`). |
+| 7-Zip C decoder (no asm) | `~/dev/supporting-codebases/7zip/C/Util/Lzma/_o/7lzma d in.lzma /dev/null` | C parity checkpoint. Built from `C/Util/Lzma` with the default makefile (`make -f makefile.gcc`). The harness looks there first and falls back to whatever `7lzma` is on `PATH`, which is how a bench box with its own build is reached. |
 | XZ Utils | `xz -dc -T1 in.xz > /dev/null` / `xz -dc --format=lzma in.lzma > /dev/null` | Tukaani C decoder; also the correctness reference for output bytes. |
 
 Reference numbers on Apple M5 Max, 7-Zip 26.01, XZ Utils 5.8 (2026-09-15):

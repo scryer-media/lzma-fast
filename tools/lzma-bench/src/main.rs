@@ -386,9 +386,19 @@ fn oracle_commands(path: &Path) -> Vec<(String, Vec<String>)> {
 /// from; the path is resolved from `$HOME` so no developer's home directory is
 /// baked into the source.
 fn reference_c_decoder() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let p = Path::new(&home).join("dev").join(REFERENCE_C_DECODER);
-    p.exists().then(|| p.display().to_string())
+    if let Ok(home) = std::env::var("HOME") {
+        let p = Path::new(&home).join("dev").join(REFERENCE_C_DECODER);
+        if p.exists() {
+            return Some(p.display().to_string());
+        }
+    }
+    // Otherwise take whatever `7lzma` the PATH offers, which is how the
+    // reference decoder is reached on a bench box that keeps its own build.
+    let path = std::env::var("PATH").ok()?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("7lzma"))
+        .find(|p| p.is_file())
+        .map(|p| p.display().to_string())
 }
 
 fn time_command(cmd: &[String]) -> Option<Duration> {
