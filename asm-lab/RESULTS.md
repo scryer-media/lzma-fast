@@ -297,3 +297,32 @@ target was not met**; the reason is the whole of sections 2–4 above.
 
 The row that matters for the Rust port is the C loop: the asm is **1.47x
 faster** than 7-Zip's own optimised C decoder, and that is the bar to clear.
+
+---
+
+## 9. Correctness sweep
+
+`./verify.sh build/7lzma-<variant>` over both project fixtures plus 63 small
+streams (7 corpora x 9 `xz --format=lzma` settings: presets 0/6/9e and
+lc/lp/pb combinations `0,0,0` / `0,2,0` / `1,1,1` / `4,0,3` / `8,0,0` and a
+1 MiB dictionary). Corpora: dictionary text (literal-heavy), urandom
+(incompressible), a self-concatenated file (one huge match), a source tarball
+(mixed), a long run of one byte (rep0 short matches), a 100-byte file, and an
+empty file.
+
+```
+stock:           ALL OK
+01-msub-rangeA:  ALL OK
+02-msub-cand:    ALL OK
+03-pair32-p32:   ALL OK
+05-normless:     ALL OK
+06-copy2b:       ALL OK
+07-cmovwrap:     ALL OK
+08-nofill4:      ALL OK
+09-copy2b-cmov:  ALL OK
+m5:              ALL OK
+```
+
+Every variant in this lab is byte-exact, including the ones that lost on speed —
+so each measurement above is a like-for-like comparison of correct decoders, not
+an artefact of a variant taking a shortcut.
