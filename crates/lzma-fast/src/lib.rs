@@ -60,6 +60,8 @@ pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};
 pub use lzma::{LzmaDecoder, LzmaProps};
 pub use lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
 pub use lzma2::Lzma2Decoder;
+#[cfg(feature = "std")]
+pub use lzma2::scan::run_boundaries;
 pub use lzma2::scan::{Lzma2Run, Lzma2RunScanner};
 
 #[cfg(feature = "std")]

@@ -21,9 +21,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use super::XzOptions;
 use super::check::BlockCheck;
 use super::error::{XzError, XzErrorKind, XzResult};
-use super::index::{XzStreamIndex, read_stream_index_ending_at};
+use super::index::{XzStreamIndex, stream_table};
 use super::pool::{XzDone, XzJob, XzPool};
-use super::stream::{CheckType, STREAM_HEADER_SIZE};
+use super::stream::CheckType;
 
 /// What a worker costs besides its buffers: the LZMA2 probability table, which
 /// is `1846 + (0x300 << (lc + lp))` sixteen-bit entries at the maximum
@@ -116,7 +116,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
     /// the index says the file decodes to more than the caller allows - which
     /// is known here, before anything is decoded.
     pub fn with_options(mut src: R, opts: XzOptions) -> XzResult<Self> {
-        let streams = map_file(&mut src, opts.memory_limit)?;
+        let streams = stream_table(&mut src, opts.memory_limit)?;
         let blocks = plan_blocks(&streams, &opts)?;
 
         let largest_out = blocks
@@ -350,45 +350,6 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
             }
         }
     }
-}
-
-/// Reads the index of every stream in the file, last stream first, and
-/// returns them in file order.
-///
-/// C: `XzDecMt` calls `Xz_ReadBackward`, which does exactly this walk: strip
-/// stream padding, read the footer, read the index, step to the start of the
-/// stream, repeat.
-fn map_file<R: Read + Seek>(src: &mut R, memory_limit: u64) -> XzResult<Vec<XzStreamIndex>> {
-    let len = src
-        .seek(SeekFrom::End(0))
-        .map_err(|_| XzError::at(XzErrorKind::TruncatedInput, 0, 0))?;
-    if len < (STREAM_HEADER_SIZE * 2) as u64 {
-        return Err(XzError::at(XzErrorKind::TruncatedInput, 0, len));
-    }
-    let mut end = len;
-    let mut streams: Vec<XzStreamIndex> = Vec::new();
-    while end > 0 {
-        // Spec §5: stream padding is a whole number of null four-byte groups.
-        loop {
-            if end < 4 {
-                return Err(XzError::at(XzErrorKind::TrailingGarbage, 0, end));
-            }
-            let mut tail = [0u8; 4];
-            src.seek(SeekFrom::Start(end - 4))
-                .and_then(|_| src.read_exact(&mut tail))
-                .map_err(|_| XzError::at(XzErrorKind::TruncatedInput, 0, end))?;
-            if tail == [0, 0, 0, 0] {
-                end -= 4;
-            } else {
-                break;
-            }
-        }
-        let idx = read_stream_index_ending_at(src, end, memory_limit)?;
-        end = idx.stream_offset;
-        streams.push(idx);
-    }
-    streams.reverse();
-    Ok(streams)
 }
 
 /// Turns the indexes into the block list, checking the caller's caps against

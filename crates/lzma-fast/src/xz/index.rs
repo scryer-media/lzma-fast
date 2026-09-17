@@ -358,6 +358,100 @@ pub fn read_stream_index_ending_at<R: std::io::Read + std::io::Seek>(
     })
 }
 
+/// Reads the index of every stream in the file, last stream first, and
+/// returns them in file order.
+///
+/// This is the whole structure of a seekable `.xz` file without decoding a
+/// byte of it: one seek and one small read per stream. A caller deciding
+/// *whether* to widen a decode - and where its threads would cut - can ask
+/// this first and commit afterwards.
+///
+/// The reader's position is left at the end of the file.
+///
+/// C: `Xz_ReadBackward` in `XzIn.c`, which does exactly this walk: strip
+/// stream padding, read the footer, read the index, step to the start of the
+/// stream, repeat.
+///
+/// # Errors
+///
+/// Any structural error in a footer, index or header, and short reads as
+/// [`XzErrorKind::TruncatedInput`]. Bytes after the last stream that are not
+/// stream padding are [`XzErrorKind::TrailingGarbage`].
+pub fn stream_table<R: std::io::Read + std::io::Seek>(
+    src: &mut R,
+    memory_limit: u64,
+) -> XzResult<Vec<XzStreamIndex>> {
+    use std::io::SeekFrom;
+
+    let len = src
+        .seek(SeekFrom::End(0))
+        .map_err(|_| XzError::at(XzErrorKind::TruncatedInput, 0, 0))?;
+    if len < (STREAM_HEADER_SIZE * 2) as u64 {
+        return Err(XzError::at(XzErrorKind::TruncatedInput, 0, len));
+    }
+    let mut end = len;
+    let mut streams: Vec<XzStreamIndex> = Vec::new();
+    while end > 0 {
+        // Spec §5: stream padding is a whole number of null four-byte groups.
+        loop {
+            if end < 4 {
+                return Err(XzError::at(XzErrorKind::TrailingGarbage, 0, end));
+            }
+            let mut tail = [0u8; 4];
+            src.seek(SeekFrom::Start(end - 4))
+                .and_then(|_| src.read_exact(&mut tail))
+                .map_err(|_| XzError::at(XzErrorKind::TruncatedInput, 0, end))?;
+            if tail == [0, 0, 0, 0] {
+                end -= 4;
+            } else {
+                break;
+            }
+        }
+        let idx = read_stream_index_ending_at(src, end, memory_limit)?;
+        end = idx.stream_offset;
+        streams.push(idx);
+    }
+    streams.reverse();
+    Ok(streams)
+}
+
+/// Every block in the file, located, in file order.
+///
+/// The `.xz` answer to "where could this decode be cut, without decoding it":
+/// [`stream_table`] flattened, with each entry's `uncompressed_offset` made
+/// relative to the whole file rather than to its own stream, so the entries
+/// describe the output a reader would produce.
+///
+/// # Errors
+///
+/// As [`stream_table`], plus [`XzErrorKind::IndexMismatch`] for an index whose
+/// sizes overflow when added up.
+pub fn block_table<R: std::io::Read + std::io::Seek>(
+    src: &mut R,
+    memory_limit: u64,
+) -> XzResult<Vec<XzBlockEntry>> {
+    let streams = stream_table(src, memory_limit)?;
+    let mut out = Vec::new();
+    let mut base = 0u64;
+    for s in &streams {
+        let blocks = s
+            .index
+            .blocks(s.stream_offset)
+            .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
+        for mut b in blocks {
+            b.uncompressed_offset = b
+                .uncompressed_offset
+                .checked_add(base)
+                .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
+            out.push(b);
+        }
+        base = base
+            .checked_add(s.index.uncompressed_size().unwrap_or(0))
+            .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
+    }
+    Ok(out)
+}
+
 /// How many blocks the single xz stream in `reader` has, or `None` if the
 /// file is not one structurally sound stream.
 ///

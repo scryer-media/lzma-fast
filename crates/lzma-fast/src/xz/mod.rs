@@ -59,8 +59,9 @@ pub use check::BlockCheck;
 pub use error::{XzError, XzErrorKind, XzResult};
 pub use filter::{FILTER_DELTA, FILTER_LZMA2, FilterChain, FilterFlags, MAX_FILTERS};
 pub use index::{
-    MAX_INDEX_SIZE, XzBlockEntry, XzIndex, XzIndexRecord, XzStreamIndex,
+    MAX_INDEX_SIZE, XzBlockEntry, XzIndex, XzIndexRecord, XzStreamIndex, block_table,
     is_single_stream_multi_block, read_stream_index_ending_at, single_stream_block_count,
+    stream_table,
 };
 pub use parallel::XzParallelReader;
 pub use reader::XzReader;

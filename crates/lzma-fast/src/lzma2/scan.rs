@@ -132,6 +132,30 @@ impl Lzma2RunScanner {
         self.open.map(|o| o.in_offset)
     }
 
+    /// Bytes of the current chunk's payload still to be walked past.
+    ///
+    /// The scanner never looks at payload bytes, only at how many there are,
+    /// so a caller reading from a seekable source can skip them with a seek
+    /// instead of a read: ask this, seek that far, and say so with
+    /// [`Lzma2RunScanner::skip_payload`].
+    #[must_use]
+    pub fn payload_remaining(&self) -> u64 {
+        self.data_remaining
+    }
+
+    /// Tells the scanner that `n` bytes of the current chunk's payload were
+    /// skipped rather than fed, and returns how many it accepted.
+    ///
+    /// Never more than [`Lzma2RunScanner::payload_remaining`]; a caller that
+    /// skipped further than that has skipped a chunk header, which the scanner
+    /// cannot recover from and will not pretend to.
+    pub fn skip_payload(&mut self, n: u64) -> u64 {
+        let take = n.min(self.data_remaining);
+        self.in_pos += take;
+        self.data_remaining -= take;
+        take
+    }
+
     /// Takes the oldest complete run.
     pub fn next_run(&mut self) -> Option<Lzma2Run> {
         self.ready.pop_front()
@@ -239,5 +263,102 @@ impl Lzma2RunScanner {
                 has_dict_reset: o.has_dict_reset,
             });
         }
+    }
+}
+
+/// The runs of an LZMA2 stream in a seekable source, without decoding it.
+///
+/// Scans from the source's current position to the stream's end marker,
+/// seeking past chunk payloads rather than reading them, so the cost is one
+/// small read per chunk header and not one pass over the packed bytes. The
+/// source's position is restored before returning, so a caller can ask this
+/// about a packed range and then decode it.
+///
+/// This is the question a consumer asks before it commits: how many
+/// independently decodable runs are in this range, how big are they, and is
+/// there enough there to be worth widening for. [`Lzma2RunScanner`] answers it
+/// for bytes as they arrive; this answers it for bytes already on disk.
+///
+/// `dict_prop` is validated and otherwise unused: finding run boundaries needs
+/// no dictionary. It is in the signature so that a caller passing a property
+/// byte no decoder would accept finds out here rather than after it has
+/// committed to a decode.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::InvalidInput`] for `dict_prop > 40`,
+/// [`std::io::ErrorKind::InvalidData`] for a stream the scanner rejects,
+/// [`std::io::ErrorKind::UnexpectedEof`] for a range that ends before the
+/// stream's end marker does, and any error the source itself returns.
+#[cfg(feature = "std")]
+pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
+    mut source: R,
+    dict_prop: u8,
+) -> std::io::Result<Vec<Lzma2Run>> {
+    use std::io::{Error as IoError, ErrorKind, SeekFrom};
+
+    if dict_prop > 40 {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            Error::UnsupportedProps,
+        ));
+    }
+    let start = source.stream_position()?;
+    let end = source.seek(SeekFrom::End(0))?;
+    source.seek(SeekFrom::Start(start))?;
+
+    let mut scanner = Lzma2RunScanner::new();
+    let mut runs = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut at = start;
+    let mut failed = None;
+
+    while !scanner.finished() {
+        while let Some(r) = scanner.next_run() {
+            runs.push(r);
+        }
+        let skip = scanner.payload_remaining();
+        if skip != 0 {
+            if skip > end - at {
+                failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+                break;
+            }
+            scanner.skip_payload(skip);
+            at += skip;
+            source.seek(SeekFrom::Start(at))?;
+            continue;
+        }
+        let want = usize::try_from(end - at)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        if want == 0 {
+            failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+            break;
+        }
+        let n = source.read(&mut buf[..want])?;
+        if n == 0 {
+            failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+            break;
+        }
+        match scanner.feed(&buf[..n]) {
+            Ok(used) => {
+                at += used as u64;
+                if used != n {
+                    source.seek(SeekFrom::Start(at))?;
+                }
+            }
+            Err(e) => {
+                failed = Some(IoError::new(ErrorKind::InvalidData, e));
+                break;
+            }
+        }
+    }
+    while let Some(r) = scanner.next_run() {
+        runs.push(r);
+    }
+    source.seek(SeekFrom::Start(start))?;
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(runs),
     }
 }
