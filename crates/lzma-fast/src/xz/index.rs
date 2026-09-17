@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use super::error::{XzError, XzErrorKind, XzResult};
 use super::stream::{STREAM_FOOTER_SIZE, STREAM_HEADER_SIZE, StreamFooter, StreamHeader};
 use super::vli;
-use crate::crc::crc32;
+use crate::crc::{Crc64Xz, crc32};
 
 /// The largest index the spec allows: 16 GiB.
 pub const MAX_INDEX_SIZE: u64 = 1 << 34;
@@ -50,6 +50,47 @@ pub struct XzBlockEntry {
     pub uncompressed_offset: u64,
     /// The record this came from.
     pub record: XzIndexRecord,
+}
+
+/// The blocks that went by, folded to a fixed size.
+///
+/// The index repeats, for every block, sizes the blocks themselves already
+/// carried, and a decoder is required to check that the two agree (spec §4.2).
+/// Holding the list would let a stream of millions of tiny blocks cost memory
+/// proportional to the file; instead each record is folded into a CRC-64 as it
+/// is produced, and the index's records are folded the same way as they are
+/// read. Any disagreement shows up in the fold.
+#[derive(Debug, Default)]
+pub(crate) struct IndexFold {
+    pub(crate) count: u64,
+    blocks_size: u64,
+    uncompressed: u64,
+    digest: Crc64Xz,
+}
+
+impl IndexFold {
+    pub(crate) fn push(&mut self, unpadded: u64, uncompressed: u64) -> Result<(), XzErrorKind> {
+        self.count += 1;
+        let padded = unpadded.checked_add(3).ok_or(XzErrorKind::SizeMismatch)? & !3;
+        self.blocks_size = self
+            .blocks_size
+            .checked_add(padded)
+            .ok_or(XzErrorKind::SizeMismatch)?;
+        self.uncompressed = self
+            .uncompressed
+            .checked_add(uncompressed)
+            .ok_or(XzErrorKind::SizeMismatch)?;
+        self.digest.update(&unpadded.to_le_bytes());
+        self.digest.update(&uncompressed.to_le_bytes());
+        Ok(())
+    }
+
+    /// Closes the fold: count, the size of the blocks with their padding, the
+    /// uncompressed size, and the digest of the records.
+    pub(crate) fn finish(&mut self) -> (u64, u64, u64, u64) {
+        let digest = core::mem::take(&mut self.digest).finalize();
+        (self.count, self.blocks_size, self.uncompressed, digest)
+    }
 }
 
 /// A parsed index.

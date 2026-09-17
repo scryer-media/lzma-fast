@@ -129,6 +129,8 @@ C: `C/Xz.h`, `C/XzIn.c`, `C/XzDec.c`, `C/XzCrc64.c`, `C/Bra.c`, `C/Bra86.c`,
 | `Bra.c`, `Bra86.c`, `BraIA64.c` | `src/xz/bcj.rs` | All eight branch converters, decode side, with the C's branchless x86. |
 | `Delta.c` | `src/xz/delta.rs` | The delta filter, with the C's 256-byte rotating history. |
 | — | `src/xz/filter.rs` | Filter flags, chain validation and the streaming converter pipeline. There is no single C counterpart: 7-Zip's chain lives inside `CXzUnpacker`. |
+| `XzDecMt.c` (`XzDecMt_Callback_Code`) | `src/xz/pool.rs`, `src/xz/parallel.rs` | Block-parallel decoding of a seekable file, scheduled from the index. |
+| — | `src/xz/adaptive.rs` | Decoding a file that is still arriving. No C counterpart: `XzDecMt` is handed a finished file. |
 
 A stream is a 12-byte header (magic `FD 37 7A 58 5A 00`, then two flag bytes
 whose low nibble is the check type and whose CRC-32 covers the pair), a series
@@ -137,7 +139,7 @@ four filters — the last of which must be LZMA2, id `0x21`, whose one property
 byte is the dictionary size — followed by the filter output, padding to a
 multiple of four, and the check.
 
-Three deliberate deviations from the C, each for a reason:
+Four deliberate deviations from the C, each for a reason:
 
 1. **The reader pulls.** `XzUnpacker_Code` is handed whole buffers; a Rust
    `Read` adapter owns its input buffer, so the state machine has to be able
@@ -154,12 +156,43 @@ Three deliberate deviations from the C, each for a reason:
    larger than it — which is what lets an `xz -9` stream of small blocks
    decode under a small memory limit.
 
+4. **A block that is still arriving is chased, not waited for.**
+   `XzDecMt` is given a file and schedules it; `src/xz/adaptive.rs` is given a
+   growing prefix of one. It reads each block header as it lands and decides
+   per block: a header that declares both sizes says exactly where the block
+   ends, so once those bytes are in the buffer the whole block goes to a
+   worker without being decoded first; anything else - a header with no
+   compressed size, and always the block still being written at the tail - is
+   decoded on the caller's thread as the bytes arrive. Input is consumed in
+   file order and the chase runs only with no worker outstanding, so the
+   caller's `(offset, bytes)` output is in order by construction.
+
 The filter chain runs in the opposite order to the header: filter 0 is the one
 the encoder applied first, so the decoder undoes the list backwards, and LZMA2
 (the only "last filter" this crate supports) is therefore always first to run
 on the decode side. Each converter carries its own unconverted tail between
 chunks — nineteen bytes in the worst chain — so a chain streams without ever
 buffering a block.
+
+### xz for weaver
+
+The point of the container layer is that weaver can drop its `liblzma` C
+dependency. These are the call sites it has today and what each becomes:
+
+| liblzma call site | This crate |
+| --- | --- |
+| `xz_multistream_decoder(..., LZMA_CONCATENATED)` | `XzReader::new`, which reads every stream in the file by default. `XzOptions::with_concatenated(false)` is the single-stream form. |
+| `xz_parallel_decoder` / `lzma_stream_decoder_mt` with an `lzma_mt` builder | `XzParallelReader::with_options` over a `Read + Seek` source, or `XzAdaptiveDecoder` when the file is still arriving. `XzOptions` carries what `lzma_mt` carried: `threads`, `memory_limit`, `concatenated`. |
+| `memlimit` on the `lzma_mt` builder | `XzOptions::with_memory_limit`. The difference in behaviour is deliberate: liblzma fails the decode when the limit is hit, and `XzParallelReader` *degrades the thread count to fit* it instead, decoding with fewer workers rather than not at all. |
+| `XZ_DECODER_MEMORY_LIMIT_BYTES` (128 MiB) | the same number, passed to `with_memory_limit`. A block's dictionary is clamped to the block's own declared uncompressed size, so `xz -9` files that liblzma would refuse under this limit decode. |
+| the process-wide `XZ_MT_DECODER_PERMIT` | `XzParallelReader::memory_estimate`, which reports what a decode will cost *before* it starts, so the permit can be reserved for the real figure instead of the worst case. |
+| `xz_filesystem_decoder_kind` (sequential vs parallel) | `xz::probe` and `xz::is_single_stream_multi_block`, which read the footer and index and decode nothing. |
+| `xz_single_stream_block_count` | `xz::single_stream_block_count`. |
+| `lzma_stream_buffer_decode` for a whole file in memory | `XzReader` over a `&[u8]`. |
+
+Errors carry more than liblzma's `lzma_ret`: every `XzError` names the stream,
+the block and the file offset it failed at, and converts to `std::io::Error`
+for a call site that only wants that.
 
 ## Adaptive use
 

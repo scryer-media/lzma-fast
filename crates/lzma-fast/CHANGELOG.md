@@ -40,6 +40,16 @@ apart for anyone reading the history.
   padding are handled by walking the file's footers backwards. The source has
   to be `Read + Seek` but not `Send`; it is only ever read on the caller's
   thread.
+- `xz::XzAdaptiveDecoder`: decoding an `.xz` file that is still arriving.
+  Input is fed rather than read and output is drained as `(offset, bytes)`, so
+  a caller chasing a download can write what it gets by position. Each block
+  decides its own mode: a block whose header declares both its sizes and whose
+  bytes have all arrived goes to a worker whole, and everything else - the
+  tail being written, and any block whose header declares no compressed size -
+  is chased on the caller's thread as it arrives. Blocks are consumed in file
+  order and the chase runs only when no worker is outstanding, so output is
+  always in order. `set_threads` takes effect at the next block, and
+  `in_flight_bytes` reports what is held.
 - `xz::probe`, `xz::single_stream_block_count` and
   `xz::is_single_stream_multi_block`: structural gates over the footer and
   index that decode nothing, for a caller choosing between a sequential and a

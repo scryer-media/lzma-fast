@@ -144,6 +144,12 @@ impl XzPool {
         }
     }
 
+    /// Takes a finished block if one is already waiting, without blocking.
+    /// Used by the adaptive decoder, which must stay responsive to input.
+    pub(crate) fn try_collect(&self) -> Option<XzDone> {
+        self.done_rx.try_recv().ok()
+    }
+
     /// Waits for the next finished block, or `None` if no worker can send one.
     pub(crate) fn collect(&self) -> Option<XzDone> {
         loop {

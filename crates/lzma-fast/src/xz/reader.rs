@@ -21,12 +21,12 @@ use super::block::{BlockHeader, MAX_BLOCK_HEADER_SIZE, header_size_from_first_by
 use super::blockdec::{BlockDecoder, BlockLimits};
 use super::check::BlockCheck;
 use super::error::{XzError, XzErrorKind};
-use super::index::MAX_INDEX_SIZE;
+use super::index::{IndexFold, MAX_INDEX_SIZE};
 use super::stream::{
     CheckType, STREAM_FOOTER_SIZE, STREAM_HEADER_SIZE, StreamFlags, StreamFooter, StreamHeader,
 };
 use super::vli;
-use crate::crc::{Crc32, Crc64Xz};
+use crate::crc::Crc32;
 
 /// The input buffer. Large enough to hold any single field - a block header is
 /// at most 1024 bytes - with room left over to keep the LZMA2 decoder fed.
@@ -101,47 +101,6 @@ impl<R: Read> Source<R> {
         dst.copy_from_slice(&self.buf[self.pos..self.pos + dst.len()]);
         self.consume(dst.len());
         Ok(true)
-    }
-}
-
-/// The blocks that went by, folded to a fixed size.
-///
-/// The index repeats, for every block, sizes the blocks themselves already
-/// carried, and a decoder is required to check that the two agree (spec §4.2).
-/// Holding the list would let a stream of millions of tiny blocks cost memory
-/// proportional to the file; instead each record is folded into a CRC-64 as it
-/// is produced, and the index's records are folded the same way as they are
-/// read. Any disagreement shows up in the fold.
-#[derive(Debug, Default)]
-struct IndexFold {
-    count: u64,
-    blocks_size: u64,
-    uncompressed: u64,
-    digest: Crc64Xz,
-}
-
-impl IndexFold {
-    fn push(&mut self, unpadded: u64, uncompressed: u64) -> Result<(), XzErrorKind> {
-        self.count += 1;
-        let padded = unpadded.checked_add(3).ok_or(XzErrorKind::SizeMismatch)? & !3;
-        self.blocks_size = self
-            .blocks_size
-            .checked_add(padded)
-            .ok_or(XzErrorKind::SizeMismatch)?;
-        self.uncompressed = self
-            .uncompressed
-            .checked_add(uncompressed)
-            .ok_or(XzErrorKind::SizeMismatch)?;
-        self.digest.update(&unpadded.to_le_bytes());
-        self.digest.update(&uncompressed.to_le_bytes());
-        Ok(())
-    }
-
-    /// Closes the fold: count, the size of the blocks with their padding, the
-    /// uncompressed size, and the digest of the records.
-    fn finish(&mut self) -> (u64, u64, u64, u64) {
-        let digest = core::mem::take(&mut self.digest).finalize();
-        (self.count, self.blocks_size, self.uncompressed, digest)
     }
 }
 

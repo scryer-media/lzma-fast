@@ -165,6 +165,15 @@ impl BlockDecoder {
         // padding and the check, not compressed data.
         let input = match self.limits.compressed_size {
             Some(c) => {
+                // The end marker is inside the compressed size, so a block
+                // that has consumed all of it without reaching the marker is
+                // not the block its header describes. Saying so here matters:
+                // the caller cannot see that the input it still holds is out
+                // of bounds for this block, so it would otherwise offer those
+                // bytes forever and never be told they cannot be used.
+                if self.packed >= c {
+                    return Err(XzErrorKind::SizeMismatch);
+                }
                 let left = usize::try_from(c - self.packed).unwrap_or(usize::MAX);
                 &input[..input.len().min(left)]
             }

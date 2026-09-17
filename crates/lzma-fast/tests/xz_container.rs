@@ -16,7 +16,8 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
+use lzma_fast::DrainStatus;
+use lzma_fast::xz::{XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader};
 use std::io::Cursor;
 
 /// Compresses `data` with the `xz` binary, or `None` if it is not installed.
@@ -108,6 +109,60 @@ fn committed_vectors_decode_to_their_sources() {
                 assert_eq!(have, want, "{name} at chunk {chunk}");
             }
         }
+    }
+}
+
+#[test]
+fn the_committed_container_shapes_decode_the_same_three_ways() {
+    // One source, six container shapes and a concatenated pair: the block
+    // layout, the filters and the checks, without needing `xz` installed.
+    let cases: &[(&str, &str)] = &[
+        ("mixed.mb.xz", "src_mixed.bin"),
+        ("mixed.bcjx86.xz", "src_mixed.bin"),
+        ("mixed.delta4.xz", "src_mixed.bin"),
+        ("mixed.sha256.xz", "src_mixed.bin"),
+        ("mixed.crc32.xz", "src_mixed.bin"),
+        ("mixed.nocheck.xz", "src_mixed.bin"),
+    ];
+    for (name, source) in cases {
+        let path = common::data_dir().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let want = common::read(source);
+        assert_eq!(decode(&bytes).expect(name), want, "{name} sequential");
+        for chunk in [1usize, 7, 4096] {
+            assert_eq!(
+                decode_chunked(&bytes, chunk).expect(name),
+                want,
+                "{name} in {chunk}-byte reads"
+            );
+        }
+        for threads in [1usize, 4] {
+            assert_eq!(
+                decode_parallel(&bytes, threads, 4096).expect(name),
+                want,
+                "{name} on {threads} threads"
+            );
+            assert_eq!(
+                decode_adaptive(&bytes, threads, 13).expect(name),
+                want,
+                "{name} adaptive on {threads} threads"
+            );
+        }
+    }
+
+    // And the concatenated pair, which has to decode to its source twice.
+    let path = common::data_dir().join("tiny.concat.xz");
+    if path.exists() {
+        let bytes = std::fs::read(&path).expect("read");
+        let one = common::read("src_tiny.bin");
+        let mut want = one.clone();
+        want.extend_from_slice(&one);
+        assert_eq!(decode(&bytes).expect("concat"), want);
+        assert_eq!(decode_parallel(&bytes, 2, 5).expect("concat"), want);
+        assert_eq!(decode_adaptive(&bytes, 2, 5).expect("concat"), want);
     }
 }
 
@@ -424,4 +479,381 @@ fn a_corrupt_block_fails_the_parallel_decode_without_a_panic() {
             "corruption at {at} went unnoticed"
         );
     }
+}
+
+// -- the adaptive decoder ------------------------------------------------
+
+/// Feeds `data` to the adaptive decoder in `chunk`-sized pieces, draining
+/// after each, and reassembles the output by the offsets it is handed rather
+/// than by the order it is handed them in.
+fn decode_adaptive(
+    data: &[u8],
+    threads: usize,
+    chunk: usize,
+) -> Result<Vec<u8>, lzma_fast::XzError> {
+    let opts = XzOptions::default().with_threads(threads);
+    let mut dec = XzAdaptiveDecoder::new(opts);
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if pos < data.len() {
+            let end = (pos + chunk).min(data.len());
+            let took = dec.feed(&data[pos..end])?;
+            pos += took;
+            if pos == data.len() {
+                dec.end_of_input();
+            }
+        }
+        let status = dec.drain(|off, bytes| {
+            let off = usize::try_from(off).expect("offset");
+            if out.len() < off + bytes.len() {
+                out.resize(off + bytes.len(), 0u8);
+            }
+            out[off..off + bytes.len()].copy_from_slice(bytes);
+        })?;
+        match status {
+            DrainStatus::Finished => return Ok(out),
+            DrainStatus::NeedsMoreInput if pos == data.len() => {
+                panic!("the decoder wanted input after the file ended")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn the_adaptive_decoder_matches_the_sequential_one() {
+    for (name, payload) in payloads() {
+        for args in [
+            vec!["-6"],
+            vec!["-9", "--check=crc64"],
+            vec!["--check=sha256", "--x86", "--lzma2=preset=3"],
+            vec!["-1", "--check=none"],
+        ] {
+            let Some(data) = xz_compress(&args, &payload) else {
+                return;
+            };
+            for threads in [1usize, 2, 8] {
+                for chunk in [1usize, 13, 4096, 1 << 20] {
+                    let got = decode_adaptive(&data, threads, chunk)
+                        .unwrap_or_else(|e| panic!("{name} {args:?} t{threads} c{chunk}: {e}"));
+                    assert_eq!(
+                        got, payload,
+                        "{name} {args:?} threads {threads} chunk {chunk}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_adaptive_decoder_dispatches_a_multi_block_file() {
+    let payload = common::pseudo_random(4 << 20, 0xab1e);
+    let Some(data) = xz_compress(&["-1", "--block-size=262144", "-T4"], &payload) else {
+        return;
+    };
+    for threads in [1usize, 4, 16] {
+        for chunk in [7usize, 65_536, 1 << 20] {
+            let got = decode_adaptive(&data, threads, chunk).expect("adaptive");
+            assert_eq!(got, payload, "threads {threads} chunk {chunk}");
+        }
+    }
+
+    // And the blocks really did go to workers rather than all being chased.
+    let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(4));
+    let mut pos = 0usize;
+    let mut total = 0u64;
+    loop {
+        if pos < data.len() {
+            let end = (pos + (1 << 20)).min(data.len());
+            pos += dec.feed(&data[pos..end]).expect("feed");
+            if pos == data.len() {
+                dec.end_of_input();
+            }
+        }
+        let status = dec.drain(|_, b| total += b.len() as u64).expect("drain");
+        if status == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(total, payload.len() as u64);
+    assert!(
+        dec.spawned_threads() > 1,
+        "a multi-block file was decoded on one thread"
+    );
+}
+
+#[test]
+fn the_adaptive_decoder_handles_concatenated_streams() {
+    let a = common::pseudo_random(100_000, 1);
+    let b = common::pseudo_random(60_000, 2);
+    let (Some(mut xa), Some(xb)) = (
+        xz_compress(&["-2", "--check=crc32"], &a),
+        xz_compress(&["-4", "--check=crc64"], &b),
+    ) else {
+        return;
+    };
+    xa.extend_from_slice(&[0, 0, 0, 0]);
+    xa.extend_from_slice(&xb);
+    let mut want = a.clone();
+    want.extend_from_slice(&b);
+    for chunk in [5usize, 1024, 1 << 20] {
+        assert_eq!(decode_adaptive(&xa, 4, chunk).expect("adaptive"), want);
+    }
+}
+
+#[test]
+fn the_thread_count_can_change_mid_stream() {
+    let payload = common::pseudo_random(3 << 20, 0xfeed);
+    let Some(data) = xz_compress(&["-1", "--block-size=262144", "-T4"], &payload) else {
+        return;
+    };
+    let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(1));
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    let mut turns = 0u32;
+    loop {
+        if pos < data.len() {
+            let end = (pos + 100_000).min(data.len());
+            pos += dec.feed(&data[pos..end]).expect("feed");
+            if pos == data.len() {
+                dec.end_of_input();
+            }
+        }
+        let status = dec
+            .drain(|off, bytes| {
+                let off = usize::try_from(off).expect("offset");
+                if out.len() < off + bytes.len() {
+                    out.resize(off + bytes.len(), 0u8);
+                }
+                out[off..off + bytes.len()].copy_from_slice(bytes);
+            })
+            .expect("drain");
+        turns += 1;
+        dec.set_threads(match turns % 3 {
+            0 => 1,
+            1 => 8,
+            _ => 3,
+        });
+        if status == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(out, payload);
+}
+
+#[test]
+fn a_truncated_feed_that_ends_is_an_error_not_a_hang() {
+    let payload = common::pseudo_random(200_000, 9);
+    let Some(data) = xz_compress(&["-2"], &payload) else {
+        return;
+    };
+    for cut in [1usize, 12, 40, data.len() / 2, data.len() - 1] {
+        let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(2));
+        let mut fed = 0usize;
+        while fed < cut {
+            fed += dec.feed(&data[fed..cut]).expect("feed");
+        }
+        dec.end_of_input();
+        let mut err = None;
+        loop {
+            match dec.drain(|_, _| {}) {
+                Ok(DrainStatus::Finished) => break,
+                Ok(DrainStatus::NeedsMoreInput) => {
+                    panic!("wanted input after end_of_input at cut {cut}")
+                }
+                Ok(DrainStatus::Progress) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(err.is_some(), "truncation at {cut} was accepted");
+    }
+}
+
+#[test]
+fn corrupting_a_byte_fails_the_adaptive_decode() {
+    let payload = common::pseudo_random(120_000, 11);
+    let Some(data) = xz_compress(&["-2", "--check=crc64"], &payload) else {
+        return;
+    };
+    for at in [8usize, 40, data.len() / 3, data.len() - 6] {
+        let mut bad = data.clone();
+        bad[at] ^= 0x40;
+        if let Ok(got) = decode_adaptive(&bad, 2, 4096) {
+            assert_ne!(got, payload, "corruption at {at} decoded to the original");
+        }
+    }
+}
+
+// -- the structural gates ------------------------------------------------
+
+/// `(streams, blocks, uncompressed size)` as `xz -l --robot` reports them.
+fn xz_list(path: &std::path::Path) -> Option<(u64, u64, u64)> {
+    let out = Command::new("xz")
+        .args(["-l", "--robot"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // The `file` line is: name, streams, blocks, compressed, uncompressed, ...
+    let line = text.lines().find(|l| l.starts_with("file\t"))?;
+    let f: Vec<&str> = line.split('\t').collect();
+    Some((
+        f.get(1)?.parse().ok()?,
+        f.get(2)?.parse().ok()?,
+        f.get(4)?.parse().ok()?,
+    ))
+}
+
+#[test]
+fn the_structural_gates_agree_with_xz_l_robot() {
+    let payload = common::pseudo_random(700_000, 0x9a7e);
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["-1"],
+        vec!["-1", "--block-size=65536"],
+        vec!["-1", "--block-size=65536", "-T4"],
+        vec!["-6", "--check=sha256"],
+    ];
+    for args in cases {
+        let Some(data) = xz_compress(&args, &payload) else {
+            return;
+        };
+        for (name, bytes) in [
+            ("single", data.clone()),
+            ("concatenated", {
+                let mut two = data.clone();
+                two.extend_from_slice(&[0, 0, 0, 0]);
+                two.extend_from_slice(&data);
+                two
+            }),
+        ] {
+            let path = std::env::temp_dir()
+                .join(format!("lzma-fast-gate-{}-{name}.xz", std::process::id()));
+            std::fs::write(&path, &bytes).expect("temp file");
+            let listed = xz_list(&path);
+            let _ = std::fs::remove_file(&path);
+            let Some((streams, blocks, uncompressed)) = listed else {
+                return;
+            };
+
+            // `probe` sees a stream header at byte zero either way.
+            assert!(
+                lzma_fast::xz::probe(&bytes).is_some(),
+                "{args:?} {name}: probe missed a stream header"
+            );
+
+            let mut cur = Cursor::new(&bytes);
+            let count = lzma_fast::xz::single_stream_block_count(&mut cur);
+            if streams == 1 {
+                assert_eq!(
+                    count,
+                    Some(usize::try_from(blocks).expect("blocks")),
+                    "{args:?} {name}: block count"
+                );
+                assert_eq!(
+                    lzma_fast::xz::is_single_stream_multi_block(&mut cur),
+                    blocks > 1,
+                    "{args:?} {name}: multi-block gate"
+                );
+            } else {
+                // More than one stream is not the shape the gate admits.
+                assert_eq!(count, None, "{args:?} {name}: multi-stream was admitted");
+                assert!(!lzma_fast::xz::is_single_stream_multi_block(&mut cur));
+            }
+
+            // And the parallel reader's own view of the file agrees with xz.
+            let r = XzParallelReader::new(Cursor::new(&bytes)).expect("parallel reader");
+            // `xz -l --robot` totals its `file` line over the whole file, so
+            // these are the file's figures, not one stream's.
+            assert_eq!(
+                r.uncompressed_size(),
+                uncompressed,
+                "{args:?} {name}: uncompressed size"
+            );
+            assert_eq!(
+                r.block_count() as u64,
+                blocks,
+                "{args:?} {name}: total blocks"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_memory_limit_smaller_than_a_block_still_finishes() {
+    // The trap this guards: a block whose header declares both sizes is
+    // dispatched whole, so the decoder wants to buffer all of it - but under a
+    // limit smaller than the block, `feed` will not take that much. Waiting
+    // would wait forever, so such a block has to fall back to the chase.
+    let payload = common::pseudo_random(2 << 20, 0x11ce);
+    let Some(data) = xz_compress(&["-1", "--block-size=524288", "-T2"], &payload) else {
+        return;
+    };
+    // The limit has to leave room for one block's dictionary, which is the
+    // block's own 512 KiB here; below that the decode rightly fails. What is
+    // tested is the range where a block fits but the whole padded block plus
+    // its output does not.
+    for limit in [640u64 << 10, 1 << 20, 2 << 20] {
+        let opts = XzOptions::default()
+            .with_threads(4)
+            .with_memory_limit(limit);
+        let mut dec = XzAdaptiveDecoder::new(opts);
+        let mut out: Vec<u8> = Vec::new();
+        let mut pos = 0usize;
+        let mut idle = 0u32;
+        loop {
+            let before = pos;
+            if pos < data.len() {
+                let end = (pos + 100_000).min(data.len());
+                pos += dec.feed(&data[pos..end]).expect("feed");
+                if pos == data.len() {
+                    dec.end_of_input();
+                }
+            }
+            let mut wrote = false;
+            let status = dec
+                .drain(|off, bytes| {
+                    wrote = true;
+                    let off = usize::try_from(off).expect("offset");
+                    if out.len() < off + bytes.len() {
+                        out.resize(off + bytes.len(), 0u8);
+                    }
+                    out[off..off + bytes.len()].copy_from_slice(bytes);
+                })
+                .expect("drain");
+            if status == DrainStatus::Finished {
+                break;
+            }
+            idle = if wrote || pos != before { 0 } else { idle + 1 };
+            assert!(idle < 100, "the decoder stopped making progress at {limit}");
+        }
+        assert_eq!(out, payload, "limit {limit}");
+    }
+}
+
+#[test]
+fn a_block_that_runs_out_of_its_declared_compressed_size_does_not_spin() {
+    // Found by the fuzzer: a block header declaring a compressed size, whose
+    // LZMA2 never reaches its end marker inside it. The decoder clamps its
+    // input to the declared size, so it was offered bytes it could not use,
+    // returned "nothing read, nothing written", and was offered them again.
+    // The bytes after the declared size are padding and the check, so running
+    // out of it without an end marker is a size mismatch, not a wait.
+    let path = common::data_dir().join("spin.declared-size.xz");
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("read");
+    assert!(decode(&bytes).is_err(), "the truncated block was accepted");
+    assert!(decode_chunked(&bytes, 7).is_err());
+    assert!(decode_adaptive(&bytes, 4, 11).is_err());
 }

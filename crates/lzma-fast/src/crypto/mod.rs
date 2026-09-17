@@ -6,8 +6,8 @@
 //!
 //! There are two backends behind one API:
 //!
-//! - [`awslc`], from `aws-lc-rs`, behind the default `crypto` feature;
-//! - [`rustcrypto`], from the `sha2` crate, behind `native-crypto`, for a
+//! - `awslc`, from `aws-lc-rs`, behind the default `crypto` feature;
+//! - `rustcrypto`, from the `sha2` crate, behind `native-crypto`, for a
 //!   build that wants no C toolchain.
 //!
 //! The features are additive, and `native-crypto` wins: with both on, both

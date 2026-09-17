@@ -23,12 +23,16 @@ stream, the block and the file offset.
 | Declared sizes | compared with what was decoded | `xz::blockdec::BlockDecoder::note` | A block that decodes to more or less than its header said is an error, not a short read. |
 | Index size | 16 GiB (spec) and the caller's memory limit | `xz::MAX_INDEX_SIZE`, `xz::read_stream_index_ending_at` | The seekable path allocates the index only after the footer's size field has been bounded and `try_reserve_exact` has succeeded. |
 | Index records | bounded by the index's own bytes | `xz::XzIndex::parse` | A record count of 2^63 cannot be used to reserve memory: the count must fit in the remaining bytes at two bytes a record before anything is reserved. |
-| Index vs. blocks (streaming) | a 24-byte running fold | `xz::reader::IndexFold` | The sequential reader verifies every record against the blocks it decoded without holding a list of them, so a stream of millions of tiny blocks costs constant memory. |
+| Index vs. blocks (streaming) | a 24-byte running fold | `xz::index::IndexFold` | The sequential reader verifies every record against the blocks it decoded without holding a list of them, so a stream of millions of tiny blocks costs constant memory. |
 | Index position | must sit exactly where the blocks end | `xz::read_stream_index_ending_at` | An index that describes blocks the file does not contain. |
 | Padding | block, index and stream padding must be null and correctly sized | `xz::XzReader` | Data hidden in padding, and a stream padding length that is not a multiple of four. |
 | Stream footer | flags must equal the header's, index size must match | `xz::XzReader::footer` | A truncated or spliced stream whose footer belongs to a different stream. |
 | Unverifiable checks | refused unless `allow_unverifiable` | `xz::XzReader::stream_header` | A build without SHA-256 silently returning unchecked bytes for a check-type-10 stream. |
 | Truncated input | every field reports `TruncatedInput` | `xz::XzReader` | A decoder that spins on a stream that stopped arriving: a read that returns zero with the field incomplete is an error, never a retry loop. |
+| Bytes held while chasing | the caller's memory limit, via back-pressure | `xz::XzAdaptiveDecoder::feed` | A caller feeding faster than it drains cannot grow the decoder without bound: `feed` takes only what fits and returns how much it took. |
+| Blocks in flight | the thread ceiling, and the memory limit per worker | `xz::XzAdaptiveDecoder::try_dispatch` | A file of many small finished blocks handing every one of them to a worker at once. |
+| Index while chasing | re-parsed only when more input has arrived | `xz::XzAdaptiveDecoder::index` | Quadratic work re-parsing a large index on every drain while it trickles in. |
+| A lost worker | reported, never waited on | `xz::XzAdaptiveDecoder::drain` | A dispatched block that no worker can return would otherwise hang the caller; it is an `InternalFailure` instead. |
 
 ## The decoder
 

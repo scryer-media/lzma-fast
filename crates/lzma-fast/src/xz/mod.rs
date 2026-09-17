@@ -47,11 +47,13 @@ pub mod index;
 pub mod stream;
 pub mod vli;
 
+mod adaptive;
 mod blockdec;
 mod parallel;
 mod pool;
 mod reader;
 
+pub use adaptive::XzAdaptiveDecoder;
 pub use block::{BlockHeader, MAX_BLOCK_HEADER_SIZE};
 pub use check::BlockCheck;
 pub use error::{XzError, XzErrorKind, XzResult};
