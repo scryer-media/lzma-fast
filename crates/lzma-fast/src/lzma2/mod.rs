@@ -423,6 +423,17 @@ impl Lzma2Decoder {
         }
     }
 
+    /// Whether the decoder sits between chunks: no chunk half-decoded, none
+    /// owing output or input. A stream may only end here.
+    ///
+    /// C: the `p->state == LZMA2_STATE_CONTROL` the `Lzma2Dec_Decode_ST` loop
+    /// tests before it accepts an end marker.
+    pub(crate) fn at_chunk_boundary(&self) -> bool {
+        self.frame.state == crate::lzma2::frame::Lzma2State::Control
+            && self.frame.unpack_size == 0
+            && self.frame.pack_size == 0
+    }
+
     /// The decoded bytes between two dictionary positions.
     pub(crate) fn dic_slice(&self, from: usize, to: usize) -> &[u8] {
         &self.decoder.dic[from..to]

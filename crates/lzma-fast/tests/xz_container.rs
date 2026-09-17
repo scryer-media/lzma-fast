@@ -955,3 +955,25 @@ fn the_block_table_locates_every_block_a_decode_produces() {
         );
     }
 }
+
+/// The claim the LZMA2 side had to be fixed to make: a bounded drain cannot
+/// turn a truncated file into a finished one. The chase decoder stops wherever
+/// the caller's budget runs out, which for a small budget is inside a block;
+/// the block's padding, check and the stream's index are all still ahead of
+/// it, so there is nothing for it to mistake for an end.
+#[test]
+fn a_bounded_adaptive_drain_still_rejects_a_truncated_file() {
+    let plain = common::pseudo_random(1 << 20, 0x5eed);
+    let Some(packed) = xz_compress(&["-3", "-T1"], &plain) else {
+        return;
+    };
+    for cut in [packed.len() / 3, packed.len() / 2, packed.len() - 8] {
+        for limit in [1usize, 7, 65_536] {
+            let err = decode_adaptive_upto(&packed[..cut], 1, 4096, limit);
+            assert!(
+                err.is_err(),
+                "cut {cut} limit {limit}: a truncated file was accepted"
+            );
+        }
+    }
+}

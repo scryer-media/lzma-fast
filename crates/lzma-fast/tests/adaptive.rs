@@ -634,3 +634,56 @@ fn chasing_off_still_finishes_a_stream_nothing_else_can_decode() {
     }
     assert_eq!(sink.bytes(), plain);
 }
+
+/// A bounded drain must not turn a truncated stream into a finished one.
+///
+/// The chase decoder stops when the caller's budget is spent, which can leave
+/// it in the middle of a chunk that still owes output. If the end marker
+/// happens to be the next input byte - which is what a stream cut inside its
+/// last chunk and then given a marker looks like - the input cursor is at the
+/// end of the stream with a chunk unfinished, and the decoder used to call
+/// that a clean end. Found by `decode_lzma2_mt` fuzzing with a one-byte drain
+/// budget.
+#[test]
+fn a_bounded_drain_does_not_accept_a_chunk_that_never_finished() {
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 2);
+    // Inside the last chunk's payload, then an end marker.
+    let mut cut = packed[..packed.len() * 3 / 4].to_vec();
+    cut.push(0x00);
+
+    for limit in [1usize, 7, 4096, usize::MAX] {
+        let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(1, u64::MAX)).expect("props");
+        let mut pos = 0usize;
+        let mut err = None;
+        let mut finished = false;
+        'feed: loop {
+            if pos < cut.len() {
+                match dec.feed(&cut[pos..]) {
+                    Ok(n) => pos += n,
+                    Err(e) => {
+                        err = Some(e);
+                        break 'feed;
+                    }
+                }
+                if pos == cut.len() {
+                    dec.end_of_input();
+                }
+            }
+            match dec.drain_upto(limit, |_, _| {}) {
+                Ok(DrainStatus::Finished) => {
+                    finished = true;
+                    break 'feed;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break 'feed;
+                }
+            }
+        }
+        assert!(
+            !finished && err.is_some(),
+            "limit {limit}: a truncated chunk was accepted"
+        );
+    }
+}

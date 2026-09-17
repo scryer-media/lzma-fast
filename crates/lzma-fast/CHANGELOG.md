@@ -116,6 +116,12 @@ apart for anyone reading the history.
   Seen as a segfault on macOS and as `STATUS_ACCESS_VIOLATION` on
   windows-msvc, on corrupt input only, and reproduced in a no-assembly build
   on both.
+- A bounded `drain_upto` no longer reports a truncated LZMA2 stream as
+  finished. The chase decoder can stop mid-chunk when the caller's budget runs
+  out; with the end marker as the next input byte, the input cursor reached
+  the end of the stream with a chunk still owing output, and that was taken
+  for a clean end. The stream now ends only where the chase decoder is between
+  chunks. Found by fuzzing the new drain budget.
 
 ## 0.2.0 (unreleased)
 

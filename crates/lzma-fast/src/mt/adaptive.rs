@@ -936,6 +936,14 @@ impl Lzma2AdaptiveDecoder {
             && self.pending.is_empty()
             && !self.st_in_run
             && self.cursor_in + 1 >= end
+            // The cursor reaching the end marker is not the same as the bytes
+            // before it being a whole stream: a chase decoder stopped in the
+            // middle of a chunk - it ran out of the caller's output budget
+            // before the chunk's declared size was produced - is at the end
+            // marker with a chunk still owing output, and that stream is
+            // truncated. Only the chase can be in that position; a worker
+            // either decodes its whole run or fails it.
+            && self.st.as_ref().is_none_or(Lzma2Decoder::at_chunk_boundary)
         {
             self.complete = true;
             self.cursor_in = end;
