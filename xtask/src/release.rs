@@ -5,7 +5,7 @@
 
 use std::{env, process::ExitCode};
 
-use crate::cmd::{capture, cargo, read, repo_root, run, succeeds};
+use crate::cmd::{capture, capture_all, cargo, read, repo_root, run, succeeds};
 
 /// The crate this repository publishes.
 const CRATE: &str = "lzma-fast";
@@ -93,11 +93,25 @@ impl Release {
         if !succeeds("git", &["verify-commit", "HEAD"]) {
             self.problem("HEAD is not a signed commit")?;
         }
-        if succeeds(
+        // A release that got as far as the tag and then failed - a refused
+        // publish, a refused push - is picked up where it stopped, as long as
+        // the tag is the signed tag this run would have made.
+        let tagged = succeeds(
             "git",
             &["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")],
-        ) {
-            self.problem(&format!("tag {tag} already exists"))?;
+        );
+        if tagged {
+            let at = capture("git", &["rev-parse", &format!("{tag}^{{commit}}")]);
+            let head = capture("git", &["rev-parse", "HEAD"]);
+            if at.is_none() || at != head {
+                self.problem(&format!(
+                    "tag {tag} exists and is not at HEAD; if it was never pushed, `git tag -d {tag}` and run again"
+                ))?;
+            } else if !succeeds("git", &["verify-tag", &tag]) {
+                self.problem(&format!("tag {tag} exists and is not a signed tag"))?;
+            } else {
+                println!("release: tag {tag} is already at HEAD, carrying on from it");
+            }
         }
 
         let changelog = read(&root, CHANGELOG);
@@ -165,7 +179,9 @@ impl Release {
         }
 
         if self.dry_run {
-            if self.problems == 0 {
+            if self.problems == 0 && tagged {
+                println!("release: dry run clean; a real run would carry on from {tag}");
+            } else if self.problems == 0 {
                 println!("release: dry run clean; a real run would tag {tag}");
             } else {
                 eprintln!("release: dry run found {} problem(s)", self.problems);
@@ -174,14 +190,20 @@ impl Release {
         }
 
         let message = format!("{CRATE} {version}");
-        if !run("git", &["tag", "-s", &tag, "-m", &message]) {
+        if !tagged && !run("git", &["tag", "-s", &tag, "-m", &message]) {
             return self.problem(&format!("could not create the signed tag {tag}"));
         }
         if publish {
             println!("release: cargo publish");
-            if !cargo(&["publish", "-p", CRATE, "--locked"]) {
+            let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let (ok, output) = capture_all(&cargo_bin, &["publish", "-p", CRATE, "--locked"])
+                .unwrap_or((false, String::from("could not run cargo")));
+            print!("{output}");
+            if !ok && output.contains("already exists") {
+                println!("release: {version} is already on crates.io, carrying on");
+            } else if !ok {
                 return self.problem(&format!(
-                    "cargo publish failed; the tag {tag} exists locally and was not pushed"
+                    "cargo publish failed; the tag {tag} exists locally and was not pushed. Fix the cause and run this again: it carries on from the tag"
                 ));
             }
         }
