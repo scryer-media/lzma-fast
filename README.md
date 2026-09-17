@@ -3,7 +3,6 @@
 [![ci](https://github.com/scryer-media/lzma-fast/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/lzma-fast/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lzma-fast.svg)](https://crates.io/crates/lzma-fast)
 [![docs.rs](https://docs.rs/lzma-fast/badge.svg)](https://docs.rs/lzma-fast)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/scryer-media/lzma-fast/badge)](https://securityscorecards.dev/viewer/?uri=github.com/scryer-media/lzma-fast)
 
 LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for
 its speed, including its hand-written `aarch64` and `x86_64` decode loops. No
