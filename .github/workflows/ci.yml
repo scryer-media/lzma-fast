@@ -113,6 +113,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install the xz the container tests are written against
+        if: runner.os == 'Linux'
+        run: ./.github/scripts/install-xz.sh
       # The default features now include `crypto`, which builds AWS-LC, so
       # this lane needs CMake - present on all four runners - and, on Windows
       # x86-64, an assembler for the NASM sources. `aws-lc-sys` is pulled with

@@ -192,7 +192,7 @@ impl BlockDecoder {
             } else {
                 FinishMode::Any
             };
-            let p = self.lzma2.decode(input, &mut out[..limit], finish)?;
+            let p = self.decode_lzma2(input, &mut out[..limit], finish)?;
             self.packed += p.read as u64;
             self.unpacked += p.written as u64;
             self.check.update(&out[..p.written]);
@@ -214,9 +214,10 @@ impl BlockDecoder {
         if self.scratch.len() < want {
             self.scratch.resize(want, 0u8);
         }
-        let p = self
-            .lzma2
-            .decode(input, &mut self.scratch[..want], finish)?;
+        let mut scratch = core::mem::take(&mut self.scratch);
+        let decoded = self.decode_lzma2(input, &mut scratch[..want], finish);
+        self.scratch = scratch;
+        let p = decoded?;
         self.packed += p.read as u64;
         let produced = &self.scratch[..p.written];
         if p.status == Status::FinishedWithMark {
@@ -239,6 +240,28 @@ impl BlockDecoder {
             self.pending_pos = 0;
         }
         Ok((p.read, n))
+    }
+
+    /// One LZMA2 call, with its failure read for what it means here.
+    ///
+    /// With no room left the call exists only to read the end marker, and
+    /// LZMA2 fails it when what follows is another chunk. That is a block
+    /// running past its allowance, not corrupt data: reported as corruption, a
+    /// caller that hit its own cap is told its file is broken.
+    fn decode_lzma2(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        finish: FinishMode,
+    ) -> Result<crate::error::Progress, XzErrorKind> {
+        let full = out.is_empty();
+        self.lzma2.decode(input, out, finish).map_err(|error| {
+            if full {
+                self.at_capacity()
+            } else {
+                error.into()
+            }
+        })
     }
 
     /// The block has produced everything it is allowed to and has not stopped.

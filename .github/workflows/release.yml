@@ -48,6 +48,8 @@ jobs:
           echo "$heading"
           test -n "$heading"
           ! echo "$heading" | grep -qi unreleased
+      - name: Install the xz the container tests are written against
+        run: ./.github/scripts/install-xz.sh
       - name: Test
         run: cargo test --locked --workspace --no-fail-fast
       - name: Package
