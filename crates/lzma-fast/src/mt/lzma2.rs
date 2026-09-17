@@ -286,6 +286,20 @@ impl Coder for Lzma2Coder {
             return Err(MtError::Lzma(Error::CorruptData));
         }
 
+        // The block's buffer lives in one of two places: here between blocks,
+        // and inside the decoder as its dictionary while one is being decoded.
+        // `MtDec` may pre-code the same block twice - a block whose first
+        // attempt did not consume its input is parsed and set up again - and
+        // the buffer is then still the decoder's. Taking `out_buf` a second
+        // time would hand the decoder an empty dictionary while telling it the
+        // block is `out_pre_size` bytes long, which on the next uncompressed
+        // chunk is a slice index past the end of an empty buffer. Found on
+        // windows-msvc by the corrupt-run differential test, which is the
+        // shape that makes `MtDec` retry.
+        if self.out_buf.is_empty() {
+            self.out_buf = self.dec.take_block_dic();
+        }
+
         // C frees and reallocates when the buffer is too small. The port grows
         // it instead and lets `dic_buf_size` say how much of it this block
         // uses, so a stream of blocks of differing sizes does not re-zero the

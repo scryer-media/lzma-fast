@@ -515,7 +515,14 @@ fn lzma2_mt_fixture_checksums_fold_to_the_serial_answer() {
             ),
         ));
     }
+    // Whole-block checks, from a run with no split points. SHA-256 where the
+    // crate has it, because the digest comparison at the end needs this same
+    // run; a plain CRC otherwise - the block boundaries are the decoder's and
+    // do not depend on which check is asked for.
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
     let sha_blocks = decode(all.max(16), &ChecksumPlan::new(Checksum::Sha256));
+    #[cfg(not(any(feature = "crypto", feature = "native-crypto")))]
+    let sha_blocks = decode(all.max(16), &ChecksumPlan::new(Checksum::Crc32));
     let block_ends: Vec<u64> = sha_blocks
         .iter()
         .map(|c| c.unpacked_offset + c.len)

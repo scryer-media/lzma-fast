@@ -106,6 +106,17 @@ apart for anyone reading the history.
   scoped thread cannot serve it. `docs/porting.md` has the table of which
   driver to use for a borrowed source.
 
+### Fixed
+
+- A block whose decode was interrupted by an earlier block's error is no
+  longer decoded at all. Its `pre_code` was skipped - which is what lends the
+  coder's buffer to the decoder as its dictionary - while the code loop ran
+  anyway, so the block decoded into an empty dictionary: a panic in the
+  portable loop and a store through a dangling pointer in the assembly one.
+  Seen as a segfault on macOS and as `STATUS_ACCESS_VIOLATION` on
+  windows-msvc, on corrupt input only, and reproduced in a no-assembly build
+  on both.
+
 ## 0.2.0 (unreleased)
 
 - Multi-threaded LZMA2 decoding behind the `std` feature, ported from

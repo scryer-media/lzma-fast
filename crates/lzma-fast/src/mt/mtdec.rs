@@ -700,7 +700,18 @@ impl<'e, C: Coder> MtDec<'e, C> {
             let mut in_code_pos = 0u64;
             let mut out_code_pos = 0u64;
 
-            if res.is_none() && need_code && code_res.is_none() && io_err.is_none() {
+            // `was_interrupted` gates this as well as the pre-code above: an
+            // interrupted block never had its buffer installed as the
+            // decoder's dictionary, so coding it would decode into an empty
+            // one - a panic in the portable loop and a write through a
+            // dangling pointer in the assembly one. C guards `PreCode` and
+            // the code loop with the same `wasInterrupted`.
+            if res.is_none()
+                && need_code
+                && !was_interrupted
+                && code_res.is_none()
+                && io_err.is_none()
+            {
                 let c = coder.as_mut().expect("a coder exists once parse has run");
                 let mut is_start_block = true;
                 let mut link = 0usize;
