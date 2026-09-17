@@ -537,10 +537,10 @@ fn oracle_commands(path: &Path) -> Vec<(String, Vec<String>)> {
 /// source tree: the binary `LZMA_FAST_7LZMA` names, or else whatever `7lzma`
 /// the PATH offers.
 fn reference_c_decoder() -> Option<String> {
-    if let Ok(p) = std::env::var("LZMA_FAST_7LZMA") {
-        if Path::new(&p).is_file() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("LZMA_FAST_7LZMA")
+        && Path::new(&p).is_file()
+    {
+        return Some(p);
     }
     let path = std::env::var("PATH").ok()?;
     std::env::split_paths(&path)
