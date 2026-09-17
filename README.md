@@ -184,6 +184,7 @@ and `docs/perf-log.md` carries its `.xz` numbers.
 | [`docs/benchmarking.md`](docs/benchmarking.md) | Fixtures, oracles and how to reproduce a measurement. |
 | [`docs/security.md`](docs/security.md) | Every limit the container layer enforces, and what each one stops. |
 | [`docs/publishing.md`](docs/publishing.md) | Release checklist. |
+| [`xtask`](xtask) | `cargo xtask release`: the release checks, tag and first publish. Not published. |
 | [`scripts/make-fixtures.sh`](scripts/make-fixtures.sh) | Generates the benchmark fixtures locally. They are never committed. |
 
 ## Acknowledgements

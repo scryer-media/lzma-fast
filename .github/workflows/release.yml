@@ -1,6 +1,6 @@
 name: release
 
-# Cut by scripts/release.sh: a signed tag v<version> on main. This workflow
+# Cut by `cargo xtask release`: a signed tag v<version> on main. This workflow
 # proves the tag matches the manifest, runs the tests, publishes the crate to
 # crates.io through trusted publishing (no long-lived token in the repository)
 # and creates the GitHub release with that version's changelog section as its
@@ -69,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # `scripts/release.sh --publish` uploads from the releaser's machine (the
+      # `cargo xtask release --publish` uploads from the releaser's machine (the
       # first release has to, trusted publishing needs the crate to exist). The
       # tag still lands here, so an upload that is already there is not an error.
       - name: Is this version already on crates.io
