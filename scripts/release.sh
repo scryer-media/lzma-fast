@@ -1,51 +1,101 @@
 #!/usr/bin/env bash
-# Cut a release of lzma-fast: run every check the release workflow will run, then
-# create the signed tag and push it. Publishing to crates.io and the GitHub
-# release are done by .github/workflows/release.yml when the tag arrives.
+# Cut a release of this crate: run the checks the release workflow runs, create
+# the signed tag and push it. .github/workflows/release.yml publishes to
+# crates.io and creates the GitHub release when the tag arrives.
 #
-#   scripts/release.sh            # check, tag, push the tag
-#   scripts/release.sh --dry-run  # check only
+#   scripts/release.sh --dry-run   # report every problem, change nothing
+#   scripts/release.sh             # check, tag, push the tag
+#   scripts/release.sh --publish   # check, tag, `cargo publish` from this
+#                                  # machine, push the tag (the first release,
+#                                  # before trusted publishing exists)
 #
-# See docs/publishing.md for the release-day sequence.
+#   --skip-tests   leave out `cargo test`; CI on the release commit and the
+#                  workflow's own verify job both run it
+#
+# A dry run works on any branch and on a dirty tree and lists everything a real
+# run would refuse, instead of stopping at the first. See docs/publishing.md.
 set -euo pipefail
 
 CRATE=lzma-fast
-CHANGELOG=crates/lzma-fast/CHANGELOG.md
-DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+CHANGELOG=CHANGELOG.md
+README=README.md
+
+DRY_RUN=0 PUBLISH=0 SKIP_TESTS=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --publish) PUBLISH=1 ;;
+    --skip-tests) SKIP_TESTS=1 ;;
+    *) echo "release: unknown option '$arg'" >&2; exit 2 ;;
+  esac
+done
 
 cd "$(git rev-parse --show-toplevel)"
 
-fail() { echo "release: $*" >&2; exit 1; }
-
-branch="$(git branch --show-current)"
-[ "$branch" = "main" ] || fail "on '$branch', releases are cut from main"
-[ -z "$(git status --porcelain)" ] || fail "the tree is not clean"
-git verify-commit HEAD >/dev/null 2>&1 || fail "HEAD is not a signed commit"
+problems=0
+# In a dry run a problem is reported and the run goes on; otherwise it is fatal.
+problem() {
+  echo "release: $*" >&2
+  problems=$((problems + 1))
+  [ "$DRY_RUN" = 1 ] || exit 1
+}
 
 version="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
+minor="${version%.*}"
 tag="v$version"
 echo "release: $CRATE $version"
 
-git rev-parse -q --verify "refs/tags/$tag" >/dev/null && fail "tag $tag already exists"
+branch="$(git branch --show-current)"
+[ "$branch" = "main" ] || problem "on '$branch', releases are cut from main"
+dirty="$(git status --porcelain)"
+[ -z "$dirty" ] || problem "the tree is not clean:"$'\n'"$dirty"
+git verify-commit HEAD >/dev/null 2>&1 || problem "HEAD is not a signed commit"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  problem "tag $tag already exists"
+fi
 
-heading="$(grep -m1 "^## .*$version" "$CHANGELOG" || true)"
-[ -n "$heading" ] || fail "$CHANGELOG has no '## ... $version' section"
-echo "$heading" | grep -qi unreleased && fail "$CHANGELOG still calls $version unreleased: '$heading'"
+heading="$(grep -E -m1 "^## \[?$version([^0-9.]|\$)" "$CHANGELOG" || true)"
+if [ -z "$heading" ]; then
+  problem "$CHANGELOG has no '## $version' section"
+elif echo "$heading" | grep -qi unreleased; then
+  problem "$CHANGELOG still calls $version unreleased: '$heading'"
+fi
 
-grep -q "^lzma-fast = \"$version\"\|lzma-fast = { version = \"$version\"" crates/lzma-fast/README.md 2>/dev/null \
-  || [ "$CRATE" != "lzma-fast" ] || fail "crates/lzma-fast/README.md does not show version $version in its dependency lines"
+# The README's dependency lines may name the full version or just major.minor.
+if ! grep -Eq "^$CRATE = (\{ version = )?\"($version|$minor)\"" "$README"; then
+  problem "$README shows neither \"$version\" nor \"$minor\" in its dependency lines"
+fi
 
-echo "release: cargo test --locked --workspace"
-cargo test --locked --workspace --no-fail-fast
+if [ "$SKIP_TESTS" = 1 ]; then
+  echo "release: skipping cargo test"
+else
+  echo "release: cargo test --locked --workspace --release"
+  cargo test --locked --workspace --release --no-fail-fast || problem "tests failed"
+fi
+
 echo "release: cargo publish --dry-run"
-cargo publish -p "$CRATE" --locked --dry-run
+allow_dirty=()
+[ "$DRY_RUN" = 1 ] && [ -n "$dirty" ] && allow_dirty=(--allow-dirty)
+cargo publish -p "$CRATE" --locked --dry-run ${allow_dirty[@]+"${allow_dirty[@]}"} \
+  || problem "cargo publish --dry-run failed"
 
 if [ "$DRY_RUN" = 1 ]; then
-  echo "release: dry run, not tagging $tag"
-  exit 0
+  if [ "$problems" = 0 ]; then
+    echo "release: dry run clean; a real run would tag $tag"
+    exit 0
+  fi
+  echo "release: dry run found $problems problem(s)" >&2
+  exit 1
 fi
 
 git tag -s "$tag" -m "$CRATE $version"
+if [ "$PUBLISH" = 1 ]; then
+  echo "release: cargo publish"
+  cargo publish -p "$CRATE" --locked
+fi
 git push origin "$tag"
-echo "release: pushed $tag; the release workflow publishes it"
+if [ "$PUBLISH" = 1 ]; then
+  echo "release: published $version and pushed $tag; the workflow finds it on crates.io and only creates the GitHub release"
+else
+  echo "release: pushed $tag; the release workflow publishes it"
+fi

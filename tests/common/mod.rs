@@ -16,10 +16,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("repo root")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 pub fn read(name: &str) -> Vec<u8> {
@@ -356,5 +353,5 @@ pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
 
 /// The `.7z` pack-stream helper, shared with the benchmark harness so there is
 /// one implementation of it and it lives outside the library.
-#[path = "../../../../tools/lzma-bench/src/sevenz.rs"]
+#[path = "../../tools/lzma-bench/src/sevenz.rs"]
 pub mod sevenz;

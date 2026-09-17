@@ -94,7 +94,7 @@ decoder is configured for.
 ## Differential correctness
 
 `cargo test -p lzma-fast` decodes every fixture it can find under
-`bench/fixtures` and small committed vectors under `crates/lzma-fast/tests`,
+`bench/fixtures` and small committed vectors under `tests`,
 and compares the bytes with `xz -dc`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.
 

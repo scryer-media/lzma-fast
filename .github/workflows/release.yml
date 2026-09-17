@@ -44,7 +44,7 @@ jobs:
       - name: The changelog has a dated section for this version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          heading="$(grep -m1 "^## .*$version" crates/lzma-fast/CHANGELOG.md || true)"
+          heading="$(grep -m1 "^## .*$version" CHANGELOG.md || true)"
           echo "$heading"
           test -n "$heading"
           ! echo "$heading" | grep -qi unreleased
@@ -69,9 +69,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # `scripts/release.sh --publish` uploads from the releaser's machine (the
+      # first release has to, trusted publishing needs the crate to exist). The
+      # tag still lands here, so an upload that is already there is not an error.
+      - name: Is this version already on crates.io
+        id: exists
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A "$CRATE release workflow" "https://crates.io/api/v1/crates/$CRATE/$version")"
+          echo "crates.io answered $code"
+          if [ "$code" = 200 ]; then echo "published=true" >> "$GITHUB_OUTPUT"; fi
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.exists.outputs.published != 'true'
         id: auth
       - name: Publish
+        if: steps.exists.outputs.published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish -p "$CRATE" --locked --no-verify
@@ -92,9 +104,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           # The section whose heading names the version; failing that, the
           # first section of the file.
-          awk -v ver="$version" '/^## /{ if (found) exit; if (index($0, ver)) found=1; next } found' crates/lzma-fast/CHANGELOG.md > notes.md
+          awk -v ver="$version" '/^## /{ if (found) exit; if (index($0, ver)) found=1; next } found' CHANGELOG.md > notes.md
           if ! grep -q '[^[:space:]]' notes.md; then
-            awk 'NR>1 && /^## /{ n++; if (n==2) exit } n==1' crates/lzma-fast/CHANGELOG.md > notes.md
+            awk 'NR>1 && /^## /{ n++; if (n==2) exit } n==1' CHANGELOG.md > notes.md
           fi
           cat notes.md
       - name: Create the release

@@ -1,19 +1,60 @@
-[workspace]
-members = [
-    "crates/lzma-fast",
-    "tools/lzma-bench",
-]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "lzma-fast"
+description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
+readme = "README.md"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/lzma-fast"
+keywords = ["lzma", "lzma2", "xz", "decompression"]
+categories = ["compression", "no-std"]
+# Repository scaffolding that has no business in the crate archive.
+exclude = [
+    ".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
+    "asm-lab/", "bench/", "docs/", "fuzz/", "scripts/", "tools/", "rust-toolchain.toml",
+    # The tests share a helper with `tools/lzma-bench` and read repository
+    # fixtures, so they only build from a checkout.
+    "tests/",
+]
 
-[workspace.dependencies]
-lzma-fast = { path = "crates/lzma-fast", version = "0.3.0" }
+[features]
+default = ["std", "asm", "crc", "crypto", "xz"]
+std = ["crc-fast?/std"]
+# The hand-written decode loops ported from the LZMA SDK's Asm/ tree, used on
+# aarch64 and x86_64. Turning it off falls back to the portable Rust port of
+# the C loop, which is what every other target gets anyway.
+asm = []
+# CRC-32 and CRC-64/XZ from `crc-fast`, which uses the carry-less multiply
+# units. Default because every xz stream carries one of them (check types 1
+# and 4); the decoder itself never touches either.
+crc = ["std", "dep:crc-fast"]
+# The .xz container: stream framing, block headers, the index, the BCJ and
+# delta filters, and the readers over them. Needs `crc`, because every xz
+# header carries a mandatory CRC-32, and `std`, because the readers are I/O.
+xz = ["std", "crc"]
+# SHA-256, which is xz check type 10, over AWS-LC. Default, so that the
+# obvious build gets the fast, audited implementation.
+crypto = ["std", "dep:aws-lc-rs"]
+# The same API over RustCrypto's `sha2`, for a build that wants no C
+# toolchain. It takes precedence when both are on, so
+# `--no-default-features --features std,native-crypto` is the pure-Rust
+# choice, and a build with both compiles both and checks they agree.
+native-crypto = ["dep:sha2"]
+
+[dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+crc-fast = { version = "1.10.0", default-features = false, optional = true }
+sha2 = { version = "0.11.0", default-features = false, optional = true }
+
+[dev-dependencies]
+
+# `tools/lzma-bench` is a workspace member rather than an example because it
+# depends on `lzma-rust2` and `liblzma` to time this crate against them, and
+# those must not appear in this crate's own graph at all.
+[workspace]
+members = ["tools/lzma-bench"]
+resolver = "2"
 
 [profile.release]
 lto = "fat"

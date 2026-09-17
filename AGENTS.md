@@ -51,5 +51,5 @@ the reference decoder. Readability that costs throughput is not wanted.
   username and secrets. Keep it enabled: `git config core.hooksPath .githooks`.
 - `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`
   must pass before a commit is proposed for review.
-- Any code change to `crates/lzma-fast` bumps its version, `Cargo.lock` and
-  `crates/lzma-fast/CHANGELOG.md` in the same change.
+- Any code change to the crate (`src/`) bumps its version, `Cargo.lock` and
+  `CHANGELOG.md` in the same change.
