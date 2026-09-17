@@ -56,6 +56,10 @@ pub enum DrainStatus {
 /// A block of decoded output, in the order the caller asked for.
 type Ready = (u64, Vec<u8>, usize);
 
+/// A block a limited drain handed out only part of: its offset, its buffer,
+/// how much of the buffer is output, and how much of that has been delivered.
+type Part = (u64, Vec<u8>, usize, usize);
+
 /// What came of trying to hand the run at the cursor to a worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dispatch {
@@ -111,6 +115,9 @@ pub struct Lzma2AdaptiveDecoder {
 
     // Decoded blocks waiting for their turn.
     ready: BTreeMap<u64, Ready>,
+    /// The block `drain_upto` stopped in the middle of. Delivered before
+    /// anything else, so a limited drain cuts a block without reordering it.
+    part: Option<Part>,
     ready_bytes: u64,
     emitted_out: u64,
     spare_out: Vec<Vec<u8>>,
@@ -180,6 +187,7 @@ impl Lzma2AdaptiveDecoder {
             st: None,
             st_wr: 0,
             st_in_run: false,
+            part: None,
             pool: None,
             outstanding: 0,
             outstanding_bytes: 0,
@@ -386,18 +394,50 @@ impl Lzma2AdaptiveDecoder {
     /// Returns the located [`Error::CorruptRun`] for a run that does not
     /// decode, but only after every block before it has been delivered, so a
     /// caller writing by offset keeps what it has already written.
-    pub fn drain<F>(&mut self, mut sink: F) -> Result<DrainStatus, Error>
+    pub fn drain<F>(&mut self, sink: F) -> Result<DrainStatus, Error>
+    where
+        F: FnMut(u64, &[u8]),
+    {
+        self.drain_impl(usize::MAX, sink)
+    }
+
+    /// As [`drain`](Lzma2AdaptiveDecoder::drain), but stops once `sink` has
+    /// been handed `limit` bytes, keeping the rest of the block it was in the
+    /// middle of for the next call.
+    ///
+    /// This is the shape a `Read` implementation wants: it is asked for as
+    /// much as fits in a caller's buffer, which is rarely as much as a run of
+    /// a parallel-encoded archive decodes to, and without a limit the
+    /// difference has to be spilled into a growing buffer of its own. With
+    /// one, the decoder's memory is a function of what is in flight rather
+    /// than of what has been fed.
+    ///
+    /// A `limit` of zero delivers nothing. Ordering is unaffected: the part
+    /// left over is the first thing the next call hands out.
+    ///
+    /// # Errors
+    ///
+    /// As [`drain`](Lzma2AdaptiveDecoder::drain).
+    pub fn drain_upto<F>(&mut self, limit: usize, sink: F) -> Result<DrainStatus, Error>
+    where
+        F: FnMut(u64, &[u8]),
+    {
+        self.drain_impl(limit, sink)
+    }
+
+    fn drain_impl<F>(&mut self, limit: usize, mut sink: F) -> Result<DrainStatus, Error>
     where
         F: FnMut(u64, &[u8]),
     {
         if self.cancelled {
             return Err(Error::Cancelled);
         }
+        let mut left = limit;
         let mut progress = false;
         loop {
             self.scan()?;
             let mut did = self.collect(false);
-            did |= self.emit(&mut sink);
+            did |= self.emit(&mut sink, &mut left);
             self.check_failed()?;
 
             // The chase decoder must not steal a run that a worker could take,
@@ -409,7 +449,16 @@ impl Lzma2AdaptiveDecoder {
                 Dispatch::Sent => did = true,
                 Dispatch::Busy => {}
                 Dispatch::None => {
-                    if self.st_step(&mut sink)? {
+                    // The chase serialises the whole decoder: while it holds
+                    // the cursor no worker may claim a run. That is the right
+                    // trade only when there is nothing else in flight - the
+                    // tail of an arriving stream. With a worker outstanding
+                    // there is something to wait for, and waiting costs a
+                    // fraction of a block while chasing costs the whole of
+                    // one, so the chase stands aside. A run it has already
+                    // started it must finish: the cursor is inside it.
+                    let stand_aside = self.outstanding != 0 && !self.st_in_run;
+                    if !stand_aside && self.st_step(&mut sink, &mut left)? {
                         did = true;
                     }
                 }
@@ -417,8 +466,18 @@ impl Lzma2AdaptiveDecoder {
 
             progress |= did;
 
-            if self.complete && self.outstanding == 0 && self.ready.is_empty() {
+            if self.complete
+                && self.outstanding == 0
+                && self.ready.is_empty()
+                && self.part.is_none()
+            {
                 return Ok(DrainStatus::Finished);
+            }
+            if left == 0 {
+                // The caller's buffer is full. Whatever else could be decoded
+                // waits for the next call, which starts with the part of the
+                // block that did not fit.
+                return Ok(DrainStatus::Progress);
             }
             if did {
                 continue;
@@ -522,10 +581,30 @@ impl Lzma2AdaptiveDecoder {
         }
     }
 
-    /// Hands out every block whose turn has come.
-    fn emit<F: FnMut(u64, &[u8])>(&mut self, sink: &mut F) -> bool {
+    /// Hands out every block whose turn has come, up to `left` bytes.
+    ///
+    /// A block that does not fit in what is left is cut: the rest stays in
+    /// [`Self::part`] and is the first thing the next call delivers, so a
+    /// limited drain changes how the output is sliced and nothing else.
+    fn emit<F: FnMut(u64, &[u8])>(&mut self, sink: &mut F, left: &mut usize) -> bool {
         let mut any = false;
         loop {
+            if *left == 0 {
+                break;
+            }
+            if let Some((off, buf, len, sent)) = self.part.as_mut() {
+                let take = (*len - *sent).min(*left);
+                sink(*off + *sent as u64, &buf[*sent..*sent + take]);
+                *sent += take;
+                *left -= take;
+                self.ready_bytes -= take as u64;
+                any = true;
+                if *sent == *len {
+                    let (_, buf, _, _) = self.part.take().expect("just borrowed");
+                    self.recycle(buf);
+                }
+                continue;
+            }
             let key = if self.ordered {
                 match self.ready.first_key_value() {
                     Some((k, _)) if *k == self.emitted_out => *k,
@@ -538,12 +617,21 @@ impl Lzma2AdaptiveDecoder {
                 }
             };
             let (off, buf, len) = self.ready.remove(&key).expect("just looked it up");
-            self.ready_bytes -= len as u64;
-            sink(off, &buf[..len]);
+            let take = len.min(*left);
+            self.ready_bytes -= take as u64;
+            sink(off, &buf[..take]);
+            *left -= take;
             if off == self.emitted_out {
+                // The whole block counts as claimed even when only part of it
+                // has been handed over: the rest is held here, ahead of
+                // everything else, so nothing can overtake it.
                 self.emitted_out = off + len as u64;
             }
-            self.recycle(buf);
+            if take == len {
+                self.recycle(buf);
+            } else {
+                self.part = Some((off, buf, len, take));
+            }
             any = true;
         }
         any
@@ -658,8 +746,12 @@ impl Lzma2AdaptiveDecoder {
     /// This is the chase path. It decodes a run whose tail has not arrived
     /// yet, chunk by chunk, and keeps its state between calls, so there is no
     /// need to wait for a run to be complete before starting on it.
-    fn st_step<F: FnMut(u64, &[u8])>(&mut self, sink: &mut F) -> Result<bool, Error> {
-        if self.complete || self.failed.is_some() {
+    fn st_step<F: FnMut(u64, &[u8])>(
+        &mut self,
+        sink: &mut F,
+        left: &mut usize,
+    ) -> Result<bool, Error> {
+        if self.complete || self.failed.is_some() || *left == 0 {
             return Ok(false);
         }
         let avail = self.buf.len() - (self.cursor_in - self.base) as usize;
@@ -673,9 +765,13 @@ impl Lzma2AdaptiveDecoder {
         let dec = self.st.as_mut().expect("just built");
 
         let dic_pos = dec.dic_pos();
+        // A step is capped by what the caller still has room for as well as by
+        // the step size, so a limited drain never decodes bytes it cannot hand
+        // over and would have to hold.
+        let step = OUT_STEP_ST.min(*left);
         let mut limit = dec.dic_buf_size();
-        if limit - self.st_wr > OUT_STEP_ST {
-            limit = self.st_wr + OUT_STEP_ST;
+        if limit - self.st_wr > step {
+            limit = self.st_wr + step;
         }
         let from = (self.cursor_in - self.base) as usize;
         let (used, status) = dec.decode_block(limit, &self.buf[from..], FinishMode::Any)?;
@@ -718,6 +814,7 @@ impl Lzma2AdaptiveDecoder {
             } else {
                 sink(offset, dec.dic_slice(start, end));
                 self.emitted_out = offset + produced as u64;
+                *left -= produced.min(*left);
             }
             dec.wrap_dic_pos();
             self.st_wr = dec.dic_pos();

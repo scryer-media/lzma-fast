@@ -50,6 +50,18 @@ apart for anyone reading the history.
   order and the chase runs only when no worker is outstanding, so output is
   always in order. `set_threads` takes effect at the next block, and
   `in_flight_bytes` reports what is held.
+- `xz::XzAdaptiveDecoder::drain_upto(limit, sink)`: as `drain`, but stops once
+  the sink has been handed `limit` bytes and keeps the rest of the block it was
+  in the middle of for the next call. A caller implementing `Read` over the
+  decoder can hand it the caller's own buffer instead of spilling whole blocks
+  into one of its own, which makes its memory a function of what is in flight
+  rather than of what has been fed.
+- `xz::stream_table` and `xz::block_table`: every stream, and every block,
+  located from the indexes of a seekable file without decoding anything.
+  `block_table` is the whole file's block list in file order with output
+  offsets relative to the file, which is what a caller deciding whether to
+  widen a decode wants to see before it commits. `XzParallelReader` now uses
+  `stream_table` rather than its own copy of the walk.
 - `xz::probe`, `xz::single_stream_block_count` and
   `xz::is_single_stream_multi_block`: structural gates over the footer and
   index that decode nothing, for a caller choosing between a sequential and a
@@ -62,6 +74,31 @@ apart for anyone reading the history.
   block's dictionary is clamped to the block's own declared uncompressed size,
   which is usually far below the dictionary the stream declares. The limits
   are listed in `docs/security.md`.
+
+### LZMA2, asked for by the `sevenz-fast` fork
+
+- `Lzma2AdaptiveDecoder` no longer decodes on the calling thread while a worker
+  is outstanding. The chase decoder serialises the whole decoder while it holds
+  the cursor - no worker may claim a run - and that is only the right trade
+  when there is nothing else in flight, which is the arriving-stream case it
+  was built for. For a stream already on disk it cost the fork a measured 1.50x
+  against the same decoder's own parallel path. There is no knob: with a worker
+  outstanding there is something to wait for, and waiting is what `drain`
+  already does everywhere else. A run the chase has *started* it still
+  finishes, since the cursor is inside it.
+- `Lzma2AdaptiveDecoder::drain_upto(limit, sink)`, as on `XzAdaptiveDecoder`
+  above and for the same reason.
+- `lzma_fast::run_boundaries(source, dict_prop)`: the runs of an LZMA2 stream
+  in a `Read + Seek` source, found by seeking past chunk payloads rather than
+  reading them, with the source's position restored. `Lzma2RunScanner` answers
+  this for bytes as they arrive; this answers it for bytes already on disk.
+  `Lzma2RunScanner::payload_remaining` and `skip_payload` are the two methods
+  that make skipping possible, and are public for callers driving the scanner
+  over their own source.
+- `Lzma2ParallelReader`'s `Read + Send + 'static` bound is documented rather
+  than removed: the reader is moved onto a thread that outlives the call, so a
+  scoped thread cannot serve it. `docs/porting.md` has the table of which
+  driver to use for a borrowed source.
 
 ## 0.2.0 (unreleased)
 

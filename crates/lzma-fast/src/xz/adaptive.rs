@@ -94,6 +94,9 @@ pub struct XzAdaptiveDecoder {
     planned_out: u64,
     next_emit: u64,
     ready: BTreeMap<u64, XzDone>,
+    /// The block a limited drain stopped in the middle of: its buffer, how
+    /// much of it is output, and how much of that has been handed over.
+    part: Option<(Vec<u8>, usize, usize)>,
     spare_out: Vec<Vec<u8>>,
     spare_in: Vec<Vec<u8>>,
 
@@ -142,6 +145,7 @@ impl XzAdaptiveDecoder {
             planned_out: 0,
             next_emit: 0,
             ready: BTreeMap::new(),
+            part: None,
             spare_out: Vec::new(),
             spare_in: Vec::new(),
             emitted: 0,
@@ -251,23 +255,63 @@ impl XzAdaptiveDecoder {
     /// Any structural or check failure, located; a block that fails is
     /// reported only after every block before it has been handed over, so a
     /// caller writing by offset keeps what it has already written.
-    pub fn drain<F>(&mut self, mut sink: F) -> XzResult<DrainStatus>
+    pub fn drain<F>(&mut self, sink: F) -> XzResult<DrainStatus>
+    where
+        F: FnMut(u64, &[u8]),
+    {
+        self.drain_impl(usize::MAX, sink)
+    }
+
+    /// As [`drain`](XzAdaptiveDecoder::drain), but stops once `sink` has been
+    /// handed `limit` bytes, keeping the rest of the block it was in the
+    /// middle of for the next call.
+    ///
+    /// A block of a parallel-encoded `.xz` file is whatever the encoder chose,
+    /// often tens or hundreds of megabytes, while a caller implementing `Read` is
+    /// asked for what fits in a buffer. Without a limit the difference has to
+    /// be spilled somewhere; with one, the decoder's memory is a function of
+    /// what is in flight and not of what has been fed.
+    ///
+    /// A `limit` of zero delivers nothing. Ordering is unaffected: the part
+    /// left over is the first thing the next call hands out.
+    ///
+    /// # Errors
+    ///
+    /// As [`drain`](XzAdaptiveDecoder::drain).
+    pub fn drain_upto<F>(&mut self, limit: usize, sink: F) -> XzResult<DrainStatus>
+    where
+        F: FnMut(u64, &[u8]),
+    {
+        self.drain_impl(limit, sink)
+    }
+
+    fn drain_impl<F>(&mut self, limit: usize, mut sink: F) -> XzResult<DrainStatus>
     where
         F: FnMut(u64, &[u8]),
     {
         if self.cancelled {
             return Err(self.err(XzErrorKind::Lzma(crate::Error::Cancelled)));
         }
+        let mut left = limit;
         let mut progress = false;
         loop {
             let mut did = self.collect(false)?;
-            did |= self.emit(&mut sink)?;
+            did |= self.emit(&mut sink, &mut left)?;
 
-            if self.state == State::Done && self.outstanding == 0 && self.ready.is_empty() {
+            if self.state == State::Done
+                && self.outstanding == 0
+                && self.ready.is_empty()
+                && self.part.is_none()
+            {
                 return Ok(DrainStatus::Finished);
             }
+            if left == 0 {
+                // The caller's buffer is full. The next call starts with the
+                // part of the block that did not fit.
+                return Ok(DrainStatus::Progress);
+            }
 
-            match self.step(&mut sink)? {
+            match self.step(&mut sink, &mut left)? {
                 Step::Did => did = true,
                 Step::Blocked => {
                     // Nothing can be done with what has arrived. If a worker
@@ -281,7 +325,7 @@ impl XzAdaptiveDecoder {
                             // so this is reported rather than waited on.
                             return Err(self.err(XzErrorKind::Lzma(crate::Error::InternalFailure)));
                         }
-                        did |= self.emit(&mut sink)?;
+                        did |= self.emit(&mut sink, &mut left)?;
                     } else {
                         progress |= did;
                         return Ok(if progress {
@@ -303,7 +347,7 @@ impl XzAdaptiveDecoder {
 
     // -- the state machine -------------------------------------------------
 
-    fn step<F>(&mut self, sink: &mut F) -> XzResult<Step>
+    fn step<F>(&mut self, sink: &mut F, left: &mut usize) -> XzResult<Step>
     where
         F: FnMut(u64, &[u8]),
     {
@@ -311,7 +355,7 @@ impl XzAdaptiveDecoder {
             State::Done => Ok(Step::Blocked),
             State::StreamHeader => self.stream_header(),
             State::BlockOrIndex => self.block_or_index(),
-            State::Block => self.chase(sink),
+            State::Block => self.chase(sink, left),
             State::Index => self.index(),
             State::Footer => self.footer(),
             State::Padding => self.padding(),
@@ -546,11 +590,17 @@ impl XzAdaptiveDecoder {
     }
 
     /// One turn of the chase decoder.
-    fn chase<F>(&mut self, sink: &mut F) -> XzResult<Step>
+    fn chase<F>(&mut self, sink: &mut F, left: &mut usize) -> XzResult<Step>
     where
         F: FnMut(u64, &[u8]),
     {
-        let want = OUT_STEP;
+        // Never decode more than the caller has room for: bytes the chase
+        // produces go straight to the sink, so anything over the limit would
+        // have to be held here instead.
+        let want = OUT_STEP.min(*left);
+        if want == 0 {
+            return Ok(Step::Blocked);
+        }
         if self.st_out.len() < want {
             self.st_out.resize(want, 0u8);
         }
@@ -573,6 +623,7 @@ impl XzAdaptiveDecoder {
                 if wrote > 0 {
                     sink(self.emitted, &self.st_out[..wrote]);
                     self.emitted += wrote as u64;
+                    *left -= wrote.min(*left);
                     self.planned_out = self.emitted;
                     if let Some(cap) = self.opts.max_unpack_bytes
                         && self.emitted > cap
@@ -798,12 +849,30 @@ impl XzAdaptiveDecoder {
     }
 
     /// Hands finished blocks to the caller in file order.
-    fn emit<F>(&mut self, sink: &mut F) -> XzResult<bool>
+    fn emit<F>(&mut self, sink: &mut F, left: &mut usize) -> XzResult<bool>
     where
         F: FnMut(u64, &[u8]),
     {
         let mut did = false;
-        while let Some(done) = self.ready.remove(&self.next_emit) {
+        if let Some((buf, len, sent)) = self.part.as_mut() {
+            let take = (*len - *sent).min(*left);
+            if take != 0 {
+                sink(self.emitted, &buf[*sent..*sent + take]);
+                self.emitted += take as u64;
+                *sent += take;
+                *left -= take;
+                did = true;
+            }
+            if *sent == *len {
+                let (buf, _, _) = self.part.take().expect("just borrowed");
+                self.spare_out.push(buf);
+            } else {
+                return Ok(did);
+            }
+        }
+        while *left != 0
+            && let Some(done) = self.ready.remove(&self.next_emit)
+        {
             let XzDone {
                 index: _,
                 stream,
@@ -825,14 +894,22 @@ impl XzAdaptiveDecoder {
                     file_offset,
                 ));
             }
-            sink(self.emitted, &out[..unpacked_len]);
-            self.emitted += unpacked_len as u64;
+            let take = unpacked_len.min(*left);
+            sink(self.emitted, &out[..take]);
+            self.emitted += take as u64;
+            *left -= take;
             if let Some(c) = checks
                 && !self.opts.plan.is_none()
             {
                 self.checks.push(c);
             }
-            self.spare_out.push(out);
+            if take == unpacked_len {
+                self.spare_out.push(out);
+            } else {
+                // The rest of this block goes out first on the next call,
+                // ahead of anything decoded in the meantime.
+                self.part = Some((out, unpacked_len, take));
+            }
             self.next_emit += 1;
             did = true;
             if let Some(cap) = self.opts.max_unpack_bytes

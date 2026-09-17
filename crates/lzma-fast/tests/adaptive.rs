@@ -386,3 +386,181 @@ fn the_threaded_path_never_claims_a_run_the_chase_started() {
     }
     assert_eq!(sink.bytes(), plain);
 }
+
+// 12. The requests the sevenz-fast fork filed: a chase that stands aside for a
+// worker, a drain the caller can bound, and a run index over a seekable
+// source.
+
+#[test]
+fn the_chase_stands_aside_while_a_worker_is_outstanding() {
+    // With every run complete in the buffer and threads available, nothing
+    // should be decoded on the calling thread: the chase exists for a run
+    // whose tail has not arrived, and taking one here stops every worker from
+    // claiming anything until it is through.
+    let names = ["text.p1.xz", "mixed.p1.xz", "rand.p1.xz", "text.p1.xz"];
+    let (prop, packed, plain) = multi_run(&names, 2);
+
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+    while dec.drain(|o, b| sink.put(o, b)).expect("drain") != DrainStatus::Finished {}
+    assert_eq!(sink.bytes(), plain);
+
+    // Every run but the last is complete before the first drain, so every one
+    // of them should have gone to a worker. The last run of the stream ends at
+    // the end marker and is claimed the same way, so the only block the chase
+    // may produce is none at all: each block delivered is one run.
+    assert_eq!(
+        sink.order.len(),
+        names.len() * 2,
+        "output was cut into more pieces than there are runs, so the chase \
+         decoded some of it a megabyte at a time"
+    );
+}
+
+#[test]
+fn a_bounded_drain_cuts_blocks_without_reordering_them() {
+    let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 2);
+    for threads in [1usize, 4] {
+        for limit in [1usize, 7, 4096, 1 << 16] {
+            let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(threads, u64::MAX)).expect("props");
+            let mut out: Vec<u8> = Vec::new();
+            let mut pos = 0usize;
+            loop {
+                if pos < packed.len() {
+                    let end = (pos + (1 << 15)).min(packed.len());
+                    pos += dec.feed(&packed[pos..end]).expect("feed");
+                    if pos == packed.len() {
+                        dec.end_of_input();
+                    }
+                }
+                let mut handed = 0usize;
+                let status = dec
+                    .drain_upto(limit, |off, b| {
+                        assert_eq!(off, out.len() as u64, "out of order at {off}");
+                        assert!(b.len() <= limit, "sink got {} over {limit}", b.len());
+                        handed += b.len();
+                        out.extend_from_slice(b);
+                    })
+                    .expect("drain_upto");
+                assert!(
+                    handed <= limit,
+                    "{handed} bytes handed over for a {limit} limit"
+                );
+                if status == DrainStatus::Finished {
+                    break;
+                }
+            }
+            assert_eq!(out, plain, "threads={threads} limit={limit}");
+        }
+    }
+}
+
+#[test]
+fn a_bounded_drain_holds_less_than_an_unbounded_one() {
+    // The point of the limit: what the decoder holds follows what is in
+    // flight, not what has been fed. Feed the whole stream, then take it 64
+    // KiB at a time and watch the high-water mark.
+    let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 4);
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut peak = 0u64;
+    loop {
+        let status = dec
+            .drain_upto(1 << 16, |_, b| out.extend_from_slice(b))
+            .expect("drain_upto");
+        peak = peak.max(dec.in_flight_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(out, plain);
+    assert!(peak > 0, "nothing was ever in flight");
+}
+
+#[test]
+fn a_zero_limit_delivers_nothing_and_loses_nothing() {
+    let (prop, packed, plain) = multi_run(&["text.p1.xz"], 1);
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(2, u64::MAX)).expect("props");
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+    let status = dec
+        .drain_upto(0, |_, _| panic!("a zero limit handed bytes over"))
+        .expect("drain_upto");
+    assert_eq!(status, DrainStatus::Progress);
+
+    let mut out = Vec::new();
+    while dec
+        .drain_upto(1 << 20, |_, b| out.extend_from_slice(b))
+        .expect("drain_upto")
+        != DrainStatus::Finished
+    {}
+    assert_eq!(out, plain);
+}
+
+#[test]
+fn run_boundaries_agrees_with_the_scanner_it_seeks_over() {
+    use std::io::Cursor;
+
+    use lzma_fast::{Lzma2RunScanner, run_boundaries};
+
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 3);
+
+    let mut scanner = Lzma2RunScanner::new();
+    scanner.feed(&packed).expect("scan");
+    let mut expected = Vec::new();
+    while let Some(r) = scanner.next_run() {
+        expected.push(r);
+    }
+
+    // From the start, and from a position part way into a larger buffer: the
+    // packed stream a 7z coder asks about is a range inside an archive.
+    let mut padded = alloc_prefix(32);
+    padded.extend_from_slice(&packed);
+    let mut src = Cursor::new(padded);
+    src.set_position(32);
+    let got = run_boundaries(&mut src, prop).expect("run_boundaries");
+    assert_eq!(got.len(), expected.len());
+    for (g, e) in got.iter().zip(&expected) {
+        assert_eq!(g.packed_len, e.packed_len);
+        assert_eq!(g.unpacked_len, e.unpacked_len);
+        assert_eq!(g.out_offset, e.out_offset);
+    }
+    assert_eq!(src.position(), 32, "the source's position was not restored");
+}
+
+fn alloc_prefix(n: usize) -> Vec<u8> {
+    vec![0xAAu8; n]
+}
+
+#[test]
+fn run_boundaries_rejects_a_range_that_stops_short() {
+    use std::io::Cursor;
+
+    use lzma_fast::run_boundaries;
+
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 2);
+    let mut src = Cursor::new(packed[..packed.len() / 2].to_vec());
+    let err = run_boundaries(&mut src, prop).expect_err("no end marker");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(src.position(), 0, "the source's position was not restored");
+
+    let mut src = Cursor::new(Vec::new());
+    assert!(
+        run_boundaries(&mut src, 41).is_err(),
+        "dict_prop 41 accepted"
+    );
+}

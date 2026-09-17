@@ -857,3 +857,101 @@ fn a_block_that_runs_out_of_its_declared_compressed_size_does_not_spin() {
     assert!(decode_chunked(&bytes, 7).is_err());
     assert!(decode_adaptive(&bytes, 4, 11).is_err());
 }
+
+/// As [`decode_adaptive`], but takes the output `limit` bytes at a time.
+fn decode_adaptive_upto(
+    data: &[u8],
+    threads: usize,
+    chunk: usize,
+    limit: usize,
+) -> Result<Vec<u8>, lzma_fast::XzError> {
+    let opts = XzOptions::default().with_threads(threads);
+    let mut dec = XzAdaptiveDecoder::new(opts);
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if pos < data.len() {
+            let end = (pos + chunk).min(data.len());
+            pos += dec.feed(&data[pos..end])?;
+            if pos == data.len() {
+                dec.end_of_input();
+            }
+        }
+        let mut handed = 0usize;
+        let status = dec.drain_upto(limit, |off, bytes| {
+            assert_eq!(off, out.len() as u64, "out of order at {off}");
+            assert!(
+                bytes.len() <= limit,
+                "sink got {} over {limit}",
+                bytes.len()
+            );
+            handed += bytes.len();
+            out.extend_from_slice(bytes);
+        })?;
+        assert!(handed <= limit, "{handed} bytes for a {limit} limit");
+        match status {
+            DrainStatus::Finished => return Ok(out),
+            DrainStatus::NeedsMoreInput if pos == data.len() => {
+                panic!("the decoder wanted input after the file ended")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_bounded_adaptive_drain_delivers_the_same_bytes() {
+    for name in ["mixed.mb.xz", "mixed.bcjx86.xz", "tiny.concat.xz"] {
+        let path = common::data_dir().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        // The sequential reader is the reference here: `tiny.concat.xz` is two
+        // streams, so what it decodes to is not one copy of a source file.
+        let want = decode(&bytes).expect(name);
+        for threads in [1usize, 4] {
+            for limit in [1usize, 5, 997, 1 << 16] {
+                let have = decode_adaptive_upto(&bytes, threads, 512, limit)
+                    .unwrap_or_else(|e| panic!("{name} t={threads} limit={limit}: {e}"));
+                assert_eq!(have, want, "{name} t={threads} limit={limit}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_block_table_locates_every_block_a_decode_produces() {
+    // The seekable question a consumer asks before it commits to a decode:
+    // where the blocks are and what they decode to, without decoding.
+    for name in ["mixed.mb.xz", "tiny.concat.xz"] {
+        let path = common::data_dir().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let mut src = Cursor::new(bytes.clone());
+        let table = lzma_fast::xz::block_table(&mut src, u64::MAX).expect(name);
+        assert!(!table.is_empty(), "{name} has no blocks");
+
+        let mut want_offset = 0u64;
+        for b in &table {
+            assert_eq!(b.uncompressed_offset, want_offset, "{name} block offsets");
+            assert!(
+                b.file_offset < bytes.len() as u64,
+                "{name} block past the end of the file"
+            );
+            // The block header's first byte encodes its own size, so a located
+            // block must start on one.
+            let first = bytes[usize::try_from(b.file_offset).expect("offset")];
+            assert_ne!(first, 0, "{name} points a block at an index indicator");
+            want_offset += b.record.uncompressed_size;
+        }
+        let decoded = decode(&bytes).expect(name);
+        assert_eq!(
+            want_offset,
+            decoded.len() as u64,
+            "{name}: the table's sizes do not add up to the decode"
+        );
+    }
+}
