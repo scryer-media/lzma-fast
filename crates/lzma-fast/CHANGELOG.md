@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
 The `.xz` container, behind the new default `xz` feature. 0.2.0's entry is
 kept below as it stands: that work is unreleased, but the container is a

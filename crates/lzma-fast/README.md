@@ -148,9 +148,6 @@ to be named first.
 - The **XZ for Java** lineage of pure-Rust decoders, whose readability set
   the bar this crate measures itself against, and whose authors made LZMA in
   Rust normal long before this port existed.
-- The authors of [`crc-fast`](https://crates.io/crates/crc-fast),
-  [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs) and RustCrypto's
-  [`sha2`](https://crates.io/crates/sha2), which do the checksumming.
 
 ## License
 
