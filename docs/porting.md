@@ -94,50 +94,72 @@ question; get to C parity first, then close on the asm.
 
 ## The container layer
 
-The decoder is deliberately format-free: it decodes raw LZMA1 and raw LZMA2
-and knows nothing about the files those streams arrive in. The layer above it
-is not written yet; this section fixes its shape so that when it is, it is
-ported from the same tree with the same discipline.
+The decoder proper is deliberately format-free: it decodes raw LZMA1 and raw
+LZMA2 and knows nothing about the files those streams arrive in. The container
+layer sits above it, in `src/xz/`, behind the `xz` feature, and is ported from
+the same tree with the same discipline.
 
 The container this crate covers is xz, and only xz. 7z — its header, folders
-and coder graphs, its BCJ and delta filters, its AES-256 and the `7zAes` key
-derivation — is out of scope here and is handled by a fork of `sevenz-rust2`
-that depends on this crate.
+and coder graphs, its AES-256 and the `7zAes` key derivation — is out of scope
+here and is handled by a fork of `sevenz-rust2` that depends on this crate.
+The BCJ and delta converters are shared: they are the same filters in both
+formats, so `xz::bcj` and `xz::delta` are public and the 7z fork uses them
+rather than carrying its own.
 
-Two things the xz layer needs first, and which the crate already has: the
-checksums in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check
-type 1 and CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`]
-(check type 10), which is `aws-lc-rs` under the `crypto` feature and
-RustCrypto's `sha2` under `native-crypto`, the latter winning when both are
-on. All three are on by default, because every xz stream carries one of the
-three checks; all three are unreachable from the decoder, and
-`--no-default-features` has none of them.
+Two things the xz layer needs, and which the crate already had: the checksums
+in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check type 1 and
+CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`] (check type 10),
+which is `aws-lc-rs` under the `crypto` feature and RustCrypto's `sha2` under
+`native-crypto`, the latter winning when both are on. `xz` therefore implies
+`crc`: every xz header carries a mandatory CRC-32, so a container reader
+without one could not verify anything.
 
 ### xz
 
-C: `C/Xz.h`, `C/XzIn.c`, `C/XzDec.c`.
+C: `C/Xz.h`, `C/XzIn.c`, `C/XzDec.c`, `C/XzCrc64.c`, `C/Bra.c`, `C/Bra86.c`,
+`C/BraIA64.c`, `C/Delta.c`. The file map:
+
+| C | Rust | Notes |
+| --- | --- | --- |
+| `Xz.h`, `XzIn.c` (`Xz_ReadHeader`, `XzBlock_Parse`) | `src/xz/stream.rs`, `src/xz/block.rs` | Stream header and footer, block header, check types. |
+| `XzIn.c` (`Xz_ReadIndex`, `Xz_ReadBackward`) | `src/xz/index.rs` | Index parsing, the seekable footer-first path, and the structural gates. |
+| `Xz.c` (`Xz_ParseIndex`-adjacent VLI helpers) | `src/xz/vli.rs` | Variable-length integers, hardened: nine bytes, 63 bits, shortest encoding only. |
+| `XzDec.c` (`CXzUnpacker`, `XzUnpacker_Code`) | `src/xz/reader.rs`, `src/xz/blockdec.rs` | The state machine and the per-block decode. |
+| `XzDec.c` (`CXzCheck`), `XzCrc64.c` | `src/xz/check.rs`, `src/crc.rs` | The block check, computed by whoever decoded the block. |
+| `Bra.c`, `Bra86.c`, `BraIA64.c` | `src/xz/bcj.rs` | All eight branch converters, decode side, with the C's branchless x86. |
+| `Delta.c` | `src/xz/delta.rs` | The delta filter, with the C's 256-byte rotating history. |
+| — | `src/xz/filter.rs` | Filter flags, chain validation and the streaming converter pipeline. There is no single C counterpart: 7-Zip's chain lives inside `CXzUnpacker`. |
 
 A stream is a 12-byte header (magic `FD 37 7A 58 5A 00`, then two flag bytes
 whose low nibble is the check type and whose CRC-32 covers the pair), a series
 of blocks, an index, and a 12-byte footer. A block is a header naming one to
-four filters — for this crate the only interesting chain is a single LZMA2
-filter, id `0x21`, whose one property byte is the dictionary size — followed
-by the filter output, padding to a multiple of four, and the check. The check
-is CRC-32, CRC-64/XZ or SHA-256 depending on the stream flags, or absent.
-`tests/common/mod.rs` already contains the minimum of this reader, in the
-strictest possible form: it rejects everything it does not understand rather
-than guessing, and the real one should keep that habit.
+four filters — the last of which must be LZMA2, id `0x21`, whose one property
+byte is the dictionary size — followed by the filter output, padding to a
+multiple of four, and the check.
 
-The index is what makes random access possible: it records, for every block,
-the compressed and uncompressed size, so a reader can seek to a block boundary
-without decoding what precedes it. The footer repeats the index size and its
-CRC-32 so the index can be found from the end of the file.
+Three deliberate deviations from the C, each for a reason:
 
-None of this is implemented. When it is: the same rules as the decoder — port
-rather than redesign, cite the C function, prove it differentially against
-`7zz x` and `xz -dc`, and keep it behind features so that a caller who only
-wants raw LZMA still gets a crate with no dependencies.
+1. **The reader pulls.** `XzUnpacker_Code` is handed whole buffers; a Rust
+   `Read` adapter owns its input buffer, so the state machine has to be able
+   to stop in the middle of every field. That is what `src/xz/reader.rs`'s
+   `State` is.
+2. **The index is verified by folding, not by listing.** 7-Zip reads the whole
+   index into memory. The sequential reader cannot (a hostile stream can carry
+   millions of records), so it folds each block's record into a CRC-64 as the
+   block goes by and folds the index's records the same way as they stream
+   past. Constant memory, same verdict.
+3. **The dictionary is clamped to the block.** 7-Zip allocates what the
+   property byte declares. xz resets the dictionary at every block, so when a
+   block header declares an uncompressed size the dictionary need never be
+   larger than it — which is what lets an `xz -9` stream of small blocks
+   decode under a small memory limit.
 
+The filter chain runs in the opposite order to the header: filter 0 is the one
+the encoder applied first, so the decoder undoes the list backwards, and LZMA2
+(the only "last filter" this crate supports) is therefore always first to run
+on the decode side. Each converter carries its own unconverted tail between
+chunks — nineteen bytes in the worst chain — so a chain streams without ever
+buffering a block.
 
 ## Adaptive use
 

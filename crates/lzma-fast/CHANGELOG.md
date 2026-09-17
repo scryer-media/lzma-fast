@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+The `.xz` container, behind the new default `xz` feature. 0.2.0's entry is
+kept below as it stands: that work is unreleased, but the container is a
+second public surface of its own size - a module, a reader, a filter set and a
+dozen error variants - and versioning it separately keeps the two stories
+apart for anyone reading the history.
+
+- `xz::XzReader`: a `Read` adapter over an `.xz` file. Reads every stream in
+  the file by default, as `xz -d` does, and verifies the stream header and
+  footer, every block header's CRC-32 *before* believing any field in it, the
+  declared compressed and uncompressed sizes, each block's check, the block
+  and stream padding, and the index - against a running fold of the blocks
+  rather than a list of them, so a stream of a million blocks costs the same
+  state as a stream of one. `with_memory_limit`, `with_checks`,
+  `allow_unverifiable` and `single_stream` on the reader; everything else on
+  `xz::XzOptions`.
+- Filters: LZMA2, delta, and the eight BCJ converters (x86, ARM, ARM-Thumb,
+  ARM64, PowerPC, SPARC, IA-64, RISC-V), each with the optional four-byte
+  start-offset property, in chains of up to four in the order the format
+  allows. Ported from `C/Bra.c`, `C/Bra86.c`, `C/BraIA64.c` and `C/Delta.c`,
+  and public as `xz::bcj` and `xz::delta` so that other container code in this
+  workspace can use them directly.
+- Checks: none, CRC-32, CRC-64/XZ and SHA-256 (the last behind `crypto` or
+  `native-crypto`). A stream whose check this build cannot compute is an error
+  unless the caller opts in with `allow_unverifiable`, so unchecked bytes are
+  never returned silently. The check is computed by whoever decoded the block,
+  through the same `ChecksumPlan` machinery the LZMA2 workers use, and the
+  caller's own split points are computed in the same pass.
+- `xz::probe`, `xz::single_stream_block_count` and
+  `xz::is_single_stream_multi_block`: structural gates over the footer and
+  index that decode nothing, for a caller choosing between a sequential and a
+  parallel decode.
+- `xz::XzIndex` and `xz::read_stream_index_ending_at`: the index of a stream,
+  parsed from its footer, with per-block file offsets and sizes.
+- `xz::XzError` carries the stream, the block and the file offset of every
+  failure, and converts to `std::io::Error`.
+- Every allocation the container makes is bounded before it is made, and a
+  block's dictionary is clamped to the block's own declared uncompressed size,
+  which is usually far below the dictionary the stream declares. The limits
+  are listed in `docs/security.md`.
+
 ## 0.2.0 (unreleased)
 
 - Multi-threaded LZMA2 decoding behind the `std` feature, ported from

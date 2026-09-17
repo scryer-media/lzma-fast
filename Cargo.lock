@@ -191,7 +191,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "lzma-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lzma-fast",
  "lzma-rust2",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-fast"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",

@@ -136,6 +136,42 @@ jobs:
       - name: Test both crypto backends against each other
         run: cargo test --locked -p lzma-fast --features native-crypto --no-fail-fast
 
+  wasm:
+    name: wasm-${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The whole crate without std: the decoder alone, no dependencies.
+          - lane: no-std
+            features: ""
+          # Everything wasm can have: the decoder, the .xz container, the
+          # filters and the checks. `asm` is accepted and inert there (wasm
+          # runs the portable loop) and SHA-256 has to come from RustCrypto,
+          # because the default `crypto` feature builds AWS-LC's C.
+          - lane: std-crc-crypto-xz
+            features: "std,asm,crc,native-crypto,xz"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+      - name: Check for wasm32-unknown-unknown
+        run: |
+          set -eu
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo check --locked -p lzma-fast --target wasm32-unknown-unknown \
+              --no-default-features --features "${{ matrix.features }}"
+          else
+            cargo check --locked -p lzma-fast --target wasm32-unknown-unknown \
+              --no-default-features
+          fi
+
   msrv:
     name: msrv
     runs-on: ubuntu-24.04
@@ -178,7 +214,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

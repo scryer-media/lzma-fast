@@ -74,6 +74,38 @@ impl Lzma2Decoder {
         Ok(p)
     }
 
+    /// Allocates a decoder whose dictionary is clamped to `cap` bytes.
+    ///
+    /// C: nothing - 7-Zip always allocates the declared dictionary. The xz
+    /// container can do better: it resets the dictionary at every block, so no
+    /// match in a block can reach further back than that block's first byte,
+    /// and when the block header declares an uncompressed size the dictionary
+    /// never has to be larger than it. That turns an `xz -9` stream of small
+    /// blocks from 64 MiB per worker into a few kilobytes.
+    ///
+    /// The caller is responsible for `cap` being at least as large as the
+    /// block's output; a smaller `cap` decodes a block whose matches reach
+    /// past it into [`Error::CorruptData`], not into wrong bytes, because the
+    /// distance check is against the dictionary size.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2Decoder::new`].
+    #[cfg(feature = "xz")]
+    pub(crate) fn new_capped(dict_prop: u8, cap: u32) -> Result<Self, Error> {
+        if dict_prop > 40 {
+            return Err(Error::UnsupportedProps);
+        }
+        let dic_size = frame::dic_size_from_prop_full(dict_prop).min(cap);
+        let prop = LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))?;
+        let mut p = Lzma2Decoder {
+            frame: Lzma2Frame::new(),
+            decoder: LzmaDec::new(prop)?,
+        };
+        p.reset();
+        Ok(p)
+    }
+
     /// Same as [`Lzma2Decoder::new`], but always runs the portable decode
     /// loop. See [`crate::LzmaDecoder::new_portable`].
     ///

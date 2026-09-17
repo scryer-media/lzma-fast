@@ -52,6 +52,9 @@ mod mt;
 #[cfg(feature = "std")]
 mod reader;
 
+#[cfg(feature = "xz")]
+pub mod xz;
+
 pub use error::{Error, FinishMode, Progress, Status};
 pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};
 pub use lzma::{LzmaDecoder, LzmaProps};
@@ -69,6 +72,8 @@ pub use mt::checksum::{BlockChecks, Checksum, ChecksumPlan, Segment, SegmentChec
 pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memory_estimate};
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
+#[cfg(feature = "xz")]
+pub use xz::{XzError, XzErrorKind, XzOptions, XzReader};
 
 #[cfg(feature = "crc")]
 pub mod crc;
