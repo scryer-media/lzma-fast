@@ -351,3 +351,38 @@ borrowing cases:
 A 7z coder's input is a bounded view of the archive's source, which is neither
 `Send` nor `'static`, so it belongs in the second row - which is where the
 `sevenz-fast` fork put it, for this reason.
+
+## The chase decoder, and when it is the wrong thing
+
+`Lzma2AdaptiveDecoder` has two ways to decode the run at its cursor: hand the
+whole run to a worker, or decode it here, chunk by chunk, as it arrives. The
+second is the *chase*, and it exists so that a caller decoding a stream that is
+still being written sees output before the last byte of it is written.
+
+The chase holds the cursor while it runs, and no worker may claim a run until
+it lets go, so a decoder that chases is a decoder that is not threading. Two
+rules keep that from happening by accident:
+
+1. **It stands aside for a worker.** If anything is outstanding, there is
+   something to wait for, and waiting costs a fraction of a block while chasing
+   costs the whole of one.
+2. **It stands aside for the input, when the caller says so.**
+   `set_chase(false)` says "my input is already on disk; an incomplete run at
+   the cursor means I have not fed the rest of it yet, not that it does not
+   exist". The decoder then returns `NeedsMoreInput` where it would have
+   chased.
+
+Rule 1 alone is not enough, and the measurement says so: fed 16 MiB at a time
+from a file with eight 128 MiB runs, a decoder with rule 1 and without rule 2
+never dispatches a single run, because the chase reaches every run first and
+finishes it before the next feed completes it. The curve is flat - 21.7 s at
+one thread, 23.9 s at eight - against 21.4 s and 8.2 s for the ring on the same
+file.
+
+Rule 2 is advisory, not absolute. Four cases decode inline whatever the caller
+said, because nothing else can: a single-threaded decoder, a run the chase has
+already started (the cursor is inside it), a run too large to fit the memory
+limit, and anything left when `end_of_input` has been called. A decoder that
+refused these would be a decoder that hangs.
+
+C: no counterpart. `Lzma2DecMt` is given a reader and blocks on it.

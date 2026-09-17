@@ -37,6 +37,17 @@ fuzz_target!(|data: &[u8]| {
         2 => 997,
         _ => usize::MAX,
     };
+    // The chase knob: a caller decoding a file already on disk turns it off,
+    // and must still get the same bytes, and still finish.
+    let chase = data[0] & 0x80 == 0;
+    // Every drain is bounded on some inputs, which cuts blocks in half and
+    // makes the decoder carry the remainder.
+    let drain_limit = match data[1] % 5 {
+        0 => 1usize,
+        1 => 7,
+        2 => 65_536,
+        _ => usize::MAX,
+    };
     let stream = &data[3..];
 
     let Some(expected) = single_threaded(dict_prop, stream) else {
@@ -60,8 +71,9 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut ad) = Lzma2AdaptiveDecoder::new(dict_prop, &opts) else {
         return;
     };
+    ad.set_chase(chase);
     let mut out = Vec::new();
-    let ok = adaptive(&mut ad, stream, feed, &mut out);
+    let ok = adaptive(&mut ad, stream, feed, drain_limit, &mut out);
     check("adaptive", &expected, ok, &out);
 });
 
@@ -94,6 +106,7 @@ fn adaptive(
     ad: &mut Lzma2AdaptiveDecoder,
     mut stream: &[u8],
     feed: usize,
+    drain_limit: usize,
     out: &mut Vec<u8>,
 ) -> bool {
     let mut failed = false;
@@ -108,7 +121,7 @@ fn adaptive(
                 ad.end_of_input();
             }
         }
-        let status = ad.drain(|off, bytes| {
+        let status = ad.drain_upto(drain_limit, |off, bytes| {
             let off = off as usize;
             if off + bytes.len() > MAX_OUT {
                 failed = true;

@@ -78,14 +78,20 @@ apart for anyone reading the history.
 ### LZMA2, asked for by the `sevenz-fast` fork
 
 - `Lzma2AdaptiveDecoder` no longer decodes on the calling thread while a worker
-  is outstanding. The chase decoder serialises the whole decoder while it holds
-  the cursor - no worker may claim a run - and that is only the right trade
-  when there is nothing else in flight, which is the arriving-stream case it
-  was built for. For a stream already on disk it cost the fork a measured 1.50x
-  against the same decoder's own parallel path. There is no knob: with a worker
-  outstanding there is something to wait for, and waiting is what `drain`
-  already does everywhere else. A run the chase has *started* it still
-  finishes, since the cursor is inside it.
+  is outstanding, and `set_chase(false)` turns the chase off for a caller whose
+  input is already on disk. The chase decoder serialises the whole decoder
+  while it holds the cursor - no worker may claim a run - and that is only the
+  right trade when there is nothing else in flight, which is the
+  arriving-stream case it was built for. For a stream already on disk it cost
+  the fork a measured 1.50x against the same decoder's own parallel path, and
+  measuring it here showed why the no-worker rule alone is not enough: fed in
+  pieces smaller than a run, the chase takes every run before a worker can see
+  it, and the decode never threads at all (21.7 s at one thread, 23.9 s at
+  eight). With chasing off the decoder waits for the rest of the run instead,
+  and the curve comes back. Off is advisory, not absolute: a run too large for
+  the memory limit, a run the chase has already started, a single-threaded
+  decoder, and everything after `end_of_input` are still decoded inline,
+  because nothing else would decode them.
 - `Lzma2AdaptiveDecoder::drain_upto(limit, sink)`, as on `XzAdaptiveDecoder`
   above and for the same reason.
 - `lzma_fast::run_boundaries(source, dict_prop)`: the runs of an LZMA2 stream

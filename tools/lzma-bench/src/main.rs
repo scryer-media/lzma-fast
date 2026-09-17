@@ -943,18 +943,26 @@ fn bench_adaptive(path: &Path, runs: usize, threads: &[usize]) {
     );
     println!(
         "  {:>7} {:>10} {:>10} {:>10} {:>10} {:>8}",
-        "threads", "adaptive", "MiB/s", "peak RAM", "ring", "ratio"
+        "threads", "chasing", "waiting", "MiB/s", "ring", "wait/ring"
     );
 
     let mut first: Option<(u64, u32)> = None;
     for &t in &threads {
         let mut ad: Vec<MtRun> = Vec::new();
+        let mut wait: Vec<Duration> = Vec::new();
         let mut ring: Vec<Duration> = Vec::new();
         for _ in 0..runs {
-            match adaptive_decode(dict_prop, payload, t, FEED) {
+            match adaptive_decode(dict_prop, payload, t, FEED, true) {
                 Ok(r) => ad.push(r),
                 Err(e) => {
                     eprintln!("lzma-bench: adaptive at {t} threads: {e}");
+                    return;
+                }
+            }
+            match adaptive_decode(dict_prop, payload, t, FEED, false) {
+                Ok(r) => wait.push(r.time),
+                Err(e) => {
+                    eprintln!("lzma-bench: adaptive (waiting) at {t} threads: {e}");
                     return;
                 }
             }
@@ -973,15 +981,15 @@ fn bench_adaptive(path: &Path, runs: usize, threads: &[usize]) {
             None => first = Some((bytes, crc)),
         }
         let t_ad = median(ad.iter().map(|r| r.time).collect());
+        let t_wait = median(wait);
         let t_ring = median(ring);
-        let peak = ad.iter().map(|r| r.peak).max().unwrap_or(0);
-        let secs = t_ad.as_secs_f64();
+        let secs = t_wait.as_secs_f64();
         println!(
-            "  {:>7} {:>9.3}s {:>10.1} {:>10} {:>9.3}s {:>8.3}",
+            "  {:>7} {:>9.3}s {:>9.3}s {:>10.1} {:>9.3}s {:>8.3}",
             t,
+            t_ad.as_secs_f64(),
             secs,
             bytes as f64 / (1024.0 * 1024.0) / secs,
-            human(peak),
             t_ring.as_secs_f64(),
             secs / t_ring.as_secs_f64()
         );
@@ -994,12 +1002,14 @@ fn adaptive_decode(
     payload: &[u8],
     threads: usize,
     feed: usize,
+    chase: bool,
 ) -> Result<MtRun, String> {
     let opts = Lzma2MtOptions {
         threads,
         memory_limit: u64::MAX,
     };
     let mut dec = Lzma2AdaptiveDecoder::new(dict_prop, &opts).map_err(|e| e.to_string())?;
+    dec.set_chase(chase);
     let mut crc = lzma_fast::crc::Crc32::new();
     let mut total = 0u64;
     let base = alloc_watch_reset();

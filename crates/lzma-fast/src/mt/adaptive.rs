@@ -69,9 +69,15 @@ enum Dispatch {
     /// busy, or the memory limit is reached with blocks still in flight. Wait
     /// for one rather than decoding it on the caller's thread.
     Busy,
-    /// Nothing to dispatch: no complete run at the cursor, or one that the
-    /// chase decoder should take instead.
+    /// Nothing to dispatch *yet*: there is no complete run at the cursor. More
+    /// input may change that, so a caller that would rather wait than
+    /// serialise can wait here.
     None,
+    /// Nothing to dispatch, and no amount of waiting will change it: one
+    /// thread, a run the chase has already started, a run too large for the
+    /// memory limit, or no thread could be spawned. The chase decoder has to
+    /// take this one or nothing will ever move.
+    Chase,
 }
 
 /// An LZMA2 decoder that is fed input and switches between single- and
@@ -81,6 +87,7 @@ pub struct Lzma2AdaptiveDecoder {
     memory_limit: u64,
     threads: usize,
     ordered: bool,
+    chase: bool,
 
     // Input. `buf[0]` is at stream offset `base`; nothing before `cursor_in`
     // is retained.
@@ -174,6 +181,7 @@ impl Lzma2AdaptiveDecoder {
             memory_limit: options.memory_limit,
             threads: options.threads.max(1),
             ordered: true,
+            chase: true,
             buf: Vec::new(),
             base: 0,
             input_done: false,
@@ -278,6 +286,35 @@ impl Lzma2AdaptiveDecoder {
                 self.checks.push(checks);
             }
         }
+    }
+
+    /// Whether the run at the cursor may be decoded on the calling thread
+    /// while it is still arriving. On by default.
+    ///
+    /// The chase decoder is what lets output come out of a stream that is
+    /// still being written: it decodes the run at the cursor chunk by chunk,
+    /// without waiting for the whole of it. The price is that it holds the
+    /// cursor while it does so, and no worker may claim a run until it is
+    /// through, so a decoder that chases is a decoder that is not threading.
+    ///
+    /// For a stream that is already on disk that price buys nothing: the bytes
+    /// are all there, and the only reason the run at the cursor is incomplete
+    /// is that the caller has not fed the rest of it yet. Such a caller should
+    /// turn chasing off, feed more, and let the workers have the whole run.
+    ///
+    /// Off does not mean never: a run too large for the memory limit, a run
+    /// the chase has already started, a single-threaded decoder, and anything
+    /// at all once [`end_of_input`](Lzma2AdaptiveDecoder::end_of_input) has
+    /// been called are still decoded on the calling thread, because otherwise
+    /// nothing would decode them.
+    pub fn set_chase(&mut self, chase: bool) {
+        self.chase = chase;
+    }
+
+    /// Whether the chase decoder may take the run at the cursor.
+    #[must_use]
+    pub fn chases(&self) -> bool {
+        self.chase
     }
 
     /// Delivers blocks in stream order (the default), or as soon as they are
@@ -448,17 +485,34 @@ impl Lzma2AdaptiveDecoder {
             match self.dispatch()? {
                 Dispatch::Sent => did = true,
                 Dispatch::Busy => {}
+                Dispatch::Chase => {
+                    if self.st_step(&mut sink, &mut left)? {
+                        did = true;
+                    }
+                }
                 Dispatch::None => {
                     // The chase serialises the whole decoder: while it holds
                     // the cursor no worker may claim a run. That is the right
                     // trade only when there is nothing else in flight - the
-                    // tail of an arriving stream. With a worker outstanding
-                    // there is something to wait for, and waiting costs a
-                    // fraction of a block while chasing costs the whole of
-                    // one, so the chase stands aside. A run it has already
-                    // started it must finish: the cursor is inside it.
-                    let stand_aside = self.outstanding != 0 && !self.st_in_run;
-                    if !stand_aside && self.st_step(&mut sink, &mut left)? {
+                    // tail of an arriving stream.
+                    //
+                    // With a worker outstanding there is something to wait
+                    // for, and waiting costs a fraction of a block while
+                    // chasing costs the whole of one, so the chase stands
+                    // aside. A caller that has turned chasing off stands aside
+                    // for the *input* too: the run at the cursor is incomplete
+                    // only because not all of it has been fed, and feeding the
+                    // rest is cheaper than decoding it here. Once the input is
+                    // over, waiting is waiting forever, so the chase takes it
+                    // either way.
+                    let busy = self.outstanding != 0;
+                    // Waiting for input is only waiting if input can still be
+                    // taken: at the memory limit `feed` refuses everything, so
+                    // a decoder that waited there would wait forever.
+                    let waiting_for_input = !self.chase
+                        && !self.input_done
+                        && self.in_flight_bytes() < self.memory_limit;
+                    if !busy && !waiting_for_input && self.st_step(&mut sink, &mut left)? {
                         did = true;
                     }
                 }
@@ -659,8 +713,11 @@ impl Lzma2AdaptiveDecoder {
     /// Sends the run at the cursor to a worker, if that is the right thing to
     /// do with it.
     fn dispatch(&mut self) -> Result<Dispatch, Error> {
-        if self.threads <= 1 || self.complete || self.failed.is_some() || self.st_in_run {
+        if self.complete || self.failed.is_some() {
             return Ok(Dispatch::None);
+        }
+        if self.threads <= 1 || self.st_in_run {
+            return Ok(Dispatch::Chase);
         }
         let Some(run) = self.pending.front().copied() else {
             return Ok(Dispatch::None);
@@ -680,14 +737,14 @@ impl Lzma2AdaptiveDecoder {
         // a deadlock, and buffering it anyway would be a lie about the limit.
         let need = run.unpacked_len + run.packed_len;
         if need > self.memory_limit {
-            return Ok(Dispatch::None);
+            return Ok(Dispatch::Chase);
         }
         if self.in_flight_bytes() + need > self.memory_limit {
             // Room appears when an outstanding block lands. If none is
             // outstanding there is nothing to wait for, so the chase decoder
             // takes it and streams it instead.
             return Ok(if self.outstanding == 0 {
-                Dispatch::None
+                Dispatch::Chase
             } else {
                 Dispatch::Busy
             });
@@ -710,7 +767,7 @@ impl Lzma2AdaptiveDecoder {
         }
         if pool.spawned() == 0 {
             // No thread could be created; fall back to decoding inline.
-            return Ok(Dispatch::None);
+            return Ok(Dispatch::Chase);
         }
 
         let mut packed_buf = self.spare_in.pop().unwrap_or_default();

@@ -564,3 +564,73 @@ fn run_boundaries_rejects_a_range_that_stops_short() {
         "dict_prop 41 accepted"
     );
 }
+
+#[test]
+fn chasing_off_waits_for_input_rather_than_serialising() {
+    // The on-disk shape: everything is available, but it is fed in pieces
+    // smaller than a run. With chasing on, the decoder decodes each run on the
+    // calling thread as it arrives and never dispatches; with it off, it waits
+    // for the rest of the run and hands it to a worker.
+    let names = ["text.p1.xz", "mixed.p1.xz", "rand.p1.xz", "text.p1.xz"];
+    let (prop, packed, plain) = multi_run(&names, 2);
+
+    for chase in [true, false] {
+        let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+        dec.set_chase(chase);
+        assert_eq!(dec.chases(), chase);
+        let mut sink = Sink::default();
+        let mut pos = 0usize;
+        loop {
+            if pos < packed.len() {
+                // Feeds far smaller than a run: without the knob the chase
+                // decoder gets every run before a worker can.
+                let end = (pos + 256).min(packed.len());
+                pos += dec.feed(&packed[pos..end]).expect("feed");
+                if pos == packed.len() {
+                    dec.end_of_input();
+                }
+            }
+            if dec.drain(|o, b| sink.put(o, b)).expect("drain") == DrainStatus::Finished {
+                break;
+            }
+        }
+        assert_eq!(sink.bytes(), plain, "chase={chase}");
+        if !chase {
+            assert!(
+                dec.spawned_threads() >= 1,
+                "no worker was used with chasing off"
+            );
+            assert_eq!(
+                sink.order.len(),
+                names.len() * 2,
+                "output was cut into more pieces than there are runs"
+            );
+        }
+    }
+}
+
+#[test]
+fn chasing_off_still_finishes_a_stream_nothing_else_can_decode() {
+    // A run too large for the memory limit, and the tail of a stream after
+    // `end_of_input`: with chasing off both still have to come out, because
+    // there is nothing else that could decode them.
+    let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 2);
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, 1 << 12)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    loop {
+        if pos < packed.len() {
+            let end = (pos + 4096).min(packed.len());
+            let took = dec.feed(&packed[pos..end]).expect("feed");
+            pos += took;
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        if dec.drain(|o, b| sink.put(o, b)).expect("drain") == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+}
