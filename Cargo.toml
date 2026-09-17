@@ -12,7 +12,7 @@ categories = ["compression", "no-std"]
 # Repository scaffolding that has no business in the crate archive.
 exclude = [
     ".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
-    "asm-lab/", "bench/", "docs/", "fuzz/", "scripts/", "tools/", "rust-toolchain.toml",
+    "asm-lab/", "bench/", "docs/", "fuzz/", "scripts/", "tools/", "xtask/", ".cargo/", "rust-toolchain.toml",
     # The tests share a helper with `tools/lzma-bench` and read repository
     # fixtures, so they only build from a checkout.
     "tests/",
@@ -53,7 +53,7 @@ sha2 = { version = "0.11.0", default-features = false, optional = true }
 # depends on `lzma-rust2` and `liblzma` to time this crate against them, and
 # those must not appear in this crate's own graph at all.
 [workspace]
-members = ["tools/lzma-bench"]
+members = ["tools/lzma-bench", "xtask"]
 resolver = "2"
 
 [profile.release]
