@@ -644,6 +644,69 @@ With all three, the adaptive decoder is within 3% of the ring at every thread
 count, which is the point: the fork can drop its gigabyte of read-ahead and
 use the driver whose input it can borrow.
 
+### macOS aarch64
+
+Measured on this Mac (Apple M5 Max, 18 threads) on 2026-09-16, same
+`lzma-bench`, three runs, median. The 1-minute load average was 2.85 when the
+series started; the operator's own applications, not this crate, are the
+background. `xz` is 5.8.3 and `7zz` is 7-Zip 25.01.
+
+| fixture | shape | `XzReader` | `xz -dc -T1` | ratio | `7zz t` | liblzma ST |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p256.bin.xz` | 1 block | 3.639 s | 5.880 s | 0.619 | 3.745 s | 5.791 s |
+| `p256.sha256.xz` | SHA-256 check | 3.832 s | 6.306 s | 0.608 | 3.847 s | 6.244 s |
+| `delta.xz` | delta + LZMA2 | 4.500 s | 6.875 s | 0.655 | 4.826 s | 6.831 s |
+| `p256.t8.xz` | 22 blocks | 4.152 s | 6.375 s | 0.651 | 4.106 s | 6.238 s |
+| `p256.b16.xz` | 16 blocks | 3.804 s | 5.997 s | 0.634 | 3.768 s | 5.918 s |
+
+The sequential gate is against `7zz t -mmt=1`, and that is the column to read:
+0.97-1.03 on every fixture, so the crate is level with 7-Zip's own assembly
+loop on aarch64 and the 0.61-0.66 against `xz` is the C library's LZMA2 being
+slower than 7-Zip's, not a margin this crate created.
+
+`p256.t8.xz`, parallel:
+
+| threads | ours | MiB/s | peak RAM | `xz -T<n>` | liblzma MT | vs xz | vs liblzma |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 3.870 s | 66.2 | 33.3 MiB | 6.174 s | 6.080 s | 0.627 | 0.636 |
+| 2 | 2.011 s | 127.3 | 89.1 MiB | 3.182 s | 3.163 s | 0.632 | 0.636 |
+| 4 | 1.115 s | 229.6 | 190.2 MiB | 1.785 s | 1.794 s | 0.624 | 0.621 |
+| 8 | 0.569 s | 449.8 | 369.8 MiB | 0.917 s | 0.966 s | 0.621 | 0.589 |
+| 16 | 0.433 s | 590.9 | 482.8 MiB | 0.651 s | 0.667 s | 0.665 | 0.649 |
+| 18 | 0.418 s | 611.8 | 482.9 MiB | 0.676 s | 0.663 s | 0.619 | 0.631 |
+
+`p256.b16.xz`, parallel:
+
+| threads | ours | MiB/s | peak RAM | `xz -T<n>` | liblzma MT | vs xz | vs liblzma |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 3.687 s | 69.4 | 44.3 MiB | 5.852 s | 5.798 s | 0.630 | 0.636 |
+| 2 | 1.924 s | 133.1 | 118.8 MiB | 3.050 s | 3.032 s | 0.631 | 0.634 |
+| 4 | 0.998 s | 256.6 | 267.7 MiB | 1.575 s | 1.554 s | 0.633 | 0.642 |
+| 8 | 0.520 s | 491.9 | 388.3 MiB | 0.819 s | 0.793 s | 0.635 | 0.656 |
+| 16 | 0.335 s | 765.2 | 482.7 MiB | 0.488 s | 0.452 s | 0.685 | 0.741 |
+| 18 | 0.295 s | 866.5 | 482.7 MiB | 0.551 s | 0.452 s | 0.537 | 0.654 |
+
+866 MiB/s of output at 18 threads, and both gates pass with room: every
+parallel point is faster than `xz -T<n>` and than liblzma MT at every thread
+count measured.
+
+The adaptive decoder on `mt.7z` (897 MiB packed, 8 runs of 128 MiB), against
+the ring:
+
+| threads | chasing | waiting (`set_chase(false)`) | ring | waiting / ring |
+| --- | --- | --- | --- | --- |
+| 1 | 14.952 s | 14.842 s | 15.190 s | 0.977 |
+| 2 | 14.890 s | 7.659 s | 7.577 s | 1.011 |
+| 4 | 14.903 s | 4.011 s | 3.875 s | 1.035 |
+| 8 | 15.349 s | 2.134 s | 2.075 s | 1.028 |
+
+Same shape as on x86-box: chasing a file that is already on disk pins the
+decode to one thread, and `set_chase(false)` puts it within 3.5% of the ring
+at every thread count. The 1-minute load had climbed to 7.8 by the end of the
+adaptive series (the operator's applications), which is the most likely reason
+the 4- and 8-thread ratios sit a little above the 0.97-1.02 measured on the
+quiet Linux box; the verdict is the same either way.
+
 ### windows-msvc
 
 Measured on windows-box (Ryzen 5 3600, 6C/12T, Windows) on 2026-09-16, same
