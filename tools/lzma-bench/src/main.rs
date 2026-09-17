@@ -35,8 +35,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use lzma_fast::{
-    Checksum, ChecksumPlan, FinishMode, Lzma2Decoder, Lzma2MtOptions, Lzma2ParallelDecoder,
-    LzmaAloneHeader, LzmaDecoder, Status,
+    Checksum, ChecksumPlan, DrainStatus, FinishMode, Lzma2AdaptiveDecoder, Lzma2Decoder,
+    Lzma2MtOptions, Lzma2ParallelDecoder, LzmaAloneHeader, LzmaDecoder, Status,
 };
 
 const OUT_CHUNK: usize = 1 << 20;
@@ -54,6 +54,9 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
   --threads LIST multi-threaded LZMA2: a comma-separated list of thread counts,
                  where \"all\" means this machine's available parallelism.
                  \"--threads sweep\" is shorthand for 1,2,4,8,16,all
+  --adaptive     time `Lzma2AdaptiveDecoder` on an on-disk stream as well as
+                 the ring, at each `--threads` count: the shape a consumer
+                 that pulls its own input uses
   --xz           treat the inputs as whole `.xz` files and time the container
                  layer instead of one LZMA2 stream: `XzReader` sequentially,
                  `XzParallelReader` at each `--threads` count, against
@@ -72,6 +75,7 @@ fn main() {
     let mut threads: Vec<usize> = Vec::new();
     let mut index = false;
     let mut xz_mode = false;
+    let mut adaptive = false;
     let mut checksum = Checksum::None;
     let mut files: Vec<PathBuf> = Vec::new();
 
@@ -86,6 +90,7 @@ fn main() {
             }
             "--no-oracles" | "--only-ours" => oracles = false,
             "--xz" => xz_mode = true,
+            "--adaptive" => adaptive = true,
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -133,6 +138,8 @@ fn main() {
     for file in &files {
         if index {
             run_index(file);
+        } else if adaptive {
+            bench_adaptive(file, runs, &threads);
         } else if xz_mode {
             xz::bench(file, runs, oracles, &threads);
         } else if threads.is_empty() {
@@ -895,4 +902,132 @@ fn alloc_watch_reset() -> usize {
 
 fn alloc_watch_peak(base: usize) -> u64 {
     PEAK.load(Ordering::Relaxed).saturating_sub(base) as u64
+}
+
+/// Times the adaptive decoder on a stream that is already on disk, against the
+/// ring on the same stream.
+///
+/// This is the consumer's shape, not a download's: the whole stream is
+/// available, fed in large pieces, and drained as it goes. What it measures is
+/// how much of the work ends up on the calling thread - the chase decoder
+/// serialises everything while it holds the cursor, so a decoder that chases
+/// when it could have waited shows up here as a flat curve.
+fn bench_adaptive(path: &Path, runs: usize, threads: &[usize]) {
+    const FEED: usize = 1 << 24;
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lzma-bench: {}: {e}", path.display());
+            return;
+        }
+    };
+    let (dict_prop, payload) = match lzma2_payload(path, &data) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lzma-bench: {}: {e}", path.display());
+            return;
+        }
+    };
+    let threads: Vec<usize> = if threads.is_empty() {
+        vec![1, 2, 4, 8]
+    } else {
+        threads.to_vec()
+    };
+
+    println!();
+    println!(
+        "{}  ({} packed, adaptive vs ring)",
+        path.display(),
+        human(data.len() as u64)
+    );
+    println!(
+        "  {:>7} {:>10} {:>10} {:>10} {:>10} {:>8}",
+        "threads", "adaptive", "MiB/s", "peak RAM", "ring", "ratio"
+    );
+
+    let mut first: Option<(u64, u32)> = None;
+    for &t in &threads {
+        let mut ad: Vec<MtRun> = Vec::new();
+        let mut ring: Vec<Duration> = Vec::new();
+        for _ in 0..runs {
+            match adaptive_decode(dict_prop, payload, t, FEED) {
+                Ok(r) => ad.push(r),
+                Err(e) => {
+                    eprintln!("lzma-bench: adaptive at {t} threads: {e}");
+                    return;
+                }
+            }
+            match mt_decode(dict_prop, payload, t, Checksum::None) {
+                Ok(r) => ring.push(r.time),
+                Err(e) => {
+                    eprintln!("lzma-bench: ring at {t} threads: {e}");
+                    return;
+                }
+            }
+        }
+        let bytes = ad[0].bytes;
+        let crc = ad[0].crc;
+        match first {
+            Some(prev) => assert_eq!(prev, (bytes, crc), "thread count changed the output"),
+            None => first = Some((bytes, crc)),
+        }
+        let t_ad = median(ad.iter().map(|r| r.time).collect());
+        let t_ring = median(ring);
+        let peak = ad.iter().map(|r| r.peak).max().unwrap_or(0);
+        let secs = t_ad.as_secs_f64();
+        println!(
+            "  {:>7} {:>9.3}s {:>10.1} {:>10} {:>9.3}s {:>8.3}",
+            t,
+            secs,
+            bytes as f64 / (1024.0 * 1024.0) / secs,
+            human(peak),
+            t_ring.as_secs_f64(),
+            secs / t_ring.as_secs_f64()
+        );
+    }
+}
+
+/// One adaptive decode of an on-disk stream: feed, drain, repeat.
+fn adaptive_decode(
+    dict_prop: u8,
+    payload: &[u8],
+    threads: usize,
+    feed: usize,
+) -> Result<MtRun, String> {
+    let opts = Lzma2MtOptions {
+        threads,
+        memory_limit: u64::MAX,
+    };
+    let mut dec = Lzma2AdaptiveDecoder::new(dict_prop, &opts).map_err(|e| e.to_string())?;
+    let mut crc = lzma_fast::crc::Crc32::new();
+    let mut total = 0u64;
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let mut pos = 0usize;
+    loop {
+        if pos < payload.len() {
+            let end = (pos + feed).min(payload.len());
+            pos += dec.feed(&payload[pos..end]).map_err(|e| e.to_string())?;
+            if pos == payload.len() {
+                dec.end_of_input();
+            }
+        }
+        let status = dec
+            .drain(|_, b| {
+                total += b.len() as u64;
+                crc.update(b);
+            })
+            .map_err(|e| e.to_string())?;
+        if status == DrainStatus::Finished {
+            break;
+        }
+    }
+    let time = t0.elapsed();
+    Ok(MtRun {
+        time,
+        peak: alloc_watch_peak(base),
+        bytes: total,
+        crc: crc.finalize(),
+    })
 }

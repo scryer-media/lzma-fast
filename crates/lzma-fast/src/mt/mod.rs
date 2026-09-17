@@ -575,6 +575,26 @@ impl Write for ChannelSink {
 ///
 /// The ring of threads runs behind the reader and hands whole blocks across;
 /// dropping the reader stops them and joins them.
+///
+/// # Why `R: Read + Send + 'static`
+///
+/// The reader is moved onto the coordinating thread, and that thread outlives
+/// every call: this type *is* a `Read`, so the caller keeps it and reads from
+/// it later. A scoped thread cannot be used for that, since a scope ends
+/// before the function that opened it returns, so the input cannot be a borrow of
+/// something on the caller's stack, which is what a bounded view into an
+/// archive usually is.
+///
+/// Two ways around it, both already here:
+///
+/// - [`Lzma2ParallelDecoder::decode`] takes `R: Read + Send` with no `'static`
+///   bound. It owns its threads for the length of one call and joins them
+///   before returning, so a borrowed source is sound. Use it when the output
+///   can go to a [`Write`] rather than being pulled.
+/// - [`Lzma2AdaptiveDecoder`](crate::Lzma2AdaptiveDecoder) borrows nothing at
+///   all: the caller feeds it slices and it hands workers owned copies of
+///   complete runs. Use it when the output has to be pulled, or when the
+///   thread count has to change while the stream is being decoded.
 pub struct Lzma2ParallelReader<R: Read + Send + 'static> {
     rx: Receiver<Block>,
     #[cfg(feature = "crc")]

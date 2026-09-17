@@ -326,3 +326,28 @@ One further deviation, in the ring itself: `Lzma2DecMt_Decode` never reads
 decode reports success. The port returns the error and does not write the
 failing block's partial output. Output written before it stays valid, which is
 what a caller writing blocks by offset needs.
+
+## Borrowed input, and why the ring reader wants `'static`
+
+`Lzma2ParallelReader<R: Read + Send + 'static>` is the bound consumers trip
+over, and it is not an oversight. The reader is moved onto the coordinating
+thread, and that thread has to outlive the call that created it: the type is
+itself a `Read`, so the caller keeps it and pulls from it afterwards. A scoped
+thread is exactly the thing that cannot do that - `std::thread::scope` joins
+everything it spawned before it returns - so there is no cheap borrowed
+variant of *this* shape to add. A borrowed one would have to invert the API
+into a callback (`with_parallel_reader(src, |r| ...)`), which is a different
+API, not a variant of this one.
+
+It is also not needed, because the two other drivers already cover the
+borrowing cases:
+
+| what the caller has | what to use | the bound |
+| --- | --- | --- |
+| a borrowed source, output to a `Write` | `Lzma2ParallelDecoder::decode` | `R: Read + Send`, no `'static` - it owns its threads for one call and joins them before returning |
+| a borrowed source, output pulled | `Lzma2AdaptiveDecoder` | none: the caller feeds slices and workers get owned copies of complete runs |
+| an owned source (a file, a socket) | `Lzma2ParallelReader` | `Read + Send + 'static` |
+
+A 7z coder's input is a bounded view of the archive's source, which is neither
+`Send` nor `'static`, so it belongs in the second row - which is where the
+`sevenz-fast` fork put it, for this reason.
