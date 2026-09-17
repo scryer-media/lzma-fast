@@ -1,15 +1,15 @@
 [package]
 name = "lzma-bench"
 description = "Decode-throughput harness for lzma-fast against the reference decoders"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-fast"
 publish = false
 
 [dependencies]
-lzma-fast = { workspace = true }
+lzma-fast = { path = "../.." }
 lzma-rust2 = "0.20.1"
 # The C library this crate exists to replace, for the `--xz` lane only.
 liblzma = { version = "0.4.8", features = ["parallel"] }

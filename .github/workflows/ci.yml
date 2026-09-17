@@ -35,13 +35,13 @@ jobs:
             echo "benchmark fixture bytes must never be committed" >&2
             exit 1
           fi
-          # Small differential vectors live under crates/lzma-fast/tests/data;
+          # Small differential vectors live under tests/data;
           # anything else binary, or any single vector over 256 KiB, is a leak.
-          if git ls-files | grep -E '\.(lzma|xz|7z|bin)$' | grep -v '^crates/lzma-fast/tests/data/' ; then
+          if git ls-files | grep -E '\.(lzma|xz|7z|bin)$' | grep -v '^tests/data/' ; then
             echo "binary fixtures are generated, not tracked" >&2
             exit 1
           fi
-          big="$(git ls-files -z -- crates/lzma-fast/tests/data | xargs -0 wc -c | awk '$1 > 262144 && $2 != "total"')"
+          big="$(git ls-files -z -- tests/data | xargs -0 wc -c | awk '$1 > 262144 && $2 != "total"')"
           if [ -n "$big" ]; then
             echo "test vector too large: $big" >&2
             exit 1
