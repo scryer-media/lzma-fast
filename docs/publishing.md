@@ -43,7 +43,9 @@ which it requests for that job only.
    would refuse rather than stopping at the first. A real run refuses a dirty
    tree, an unsigned HEAD, a branch other than `main`, a changelog section
    missing or still marked unreleased, a README that shows neither the version
-   nor its major.minor, and a tag that already exists. It then runs the tests
+   nor its major.minor, and a tag that exists anywhere but at HEAD (a signed tag already at HEAD is a
+   release that stopped half way - a refused publish or push - and the run
+   carries on from it). It then runs the tests
    in release mode (`--skip-tests` leaves them to CI and to the workflow's
    `verify` job) and a `cargo publish --dry-run`, creates the signed tag
    `v<version>` and pushes it.
