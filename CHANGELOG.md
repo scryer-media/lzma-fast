@@ -122,6 +122,14 @@ apart for anyone reading the history.
   the end of the stream with a chunk still owing output, and that was taken
   for a clean end. The stream now ends only where the chase decoder is between
   chunks. Found by fuzzing the new drain budget.
+- `Lzma2AdaptiveDecoder` fed far ahead of a stream of small runs no longer
+  spends its time moving its own input. The consumed front of the input buffer
+  was dropped after every dispatched run, which moves everything behind it:
+  with a gigabyte fed and 1 MiB runs - what `7zz -mx1` writes for data that
+  does not compress - that was most of a gigabyte moved a thousand times. It is
+  now dropped once it is half the buffer, or when `feed` needs the room. A
+  1 GiB archive of that shape through the `sevenz-fast` reader at 18 threads:
+  4.6 s before, 1.3 s after, against 1.1 s for `7zz t`.
 
 Packaging: the crate is the repository root (it was `crates/lzma-fast`), and
 its archive carries the library, the README, the changelog and the license

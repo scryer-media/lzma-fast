@@ -383,6 +383,10 @@ impl Lzma2AdaptiveDecoder {
         if data.is_empty() || self.complete {
             return Ok(0);
         }
+        if self.in_flight_bytes() + data.len() as u64 > self.memory_limit {
+            // Input already claimed by a run still counts until it is dropped.
+            self.reclaim();
+        }
         let held = self.in_flight_bytes();
         let room = self.memory_limit.saturating_sub(held);
         // Always take at least one byte's worth of progress possible: a limit
@@ -598,9 +602,26 @@ impl Lzma2AdaptiveDecoder {
             return;
         }
         let drop = (keep_from - self.base) as usize;
-        if drop < self.buf.len() / 2 && drop < (1 << 20) {
+        // Dropping the front moves everything behind it, so it is done only
+        // once the dead part is at least half the buffer: each byte is then
+        // moved a bounded number of times however the input was fed. Dropping
+        // after every run instead is quadratic when a caller feeds far ahead
+        // of a stream of small runs - a gigabyte held, a megabyte claimed at a
+        // time, and the whole remainder moved for each one.
+        if drop < self.buf.len() / 2 {
             return;
         }
+        self.reclaim();
+    }
+
+    /// Drops the consumed front of the input whatever it costs. For when the
+    /// room matters more than the move: `feed` running into the memory limit.
+    fn reclaim(&mut self) {
+        let keep_from = self.cursor_in;
+        if keep_from <= self.base {
+            return;
+        }
+        let drop = (keep_from - self.base) as usize;
         self.buf.drain(..drop);
         self.base = keep_from;
     }

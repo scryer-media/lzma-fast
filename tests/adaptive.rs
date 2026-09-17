@@ -489,6 +489,39 @@ fn a_bounded_drain_holds_less_than_an_unbounded_one() {
 }
 
 #[test]
+fn feeding_far_ahead_of_many_small_runs_loses_nothing() {
+    // What a `Read` adapter over an archive of incompressible data does: the
+    // whole stream is fed before the first drain, the runs are small, and each
+    // drain takes one buffer's worth. The input is dropped from the front in
+    // large steps rather than after every run, so offsets into it have to stay
+    // right across drops that land in the middle of the backlog.
+    let runs: Vec<_> = (0..256)
+        .map(|i| copy_run(&pseudo_random(1 << 16, i + 1)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    let mut dec = Lzma2AdaptiveDecoder::new(16, &opts(4, u64::MAX)).expect("props");
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let status = dec
+            .drain_upto(1 << 16, |off, b| {
+                assert_eq!(off, out.len() as u64, "out of order at {off}");
+                out.extend_from_slice(b);
+            })
+            .expect("drain_upto");
+        if status == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(out, plain);
+}
+
+#[test]
 fn a_zero_limit_delivers_nothing_and_loses_nothing() {
     let (prop, packed, plain) = multi_run(&["text.p1.xz"], 1);
     let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(2, u64::MAX)).expect("props");
