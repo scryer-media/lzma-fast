@@ -86,3 +86,47 @@ pub(crate) unsafe fn decode_real(
         ok: res == 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The assembly file's macros are named after x86 mnemonics, and `shl` is
+    /// also a NEON instruction. An assembler macro outlives the file that
+    /// defined it, and under LTO the whole program is one assembly unit, so a
+    /// macro left defined shadows that mnemonic in every other crate's
+    /// assembly. Whether it bites depends on the target and on emission order,
+    /// which is why this reads the file instead of assembling a probe.
+    #[test]
+    fn the_assembly_file_purges_every_macro_it_defines() {
+        // Without its `/* */` blocks: a definition inside one defines nothing,
+        // and purging a macro that is not defined is an error.
+        let mut source = String::new();
+        let mut rest = include_str!("lzma_dec_opt_aarch64.S");
+        while let Some(open) = rest.find("/*") {
+            source.push_str(&rest[..open]);
+            let close = rest[open..].find("*/").expect("an unclosed comment");
+            rest = &rest[open + close + 2..];
+        }
+        source.push_str(rest);
+        let named = |directive: &str| -> Vec<&str> {
+            source
+                .lines()
+                .filter_map(|line| line.trim_start().strip_prefix(directive))
+                .filter_map(|rest| rest.split_whitespace().next())
+                .collect()
+        };
+        let defined = named(".macro ");
+        let purged = named(".purgem ");
+        assert!(!defined.is_empty());
+        let left: Vec<_> = defined
+            .iter()
+            .filter(|name| !purged.contains(name))
+            .collect();
+        assert!(left.is_empty(), "macros left defined: {left:?}");
+        let last_definition = source.rfind(".macro ").unwrap();
+        let first_purge = source.find(".purgem ").unwrap();
+        assert!(
+            first_purge > last_definition,
+            "a purge precedes a definition"
+        );
+    }
+}
