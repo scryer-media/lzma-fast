@@ -610,3 +610,37 @@ because the C library writes straight into the caller's buffer and that buffer
 is not counted; the comparison to make there is against `xz -T<n>`'s own
 `--memlimit` behaviour, not against 8 KiB. Ours is bounded by the memory limit
 in `XzOptions`, which is what the `memory_estimate` API reports.
+
+### The adaptive decoder on a file already on disk
+
+The `sevenz-fast` fork measured `Lzma2AdaptiveDecoder` at 1.50x its own
+parallel path on an archive on disk and asked for a decoder that stands aside
+for its workers. `lzma-bench --adaptive` is that measurement: a 7-Zip archive
+of 897 MiB packed, fed 16 MiB at a time and drained as it goes, timed against
+`Lzma2ParallelDecoder` on the same stream. x86-box, three runs, median.
+
+| threads | chasing | waiting (`set_chase(false)`) | ring | waiting / ring |
+| --- | --- | --- | --- | --- |
+| 1 | 21.499 s | 21.773 s | 21.892 s | 0.995 |
+| 2 | 21.405 s | 12.404 s | 12.145 s | 1.021 |
+| 4 | 22.032 s | 7.026 s | 7.064 s | 0.995 |
+| 8 | 20.333 s | 6.625 s | 6.848 s | 0.967 |
+
+Pinned to cores 0-7 the same shape holds: 20.3 s / 20.3 s / 20.1 s at one
+thread, and 6.604 s against the ring's 6.794 s at eight.
+
+The "chasing" column is the default, and on this workload it is a flat line:
+the chase decoder reaches every run before the feed that would complete it, so
+the whole archive decodes on the calling thread however many threads are
+available. Three changes were needed to get the other column:
+
+1. the chase stands aside while a worker is outstanding;
+2. `set_chase(false)` lets a caller whose bytes are already on disk say that an
+   incomplete run means "not fed yet", not "not written yet";
+3. `drain` hands control back instead of blocking on a worker while input is
+   still coming - without this the decoder dispatches one run, waits for it,
+   and only then reads the next, which is a serial decode with extra steps.
+
+With all three, the adaptive decoder is within 3% of the ring at every thread
+count, which is the point: the fork can drop its gigabyte of read-ahead and
+use the driver whose input it can borrow.

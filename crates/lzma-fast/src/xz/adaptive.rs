@@ -315,7 +315,21 @@ impl XzAdaptiveDecoder {
                 Step::Did => did = true,
                 Step::Blocked => {
                     // Nothing can be done with what has arrived. If a worker
-                    // is busy, wait for it rather than spinning.
+                    // is busy, wait for it rather than spinning - unless the
+                    // caller could be feeding the next block to the next
+                    // worker instead, which is the case whenever input is
+                    // still coming and there is room to hold it.
+                    if self.outstanding > 0
+                        && !self.input_done
+                        && self.in_flight_bytes() < self.opts.memory_limit
+                    {
+                        progress |= did;
+                        return Ok(if progress {
+                            DrainStatus::Progress
+                        } else {
+                            DrainStatus::NeedsMoreInput
+                        });
+                    }
                     if self.outstanding > 0 {
                         if self.collect(true)? {
                             did = true;

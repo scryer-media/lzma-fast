@@ -537,8 +537,22 @@ impl Lzma2AdaptiveDecoder {
                 continue;
             }
             if self.outstanding != 0 {
-                // A worker is busy and there is nothing else to do, so wait
-                // for it rather than spin.
+                // A worker is busy and there is nothing else *here* to do.
+                // Whether to wait for it depends on whether the caller has
+                // something better to do: while input is still coming, handing
+                // control back lets the next run be fed and given to the next
+                // worker, where waiting here would decode one run at a time no
+                // matter how many threads there are. Once the input is over,
+                // or the memory limit means no more can be taken, there is
+                // nothing better, so wait.
+                if !self.input_done && self.in_flight_bytes() < self.memory_limit {
+                    progress |= did;
+                    return Ok(if progress {
+                        DrainStatus::Progress
+                    } else {
+                        DrainStatus::NeedsMoreInput
+                    });
+                }
                 if self.collect(true) {
                     continue;
                 }
