@@ -1,11 +1,13 @@
 # Changelog
 
-## 0.3.0 - 2026-09-17
+## 0.3.1 - 2026-09-17
 
 The crate is published as `lzma-turbo`. It was briefly on crates.io as
-`lzma-fast`, with the same contents at the same version; that name is
+`lzma-fast`, with the same contents as 0.3.0; that name is
 withdrawn. Only the crate and library names changed: replace `lzma_fast` with
 `lzma_turbo` in paths and `lzma-fast` with `lzma-turbo` in manifests.
+
+## 0.3.0 - 2026-09-17
 
 The `.xz` container, behind the new default `xz` feature. 0.2.0's entry is
 kept below as it stands: that work is unreleased, but the container is a
