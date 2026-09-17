@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 - 2026-09-17
+
+0.3.2 was tagged and never reached crates.io; this carries its change too.
+
+- An `.xz` block that declares no uncompressed size and runs past
+  `max_unpack_bytes` (or the block cap) now fails with `TooMuchOutput`. It was
+  reported as corrupt LZMA data: once the allowance was used up, LZMA2 was
+  asked to read the end marker, failed on the chunk that followed instead, and
+  that failure was returned as it stood. A single-threaded `xz` writes such
+  blocks, so a caller hitting its own limit was told its file was broken.
+
 ## 0.3.2 - 2026-09-17
 
 - The `aarch64` decode loop's assembly file now purges every macro it defines.

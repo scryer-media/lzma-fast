@@ -342,6 +342,25 @@ fn an_output_cap_stops_a_decode() {
     assert!(out.len() <= 100);
 }
 
+/// A single-threaded `xz` writes no sizes into the block header, so the only
+/// limit the block has is the caller's cap. Reaching it is a cap hit, not
+/// corrupt data: LZMA2 asked to finish with nothing left to write into fails
+/// on the chunks still to come, and that failure is the cap's.
+#[test]
+fn an_output_cap_stops_a_block_that_declares_no_size() {
+    let data = b"payload\n".repeat(4096);
+    let Some(stream) = xz_compress(&["-1", "-T1"], &data) else {
+        return;
+    };
+    let opts = XzOptions::default().with_max_unpack_bytes(Some(100));
+    let mut out = Vec::new();
+    let err = XzReader::with_options(&stream[..], opts)
+        .read_to_end(&mut out)
+        .expect_err("cap");
+    assert!(format!("{err}").contains("cap"), "{err}");
+    assert!(out.len() <= 100);
+}
+
 /// Decodes with the parallel reader at `threads`, in `chunk`-sized reads.
 fn decode_parallel(data: &[u8], threads: usize, chunk: usize) -> std::io::Result<Vec<u8>> {
     let opts = XzOptions::default().with_threads(threads);
