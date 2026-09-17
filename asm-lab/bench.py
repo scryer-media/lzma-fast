@@ -4,7 +4,7 @@
     ./bench.py --label NAME --mib 256 -n 7 -- cmd arg...
 
 Reports MIN-of-N child *user CPU* time, not median wall time.  Rationale: this
-box is shared with another agent's builds, so wall time picks up scheduling
+box is shared with other builds, so wall time picks up scheduling
 delay that has nothing to do with the code under test.  User CPU time excludes
 time the process was not running, and the minimum is the run least polluted by
 cache/DVFS interference from the neighbours.  Wall time is still printed so a

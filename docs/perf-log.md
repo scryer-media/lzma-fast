@@ -174,7 +174,7 @@ passes with the `asm` feature, with `--no-default-features --features std`,
 and as `no_std` + `alloc`, on aarch64 macOS, on x86_64 macOS under Rosetta and
 on x86_64 Linux.
 
-## The same loop on linux-x86_64 (x86-box)
+## The same loop on linux-x86_64
 
 Commit `71d8ced`, the same harness, `--runs 3`, on the x86_64 bench box:
 `12th Gen Intel(R) Core(TM) i5-1240P`, 16 logical CPUs, Ubuntu 26.04.1, gcc
@@ -443,7 +443,7 @@ every input buffer and every output block) moved the eight-thread time by
 nothing at all, 2.336 s to 2.336 s, and was reverted rather than kept: it
 bought an `unsafe` block for no measurement.
 
-### linux-x86_64 (x86-box)
+### linux-x86_64
 
 Same commits, same harness, `--runs 3`, on the x86_64 bench box:
 `12th Gen Intel(R) Core(TM) i5-1240P`, 16 logical CPUs, Ubuntu 26.04.1. The
@@ -523,7 +523,7 @@ sentence on this box. Only the first is a claim about this crate.
 
 ## xz container
 
-Measured on x86-box (Arrow Lake-H, 16 threads, gcc 15, no AVX-512) with
+Measured on linux-x86_64 (Arrow Lake-H, 16 threads, gcc 15, no AVX-512) with
 `lzma-bench --xz`, three runs, median, on 2026-09-16. macOS aarch64 and
 windows-msvc numbers follow in their own sections below.
 
@@ -616,7 +616,7 @@ The `sevenz-fast` fork measured `Lzma2AdaptiveDecoder` at 1.50x its own
 parallel path on an archive on disk and asked for a decoder that stands aside
 for its workers. `lzma-bench --adaptive` is that measurement: a 7-Zip archive
 of 897 MiB packed, fed 16 MiB at a time and drained as it goes, timed against
-`Lzma2ParallelDecoder` on the same stream. x86-box, three runs, median.
+`Lzma2ParallelDecoder` on the same stream. linux-x86_64, three runs, median.
 
 | threads | chasing | waiting (`set_chase(false)`) | ring | waiting / ring |
 | --- | --- | --- | --- | --- |
@@ -648,7 +648,7 @@ use the driver whose input it can borrow.
 
 Measured on this Mac (Apple M5 Max, 18 threads) on 2026-09-16, same
 `lzma-bench`, three runs, median. The 1-minute load average was 2.85 when the
-series started; the operator's own applications, not this crate, are the
+series started; the machine owner's own applications, not this crate, are the
 background. `xz` is 5.8.3 and `7zz` is 7-Zip 25.01.
 
 | fixture | shape | `XzReader` | `xz -dc -T1` | ratio | `7zz t` | liblzma ST |
@@ -700,16 +700,16 @@ the ring:
 | 4 | 14.903 s | 4.011 s | 3.875 s | 1.035 |
 | 8 | 15.349 s | 2.134 s | 2.075 s | 1.028 |
 
-Same shape as on x86-box: chasing a file that is already on disk pins the
+Same shape as on linux-x86_64: chasing a file that is already on disk pins the
 decode to one thread, and `set_chase(false)` puts it within 3.5% of the ring
 at every thread count. The 1-minute load had climbed to 7.8 by the end of the
-adaptive series (the operator's applications), which is the most likely reason
+adaptive series (the machine owner's applications), which is the most likely reason
 the 4- and 8-thread ratios sit a little above the 0.97-1.02 measured on the
 quiet Linux box; the verdict is the same either way.
 
 ### windows-msvc
 
-Measured on windows-box (Ryzen 5 3600, 6C/12T, Windows) on 2026-09-16, same
+Measured on windows-x86_64 (Ryzen 5 3600, 6C/12T, Windows) on 2026-09-16, same
 `lzma-bench --xz`, three runs, median. The build is `clang-cl` with AWS-LC
 linked statically; the CPU reports itself as "AMD Ryzen 5 3600 6-Core
 Processor", the toolchain is rustc 1.97.1 (8bab26f4f), and `xz` is the 5.8.1

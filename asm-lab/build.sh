@@ -14,7 +14,7 @@
 set -euo pipefail
 
 LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SDK="${SDK:-$HOME/dev/supporting-codebases/7zip}"
+SDK="${SDK:?set SDK to a checkout of github.com/ip7z/7zip}"
 C="$SDK/C"
 OUT="$LAB/build"
 CC="${CC:-clang}"

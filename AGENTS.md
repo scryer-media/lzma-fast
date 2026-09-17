@@ -13,8 +13,8 @@ the reference decoder. Readability that costs throughput is not wanted.
 1. Port, do not redesign. Keep the reference decoder's structure: one decode
    loop, coder state in locals, per-symbol limit checks under a margin, a
    separate slow path near buffer edges. See `docs/porting.md`.
-2. The reference is `~/dev/supporting-codebases/7zip/C/` at the commit named
-   in `docs/porting.md`. Cite the C function name in a comment when a Rust
+2. The reference is `C/` in a checkout of github.com/ip7z/7zip at the commit
+   named in `docs/porting.md`. Cite the C function name in a comment when a Rust
    function corresponds to one.
 3. `unsafe` is allowed where the C relies on the margin invariant, and only
    there. Every `unsafe` block carries a `// SAFETY:` comment stating the

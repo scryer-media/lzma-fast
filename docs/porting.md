@@ -2,7 +2,7 @@
 
 ## Reference
 
-- Source tree: `~/dev/supporting-codebases/7zip` (github.com/ip7z/7zip),
+- Source tree: a checkout of github.com/ip7z/7zip,
   commit `0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17`, tag 26.03.
 - Files, all public domain (`C/` and `Asm/` in the LZMA SDK):
 

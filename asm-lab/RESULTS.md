@@ -32,7 +32,7 @@ this loop on this core, documented under "Performance model" below. The shipped
   in-situ "add N instructions and see" diagnostics. Where I say "throughput
   bound" or "the branch predicts well", that is an inference, not a counter
   reading.
-* The machine was **shared with another agent** doing heavy Rust builds for
+* The machine was **shared with other heavy Rust builds** for
   most of the session (load average peaked at 24 on 18 cores). `bench.py` was
   switched mid-session from median wall time to **min-of-N CPU time** for this
   reason. On a quiet box the harness repeats to about ±0.5%; under load, ±3%.

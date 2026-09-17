@@ -40,7 +40,6 @@ use lzma_fast::{
 };
 
 const OUT_CHUNK: usize = 1 << 20;
-const REFERENCE_C_DECODER: &str = "supporting-codebases/7zip/C/Util/Lzma/_o/7lzma";
 
 const HELP: &str = "\
 usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <file> ...
@@ -534,18 +533,15 @@ fn oracle_commands(path: &Path) -> Vec<(String, Vec<String>)> {
     v
 }
 
-/// The reference C decoder lives next to the 7-Zip checkout the port was made
-/// from; the path is resolved from `$HOME` so no developer's home directory is
-/// baked into the source.
+/// The reference C decoder, `7lzma` built from `C/Util/Lzma` in the 7-Zip
+/// source tree: the binary `LZMA_FAST_7LZMA` names, or else whatever `7lzma`
+/// the PATH offers.
 fn reference_c_decoder() -> Option<String> {
-    if let Ok(home) = std::env::var("HOME") {
-        let p = Path::new(&home).join("dev").join(REFERENCE_C_DECODER);
-        if p.exists() {
-            return Some(p.display().to_string());
+    if let Ok(p) = std::env::var("LZMA_FAST_7LZMA") {
+        if Path::new(&p).is_file() {
+            return Some(p);
         }
     }
-    // Otherwise take whatever `7lzma` the PATH offers, which is how the
-    // reference decoder is reached on a bench box that keeps its own build.
     let path = std::env::var("PATH").ok()?;
     std::env::split_paths(&path)
         .map(|d| d.join("7lzma"))

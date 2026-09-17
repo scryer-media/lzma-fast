@@ -26,7 +26,7 @@ if [ ! -f "$WORK/text.bin" ]; then
   head -c 3000000 /usr/share/dict/words                > "$WORK/text.bin"   # literal-heavy
   head -c 2000000 /dev/urandom                         > "$WORK/rand.bin"   # incompressible
   cat "$WORK/text.bin" "$WORK/text.bin"                > "$WORK/rep.bin"    # one huge match
-  tar cf - -C "$HOME/dev/supporting-codebases" 7zip 2>/dev/null \
+  git -C "$LAB" archive HEAD 2>/dev/null \
     | head -c 100000000                                > "$WORK/src.bin"    # mixed lit/match
   printf 'a%.0s' $(seq 1 100000)                       > "$WORK/runs.bin"   # rep0 short matches
   head -c 100 /dev/urandom                             > "$WORK/tiny.bin"
