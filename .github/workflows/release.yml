@@ -1,0 +1,107 @@
+name: release
+
+# Cut by scripts/release.sh: a signed tag v<version> on main. This workflow
+# proves the tag matches the manifest, runs the tests, publishes the crate to
+# crates.io through trusted publishing (no long-lived token in the repository)
+# and creates the GitHub release with that version's changelog section as its
+# notes. See docs/publishing.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: lzma-fast-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.97.1
+  CRATE: lzma-fast
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: The tag names the manifest version
+        run: |
+          version="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "manifest $version, tag $tag"
+          test "$version" = "$tag"
+      - name: The changelog has a dated section for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          heading="$(grep -m1 "^## .*$version" crates/lzma-fast/CHANGELOG.md || true)"
+          echo "$heading"
+          test -n "$heading"
+          ! echo "$heading" | grep -qi unreleased
+      - name: Test
+        run: cargo test --locked --workspace --no-fail-fast
+      - name: Package
+        run: cargo publish -p "$CRATE" --locked --dry-run
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p "$CRATE" --locked --no-verify
+
+  github-release:
+    name: github release
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The section whose heading names the version; failing that, the
+          # first section of the file.
+          awk -v ver="$version" '/^## /{ if (found) exit; if (index($0, ver)) found=1; next } found' crates/lzma-fast/CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            awk 'NR>1 && /^## /{ n++; if (n==2) exit } n==1' crates/lzma-fast/CHANGELOG.md > notes.md
+          fi
+          cat notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$CRATE ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md
