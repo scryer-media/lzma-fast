@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 - 2026-09-17
+
+- `live_threads()` no longer undercounts. A worker was counted from its own
+  first instruction, but a thread does not run the moment it is spawned, so
+  between the spawn and the OS scheduling it the pool reported fewer live
+  workers than it held handles for. On an idle machine the gap is invisible;
+  on a loaded two-core runner eight workers read as six. The count now rises
+  with the handle and falls when the worker returns, which is what the
+  documented "equal to `spawned_threads()` until cancelled" promised.
+
 ## 0.3.3 - 2026-09-17
 
 0.3.2 was tagged and never reached crates.io; this carries its change too.
