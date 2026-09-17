@@ -1,6 +1,6 @@
 # Benchmark fixtures
 
-Generated locally by `scripts/make-fixtures.sh`; every file in this directory
+Generated locally by `cargo xtask fixtures`; every file in this directory
 except this README is gitignored. Expected contents after generation:
 
 | File | Size | How |

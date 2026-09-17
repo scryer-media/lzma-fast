@@ -242,7 +242,7 @@ extra state, audit every `jmp` into a `BIT_*` sequence.
   saturating all 18 cores for much of this session (load average peaked at 24).
   Quiet-box repeatability is ~±0.5%; under load ~±3%. Check `uptime` before
   believing a small delta.
-* `asm-lab/verify.sh` is the correctness gate: both project fixtures plus small
+* `cargo xtask asm-lab verify` is the correctness gate: both project fixtures plus small
   streams from `xz --format=lzma` across presets **and lc/lp/pb combinations**.
   The lc/lp/pb spread matters — `lc2_lpMask` and `pbMask` are only exercised
   off their defaults by non-default settings, so a loop can be wrong and still

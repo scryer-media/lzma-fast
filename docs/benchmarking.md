@@ -2,7 +2,7 @@
 
 ## Fixtures
 
-Run `scripts/make-fixtures.sh` once. It writes to `bench/fixtures/` (ignored).
+Run `cargo xtask fixtures` once. It writes to `bench/fixtures/` (ignored).
 See `bench/fixtures/README.md` for the list.
 
 ## Oracles
