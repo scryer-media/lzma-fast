@@ -1,0 +1,9 @@
+# The committed test vectors, their source files and the fuzz seeds are
+# bytes, not text. Without this, Git classifies any of them that happens to
+# contain no NUL byte as text and rewrites its line endings on checkout
+# wherever `core.autocrlf` is on — which is the default on Windows. A vector
+# that has been rewritten no longer matches what the decoder produces, and
+# every differential test over it fails for a reason that has nothing to do
+# with the decoder.
+tests/data/** binary
+fuzz/corpus/**/*.seed binary

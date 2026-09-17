@@ -10,6 +10,16 @@
   asked to read the end marker, failed on the chunk that followed instead, and
   that failure was returned as it stood. A single-threaded `xz` writes such
   blocks, so a caller hitting its own limit was told its file was broken.
+- The committed test vectors are now marked binary, which fixes the Windows
+  test lane. Git decides text from bytes by looking for a zero byte, and one
+  small vector's uncompressed source file happens to have none, so a Windows
+  checkout rewrote its three line endings and the file arrived three bytes
+  longer than the stream it was compressed from. Every test that compared the
+  two failed, on the assembly loop and on the portable one alike. The library
+  was never affected - it decodes those streams correctly on every platform -
+  but the Windows lane had therefore never been green, and nothing in the
+  release gate ran the tests anywhere but Linux. The release workflow now
+  runs the Windows and macOS lanes as well, and publishing waits for them.
 
 ## 0.3.2 - 2026-09-17
 
