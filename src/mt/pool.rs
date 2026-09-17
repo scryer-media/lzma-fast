@@ -73,9 +73,10 @@ pub(crate) struct Pool {
     done_tx: Sender<Done>,
     job_rx: Arc<std::sync::Mutex<Receiver<Job>>>,
     cancel: Arc<AtomicBool>,
-    /// Workers that have started and not yet returned. Only a test reads it,
-    /// but it is what makes "no thread is left behind" checkable rather than
-    /// asserted.
+    /// Workers that exist and have not yet returned. Raised with the handle
+    /// and lowered by the worker on its way out, so a thread the OS has not
+    /// scheduled yet still counts. Only a test reads it, but it is what makes
+    /// "no thread is left behind" checkable rather than asserted.
     live: Arc<AtomicUsize>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -102,6 +103,10 @@ impl Pool {
     }
 
     /// How many worker threads are running right now.
+    ///
+    /// Counted from the spawn, not from the thread's first instruction: a
+    /// worker the OS has created but not yet scheduled is alive, and on a
+    /// loaded machine that gap is wide enough to see.
     pub(crate) fn live(&self) -> usize {
         self.live.load(Ordering::Relaxed)
     }
@@ -120,17 +125,24 @@ impl Pool {
         let live = Arc::clone(&self.live);
         let prop = self.dict_prop;
         let name = alloc::format!("lzma2-mt-{}", self.handles.len());
+        // Counted here rather than as the worker's first act: the count has to
+        // rise with the handle it belongs to. A worker increments only once the
+        // OS gets round to running it, which on a loaded machine can be long
+        // after the spawn returns, and until then the pool would be reporting
+        // fewer live workers than it holds handles for.
+        self.live.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name(name).spawn(move || {
-            live.fetch_add(1, Ordering::Relaxed);
             worker(prop, &rx, &tx, &cancel);
             live.fetch_sub(1, Ordering::Relaxed);
         });
         // A thread that will not start is not an error: the work is simply
-        // done by the threads that did, or on the caller's own stack.
-        // A thread that will not start is not an error: the work is simply
-        // done by the threads that did, or on the caller's own stack.
-        if let Ok(h) = spawned {
-            self.handles.push(h);
+        // done by the threads that did, or on the caller's own stack. Its
+        // closure never runs, so the count comes back down here.
+        match spawned {
+            Ok(h) => self.handles.push(h),
+            Err(_) => {
+                self.live.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -329,5 +341,32 @@ pub(crate) fn locate(index: u64, out_offset: u64, e: Error) -> Error {
     match e {
         Error::CorruptData => Error::CorruptRun { index, out_offset },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pool;
+
+    /// A worker counts as live from the moment the pool holds its handle, not
+    /// from the moment the OS gets round to running it.
+    ///
+    /// A spawned thread has not executed anything when `spawn` returns. While
+    /// the count was the worker's own first act, the pool understated itself
+    /// for as long as the thread sat unscheduled: invisible on an idle
+    /// machine, and on a loaded two-core runner wide enough that eight
+    /// handles reported six live workers.
+    ///
+    /// Read with no pause between growing and asking, which is where the old
+    /// count was always wrong and the new one cannot be.
+    #[test]
+    fn a_worker_is_live_before_it_is_scheduled() {
+        let mut pool = Pool::new(0);
+        for _ in 0..8 {
+            pool.grow();
+            assert_eq!(pool.live(), pool.spawned(), "a handle with no live worker");
+        }
+        pool.shutdown();
+        assert_eq!(pool.live(), 0, "a worker outlived shutdown");
     }
 }

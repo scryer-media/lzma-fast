@@ -122,15 +122,22 @@ impl XzPool {
         let cancel = Arc::clone(&self.cancel);
         let live = Arc::clone(&self.live);
         let name = alloc::format!("xz-mt-{}", self.handles.len());
+        // Counted with the handle, not from inside the worker: a thread the OS
+        // has created but not yet scheduled is alive, and counting it only once
+        // it runs leaves the pool understating itself on a loaded machine.
+        self.live.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name(name).spawn(move || {
-            live.fetch_add(1, Ordering::Relaxed);
             worker(&rx, &tx, &cancel);
             live.fetch_sub(1, Ordering::Relaxed);
         });
         // A thread that will not start is not an error: the blocks are decoded
-        // by the threads that did.
-        if let Ok(h) = spawned {
-            self.handles.push(h);
+        // by the threads that did. Its closure never runs, so the count comes
+        // back down here.
+        match spawned {
+            Ok(h) => self.handles.push(h),
+            Err(_) => {
+                self.live.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 

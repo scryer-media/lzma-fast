@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-bench"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "liblzma",
  "lzma-rust2",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
