@@ -12,8 +12,8 @@
 /dist/
 /package/
 /logs/
-/lzma-fast-*.tar.gz
-/lzma-fast-*.zip
+/lzma-turbo-*.tar.gz
+/lzma-turbo-*.zip
 /SHA256SUMS
 
 # Rust profiling/coverage

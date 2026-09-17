@@ -8,7 +8,7 @@
 mod common;
 
 use common::*;
-use lzma_fast::Status;
+use lzma_turbo::Status;
 
 /// A cheap deterministic PRNG so corruption cases are reproducible without a
 /// dev-dependency. C: none; this is test scaffolding.

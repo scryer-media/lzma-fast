@@ -221,17 +221,8 @@ name = "lzma-bench"
 version = "0.3.0"
 dependencies = [
  "liblzma",
- "lzma-fast",
  "lzma-rust2",
-]
-
-[[package]]
-name = "lzma-fast"
-version = "0.3.0"
-dependencies = [
- "aws-lc-rs",
- "crc-fast",
- "sha2",
+ "lzma-turbo",
 ]
 
 [[package]]
@@ -240,6 +231,15 @@ version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "lzma-turbo"
+version = "0.3.0"
+dependencies = [
+ "aws-lc-rs",
+ "crc-fast",
  "sha2",
 ]
 

@@ -10,7 +10,7 @@ See `bench/fixtures/README.md` for the list.
 | Oracle | Command | What it measures |
 | --- | --- | --- |
 | 7-Zip shipped decoder (asm loop) | `7zz t -mmt=1 st.7z` / `7zz t -mmt=1 p256.bin.lzma` | The acceptance target. `t` decodes and CRCs without writing. |
-| 7-Zip C decoder (no asm) | `7lzma d in.lzma /dev/null` | C parity checkpoint. Built from `C/Util/Lzma` with the default makefile (`make -f makefile.gcc`). The harness takes the binary named by `LZMA_FAST_7LZMA`, or else whatever `7lzma` is on `PATH`. |
+| 7-Zip C decoder (no asm) | `7lzma d in.lzma /dev/null` | C parity checkpoint. Built from `C/Util/Lzma` with the default makefile (`make -f makefile.gcc`). The harness takes the binary named by `LZMA_TURBO_7LZMA`, or else whatever `7lzma` is on `PATH`. |
 | XZ Utils | `xz -dc -T1 in.xz > /dev/null` / `xz -dc --format=lzma in.lzma > /dev/null` | Tukaani C decoder; also the correctness reference for output bytes. |
 
 Reference numbers on Apple M5 Max, 7-Zip 26.01, XZ Utils 5.8 (2026-09-15):
@@ -93,7 +93,7 @@ decoder is configured for.
 
 ## Differential correctness
 
-`cargo test -p lzma-fast` decodes every fixture it can find under
+`cargo test -p lzma-turbo` decodes every fixture it can find under
 `bench/fixtures` and small committed vectors under `tests`,
 and compares the bytes with `xz -dc`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.

@@ -3,7 +3,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lzma_fast::{FinishMode, Lzma2Decoder, Status};
+use lzma_turbo::{FinishMode, Lzma2Decoder, Status};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {

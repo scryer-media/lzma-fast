@@ -57,7 +57,7 @@ fn oracle(args: &[&str]) -> Option<(u64, u32)> {
 /// Streams the fixture through the decoder in `in_chunk`-sized input slices
 /// and `out_chunk`-sized output slices, returning length and CRC32.
 fn ours_lzma1(data: &[u8], in_chunk: usize, out_chunk: usize) -> (u64, u32) {
-    use lzma_fast::{FinishMode, LzmaAloneHeader, LzmaDecoder, Status};
+    use lzma_turbo::{FinishMode, LzmaAloneHeader, LzmaDecoder, Status};
     let header: [u8; 13] = data[..13].try_into().unwrap();
     let props = LzmaAloneHeader::parse(&header).unwrap().props;
     let mut dec = LzmaDecoder::new(props).unwrap();
@@ -81,7 +81,7 @@ fn ours_lzma1(data: &[u8], in_chunk: usize, out_chunk: usize) -> (u64, u32) {
 }
 
 fn ours_lzma2(dict_prop: u8, payload: &[u8], in_chunk: usize, out_chunk: usize) -> (u64, u32) {
-    use lzma_fast::{FinishMode, Lzma2Decoder, Status};
+    use lzma_turbo::{FinishMode, Lzma2Decoder, Status};
     let mut dec = Lzma2Decoder::new(dict_prop).unwrap();
     let mut input = payload;
     let mut out = vec![0u8; out_chunk];
@@ -211,7 +211,7 @@ fn stdout_oracle(prog: &str, args: &[&str]) -> Option<(u64, u32)> {
 #[cfg(feature = "std")]
 #[test]
 fn lzma2_mt_fixtures_match_the_single_threaded_path() {
-    use lzma_fast::{Lzma2MtOptions, Lzma2ParallelDecoder};
+    use lzma_turbo::{Lzma2MtOptions, Lzma2ParallelDecoder};
 
     let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     for name in ["mt.7z", "st.7z"] {
@@ -254,7 +254,7 @@ fn lzma2_mt_fixtures_match_the_single_threaded_path() {
 struct CrcSink {
     crc: u32,
     #[cfg(feature = "crc")]
-    digest: Option<lzma_fast::crc::Crc32>,
+    digest: Option<lzma_turbo::crc::Crc32>,
 }
 
 #[cfg(feature = "std")]
@@ -270,7 +270,7 @@ impl std::io::Write for CrcSink {
         #[cfg(feature = "crc")]
         {
             self.digest
-                .get_or_insert_with(lzma_fast::crc::Crc32::new)
+                .get_or_insert_with(lzma_turbo::crc::Crc32::new)
                 .update(buf);
         }
         #[cfg(not(feature = "crc"))]
@@ -294,7 +294,7 @@ impl CrcSink {
             self.crc = self
                 .digest
                 .take()
-                .map_or(0, lzma_fast::crc::Crc32::finalize);
+                .map_or(0, lzma_turbo::crc::Crc32::finalize);
         }
         self.crc
     }
@@ -319,11 +319,11 @@ struct RefSink {
     split_at: usize,
     block_at: usize,
     seg_start: u64,
-    c32: Option<lzma_fast::crc::Crc32>,
-    c64: Option<lzma_fast::crc::Crc64Xz>,
+    c32: Option<lzma_turbo::crc::Crc32>,
+    c64: Option<lzma_turbo::crc::Crc64Xz>,
     segments: Vec<(u64, u64, u32, u64)>,
     #[cfg(any(feature = "crypto", feature = "native-crypto"))]
-    sha: Option<lzma_fast::crypto::Sha256>,
+    sha: Option<lzma_turbo::crypto::Sha256>,
     digests: Vec<(u64, u64, [u8; 32])>,
     sha_start: u64,
 }
@@ -334,10 +334,10 @@ impl RefSink {
         RefSink {
             splits,
             block_ends,
-            c32: Some(lzma_fast::crc::Crc32::new()),
-            c64: Some(lzma_fast::crc::Crc64Xz::new()),
+            c32: Some(lzma_turbo::crc::Crc32::new()),
+            c64: Some(lzma_turbo::crc::Crc64Xz::new()),
             #[cfg(any(feature = "crypto", feature = "native-crypto"))]
-            sha: Some(lzma_fast::crypto::Sha256::new()),
+            sha: Some(lzma_turbo::crypto::Sha256::new()),
             ..Default::default()
         }
     }
@@ -362,8 +362,8 @@ impl RefSink {
         let c64 = self.c64.take().expect("open").finalize();
         self.segments
             .push((self.seg_start, self.pos - self.seg_start, c32, c64));
-        self.c32 = Some(lzma_fast::crc::Crc32::new());
-        self.c64 = Some(lzma_fast::crc::Crc64Xz::new());
+        self.c32 = Some(lzma_turbo::crc::Crc32::new());
+        self.c64 = Some(lzma_turbo::crc::Crc64Xz::new());
         self.seg_start = self.pos;
     }
 
@@ -375,7 +375,7 @@ impl RefSink {
         let d = self.sha.take().expect("open").finalize();
         self.digests
             .push((self.sha_start, self.pos - self.sha_start, d));
-        self.sha = Some(lzma_fast::crypto::Sha256::new());
+        self.sha = Some(lzma_turbo::crypto::Sha256::new());
         self.sha_start = self.pos;
     }
 
@@ -448,8 +448,8 @@ impl std::io::Write for RefSink {
 #[cfg(all(feature = "std", feature = "crc"))]
 #[test]
 fn lzma2_mt_fixture_checksums_fold_to_the_serial_answer() {
-    use lzma_fast::crc::CrcFolder;
-    use lzma_fast::{Checksum, ChecksumPlan, Lzma2MtOptions, Lzma2ParallelDecoder};
+    use lzma_turbo::crc::CrcFolder;
+    use lzma_turbo::{Checksum, ChecksumPlan, Lzma2MtOptions, Lzma2ParallelDecoder};
 
     let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let path = repo_root().join("bench/fixtures/mt.7z");

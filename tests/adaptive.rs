@@ -10,7 +10,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use lzma_fast::{DrainStatus, Error, Lzma2AdaptiveDecoder, Lzma2MtOptions};
+use lzma_turbo::{DrainStatus, Error, Lzma2AdaptiveDecoder, Lzma2MtOptions};
 
 use common::{copy_run, join_runs, multi_run, pseudo_random};
 
@@ -387,7 +387,7 @@ fn the_threaded_path_never_claims_a_run_the_chase_started() {
     assert_eq!(sink.bytes(), plain);
 }
 
-// 12. The requests the sevenz-fast fork filed: a chase that stands aside for a
+// 12. The requests the sevenz-turbo fork filed: a chase that stands aside for a
 // worker, a drain the caller can bound, and a run index over a seekable
 // source.
 
@@ -548,7 +548,7 @@ fn a_zero_limit_delivers_nothing_and_loses_nothing() {
 fn run_boundaries_agrees_with_the_scanner_it_seeks_over() {
     use std::io::Cursor;
 
-    use lzma_fast::{Lzma2RunScanner, run_boundaries};
+    use lzma_turbo::{Lzma2RunScanner, run_boundaries};
 
     let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 3);
 
@@ -583,7 +583,7 @@ fn alloc_prefix(n: usize) -> Vec<u8> {
 fn run_boundaries_rejects_a_range_that_stops_short() {
     use std::io::Cursor;
 
-    use lzma_fast::run_boundaries;
+    use lzma_turbo::run_boundaries;
 
     let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 2);
     let mut src = Cursor::new(packed[..packed.len() / 2].to_vec());

@@ -1,5 +1,5 @@
 [package]
-name = "lzma-fast-fuzz"
+name = "lzma-turbo-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,14 +9,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-lzma-fast = { path = "..", default-features = false }
+lzma-turbo = { path = "..", default-features = false }
 
 # The fuzz targets run against both decode loops: the default carries the
 # crate's own defaults (assembly where there is one), and `--no-default-
 # features --features portable` fuzzes the portable Rust loop.
 [features]
-default = ["lzma-fast/default"]
-portable = ["lzma-fast/std", "lzma-fast/crc", "lzma-fast/xz"]
+default = ["lzma-turbo/default"]
+portable = ["lzma-turbo/std", "lzma-turbo/crc", "lzma-turbo/xz"]
 
 [[bin]]
 name = "decode_lzma"

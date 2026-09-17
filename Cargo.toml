@@ -1,12 +1,12 @@
 [package]
-name = "lzma-fast"
+name = "lzma-turbo"
 description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
 readme = "README.md"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/scryer-media/lzma-fast"
+repository = "https://github.com/scryer-media/lzma-turbo"
 keywords = ["lzma", "lzma2", "xz", "decompression"]
 categories = ["compression", "no-std"]
 # Repository scaffolding that has no business in the crate archive.

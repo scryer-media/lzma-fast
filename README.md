@@ -1,8 +1,8 @@
-# lzma-fast
+# lzma-turbo
 
-[![ci](https://github.com/scryer-media/lzma-fast/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/lzma-fast/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/lzma-fast.svg)](https://crates.io/crates/lzma-fast)
-[![docs.rs](https://docs.rs/lzma-fast/badge.svg)](https://docs.rs/lzma-fast)
+[![ci](https://github.com/scryer-media/lzma-turbo/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/lzma-turbo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/lzma-turbo.svg)](https://crates.io/crates/lzma-turbo)
+[![docs.rs](https://docs.rs/lzma-turbo/badge.svg)](https://docs.rs/lzma-turbo)
 
 LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for
 its speed, including its hand-written `aarch64` and `x86_64` decode loops. No
@@ -10,7 +10,7 @@ C bindings, no build script, no encoder.
 
 ```toml
 [dependencies]
-lzma-fast = "0.3"
+lzma-turbo = "0.3"
 ```
 
 ## Reading an `.xz` file
@@ -18,7 +18,7 @@ lzma-fast = "0.3"
 ```rust
 use std::fs::File;
 use std::io::Read;
-use lzma_fast::xz::XzReader;
+use lzma_turbo::xz::XzReader;
 
 fn main() -> std::io::Result<()> {
     let mut out = Vec::new();
@@ -51,14 +51,14 @@ row decodes the same bytes and is checked byte for byte against `xz`.
 
 One thread:
 
-| stream | lzma-fast | `7zz -mmt=1` | `xz -T1` |
+| stream | lzma-turbo | `7zz -mmt=1` | `xz -T1` |
 | --- | --- | --- | --- |
 | 1 GiB LZMA1 | 19.6 s | 19.6 s | 20.5 s |
 | 256 MiB LZMA2 (.xz) | 4.9 s | 5.1 s | 5.1 s |
 
 LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`:
 
-| threads | lzma-fast | `7zz` | lzma-rust2 |
+| threads | lzma-turbo | `7zz` | lzma-rust2 |
 | --- | --- | --- | --- |
 | 1 | 20.4 s | 20.5 s | 29.6 s |
 | 4 | 6.5 s | 6.5 s | 29.3 s |
@@ -77,7 +77,7 @@ The 8- and 16-thread LZMA2 rows are the one place `7zz` is ahead, by how
 well its threads land on this machine's performance cores; pinned to those
 cores the two are within 5%. The full tables, with peak memory and the macOS
 and Windows rows, are in
-[docs/perf-log.md](https://github.com/scryer-media/lzma-fast/blob/main/docs/perf-log.md).
+[docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md).
 
 ## Status
 
@@ -102,7 +102,7 @@ single-threaded decoder rather than buffering. Alongside it,
 `Lzma2AdaptiveDecoder` decodes a stream that is still arriving: input is fed
 rather than read, output is polled, and the thread count can be changed
 mid-stream at run boundaries. See the "Adaptive use" section of
-[docs/porting.md](https://github.com/scryer-media/lzma-fast/blob/main/docs/porting.md).
+[docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/porting.md).
 
 Either threaded decoder will also checksum its own output, in the worker that
 produced it rather than on the thread draining it — `Checksum::Crc32`,
@@ -118,8 +118,8 @@ SHA-256 cannot be folded, so it is offered per whole block only, which is the
 unit an xz stream checks.
 
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
-the same file and machine) is tracked in [docs/perf-log.md](https://github.com/scryer-media/lzma-fast/blob/main/docs/perf-log.md);
-see [docs/porting.md](https://github.com/scryer-media/lzma-fast/blob/main/docs/porting.md) for the plan.
+the same file and machine) is tracked in [docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md);
+see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/porting.md) for the plan.
 
 ## Features
 
@@ -137,7 +137,7 @@ are handled by a fork of `sevenz-rust2` that depends on it.
 
 The decoder itself has no dependencies under any combination of these; `crc`
 and `crypto` exist for the xz layer described in
-[docs/porting.md](https://github.com/scryer-media/lzma-fast/blob/main/docs/porting.md), and nothing in `src/lzma/` or
+[docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/porting.md), and nothing in `src/lzma/` or
 `src/lzma2/` can reach them. `--no-default-features` builds as `no_std` +
 `alloc` with none of them.
 
@@ -146,7 +146,7 @@ and a check is one of CRC-32, CRC-64/XZ or SHA-256. `crypto` builds AWS-LC,
 which needs a C toolchain and CMake; a build that wants neither takes
 
 ```toml
-lzma-fast = { version = "0.3", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+lzma-turbo = { version = "0.3", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
 ```
 
 which is pure Rust and works wherever the decoder does. `native-crypto` wins

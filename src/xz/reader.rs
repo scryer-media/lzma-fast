@@ -138,7 +138,7 @@ enum State {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::Read;
-/// use lzma_fast::xz::XzReader;
+/// use lzma_turbo::xz::XzReader;
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let mut r = XzReader::new(File::open("x.tar.xz")?).with_memory_limit(128 << 20);

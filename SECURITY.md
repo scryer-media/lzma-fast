@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest published release of `lzma-fast` receives fixes.
+Only the latest published release of `lzma-turbo` receives fixes.
 
 ## Reporting a vulnerability
 

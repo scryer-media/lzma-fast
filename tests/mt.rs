@@ -7,7 +7,7 @@
 
 mod common;
 
-use lzma_fast::{
+use lzma_turbo::{
     DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2RunScanner,
 };
 
@@ -117,7 +117,7 @@ fn decode_st(dict_prop: u8, packed: &[u8]) -> Result<Vec<u8>, ()> {
     common::decode_lzma2(dict_prop, packed, 1 << 16, 1 << 16)
         .ok()
         .and_then(|d| {
-            if d.status == lzma_fast::Status::FinishedWithMark {
+            if d.status == lzma_turbo::Status::FinishedWithMark {
                 Some(d.bytes)
             } else {
                 None
@@ -191,7 +191,7 @@ fn corruption_in_any_run_agrees_with_the_single_threaded_decoder() {
 
 #[test]
 fn a_corrupt_run_is_reported_with_its_index_and_offset() {
-    use lzma_fast::Error;
+    use lzma_turbo::Error;
 
     let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 3);
     let bounds = run_boundaries(&packed);

@@ -3,7 +3,7 @@
 
 mod common;
 
-use lzma_fast::{Error, Lzma2Run, Lzma2RunScanner};
+use lzma_turbo::{Error, Lzma2Run, Lzma2RunScanner};
 
 use common::{copy_run, join_runs, multi_run, pseudo_random, xz_run};
 

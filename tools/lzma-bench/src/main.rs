@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use lzma_fast::{
+use lzma_turbo::{
     Checksum, ChecksumPlan, DrainStatus, FinishMode, Lzma2AdaptiveDecoder, Lzma2Decoder,
     Lzma2MtOptions, Lzma2ParallelDecoder, LzmaAloneHeader, LzmaDecoder, Status,
 };
@@ -124,14 +124,14 @@ fn main() {
         std::process::exit(2);
     }
 
-    let loop_name = if portable || !lzma_fast::ASM_LOOP {
+    let loop_name = if portable || !lzma_turbo::ASM_LOOP {
         "portable"
     } else {
         "asm"
     };
     println!(
-        "lzma-bench (lzma-fast {}, {loop_name} loop), {runs} run(s), median",
-        lzma_fast::VERSION
+        "lzma-bench (lzma-turbo {}, {loop_name} loop), {runs} run(s), median",
+        lzma_turbo::VERSION
     );
 
     for file in &files {
@@ -161,7 +161,7 @@ fn run_index(path: &Path) {
         eprintln!("lzma-bench: {}: not an LZMA2 stream", path.display());
         return;
     };
-    let mut scanner = lzma_fast::Lzma2RunScanner::new();
+    let mut scanner = lzma_turbo::Lzma2RunScanner::new();
     if let Err(e) = scanner.feed(payload) {
         eprintln!("lzma-bench: {}: {e}", path.display());
         return;
@@ -281,8 +281,8 @@ fn bench_one(path: &Path, runs: usize, oracles: bool, portable: bool) {
         human(bytes)
     );
     println!("  {:<28} {:>9} {:>11}", "decoder", "time", "MiB/s");
-    print_row("lzma-fast (decode only)", ours_decode, bytes);
-    print_row("lzma-fast (incl. crc32)", ours_total, bytes);
+    print_row("lzma-turbo (decode only)", ours_decode, bytes);
+    print_row("lzma-turbo (incl. crc32)", ours_total, bytes);
 
     if !oracles {
         return;
@@ -416,7 +416,7 @@ fn crc_sink() -> Crc32 {
 /// output does not get charged to the decoder.
 fn drive<F>(mut input: &[u8], crc: &mut Crc32, mut step: F) -> Result<Run, String>
 where
-    F: FnMut(&[u8], &mut [u8]) -> Result<lzma_fast::Progress, String>,
+    F: FnMut(&[u8], &mut [u8]) -> Result<lzma_turbo::Progress, String>,
 {
     let mut out = vec![0u8; OUT_CHUNK];
     let mut bytes = 0u64;
@@ -534,10 +534,10 @@ fn oracle_commands(path: &Path) -> Vec<(String, Vec<String>)> {
 }
 
 /// The reference C decoder, `7lzma` built from `C/Util/Lzma` in the 7-Zip
-/// source tree: the binary `LZMA_FAST_7LZMA` names, or else whatever `7lzma`
+/// source tree: the binary `LZMA_TURBO_7LZMA` names, or else whatever `7lzma`
 /// the PATH offers.
 fn reference_c_decoder() -> Option<String> {
-    if let Ok(p) = std::env::var("LZMA_FAST_7LZMA")
+    if let Ok(p) = std::env::var("LZMA_TURBO_7LZMA")
         && Path::new(&p).is_file()
     {
         return Some(p);
@@ -577,11 +577,11 @@ fn time_command(cmd: &[String]) -> Option<Duration> {
 /// what the gap against `7zz t` was before it was replaced. `7zz t` checksums
 /// its output too, with its own fast implementation; this is what makes the
 /// comparison a comparison of decoders.
-struct Crc32(Option<lzma_fast::crc::Crc32>);
+struct Crc32(Option<lzma_turbo::crc::Crc32>);
 
 impl Crc32 {
     fn new() -> Self {
-        Crc32(Some(lzma_fast::crc::Crc32::new()))
+        Crc32(Some(lzma_turbo::crc::Crc32::new()))
     }
 
     fn update(&mut self, buf: &[u8]) {
@@ -591,7 +591,7 @@ impl Crc32 {
     }
 
     fn finish(&mut self) -> u32 {
-        self.0.take().map_or(0, lzma_fast::crc::Crc32::finalize)
+        self.0.take().map_or(0, lzma_turbo::crc::Crc32::finalize)
     }
 }
 
@@ -725,7 +725,7 @@ fn bench_mt(path: &Path, runs: usize, oracles: bool, threads: &[usize], checksum
             println!("  {:>7} lzma-rust2 peak RAM {}", "", human(rust2_peak));
         }
     }
-    println!("  (ratios are ours/oracle; below 1.000 means lzma-fast is faster)");
+    println!("  (ratios are ours/oracle; below 1.000 means lzma-turbo is faster)");
 }
 
 /// One segment per 16 MiB, so a checksummed run is also a segmented one: the
@@ -1006,7 +1006,7 @@ fn adaptive_decode(
     };
     let mut dec = Lzma2AdaptiveDecoder::new(dict_prop, &opts).map_err(|e| e.to_string())?;
     dec.set_chase(chase);
-    let mut crc = lzma_fast::crc::Crc32::new();
+    let mut crc = lzma_turbo::crc::Crc32::new();
     let mut total = 0u64;
     let base = alloc_watch_reset();
     let t0 = Instant::now();

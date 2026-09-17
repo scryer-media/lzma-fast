@@ -1,6 +1,6 @@
 # Decode throughput log
 
-Every entry is a measurement of `lzma-fast` against the oracles on the same
+Every entry is a measurement of `lzma-turbo` against the oracles on the same
 machine in the same session, with the commit the number belongs to. See
 [benchmarking.md](benchmarking.md) for the oracles and
 [porting.md](porting.md) for the acceptance gate: single-threaded decode
@@ -332,7 +332,7 @@ spreads, which is the useful check that these are real costs and not noise.
 
 #### The per-byte rates underneath
 
-`cargo run --release -p lzma-fast --example checksum_cost --features
+`cargo run --release -p lzma-turbo --example checksum_cost --features
 native-crypto`, a 256 MiB buffer, best of three passes, one core. The example
 was deleted after the measurement; it is reproduced here because the numbers
 are the answer to four separate questions.
@@ -612,7 +612,7 @@ in `XzOptions`, which is what the `memory_estimate` API reports.
 
 ### The adaptive decoder on a file already on disk
 
-The `sevenz-fast` fork measured `Lzma2AdaptiveDecoder` at 1.50x its own
+The `sevenz-turbo` fork measured `Lzma2AdaptiveDecoder` at 1.50x its own
 parallel path on an archive on disk and asked for a decoder that stands aside
 for its workers. `lzma-bench --adaptive` is that measurement: a 7-Zip archive
 of 897 MiB packed, fed 16 MiB at a time and drained as it goes, timed against

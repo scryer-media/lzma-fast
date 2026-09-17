@@ -1,4 +1,4 @@
-title = "lzma-fast gitleaks config"
+title = "lzma-turbo gitleaks config"
 
 [allowlist]
 description = "allow obvious examples and test placeholders"
