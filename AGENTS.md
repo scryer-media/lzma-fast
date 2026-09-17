@@ -38,7 +38,7 @@ the reference decoder. Readability that costs throughput is not wanted.
   gate does not merge, however clean it is.
 - Measure with `cargo run --release -p lzma-bench`, on an otherwise idle
   machine, at least three runs, report the median.
-- Never commit fixture bytes. `scripts/make-fixtures.sh` regenerates them.
+- Never commit fixture bytes. `cargo xtask fixtures` regenerates them.
 
 ## Repository hygiene
 

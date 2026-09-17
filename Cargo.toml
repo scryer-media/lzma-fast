@@ -12,7 +12,7 @@ categories = ["compression", "no-std"]
 # Repository scaffolding that has no business in the crate archive.
 exclude = [
     ".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
-    "asm-lab/", "bench/", "docs/", "fuzz/", "scripts/", "tools/", "xtask/", ".cargo/", "rust-toolchain.toml",
+    "asm-lab/", "bench/", "docs/", "fuzz/", "tools/", "xtask/", ".cargo/", "rust-toolchain.toml",
     # The tests share a helper with `tools/lzma-bench` and read repository
     # fixtures, so they only build from a checkout.
     "tests/",

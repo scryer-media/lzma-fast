@@ -1,7 +1,7 @@
 /target/
 /target-*/
 
-# Benchmark fixtures are generated locally (scripts/make-fixtures.sh) and are
+# Benchmark fixtures are generated locally (cargo xtask fixtures) and are
 # gigabytes of synthetic data; only the generator and its README are tracked.
 /bench/fixtures/*
 !/bench/fixtures/README.md

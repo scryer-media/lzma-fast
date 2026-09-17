@@ -15,9 +15,9 @@ this loop on this core, documented under "Performance model" below. The shipped
 
 | file | what it does |
 |---|---|
-| `build.sh` | builds the SDK `7lzma` CLI against a chosen decode loop (`./build.sh c`, `./build.sh LzmaDecOpt-stock.S`, `./build.sh variants/NN-x.S`, `PROB32=1 ./build.sh ...`) |
+| `cargo xtask asm-lab build` | builds the SDK `7lzma` CLI against a chosen decode loop (`cargo xtask asm-lab build c`, `cargo xtask asm-lab build LzmaDecOpt-stock.S`, `cargo xtask asm-lab build variants/NN-x.S`, `PROB32=1 cargo xtask asm-lab build ...`) |
 | `bench.py` | min-of-N **child user+sys CPU time** |
-| `verify.sh` | byte-exact decode of both fixtures plus 63 small `xz --format=lzma` streams across presets and lc/lp/pb |
+| `cargo xtask asm-lab verify` | byte-exact decode of both fixtures plus 63 small `xz --format=lzma` streams across presets and lc/lp/pb |
 | `mkvariant.py` | generates a variant by exact-match string edits on the stock source; a missed or ambiguous edit is a hard error, so a variant can never silently be a copy of stock |
 | `hotlabels.py` | attributes `samply` samples to asm basic blocks by raw module-relative address + `objdump` branch targets (samply will not symbolicate this static binary) |
 | `chainbench.c` | isolates the loop-carried recurrence latency of candidate range-decoder formulations |
@@ -302,7 +302,7 @@ faster** than 7-Zip's own optimised C decoder, and that is the bar to clear.
 
 ## 9. Correctness sweep
 
-`./verify.sh build/7lzma-<variant>` over both project fixtures plus 63 small
+`cargo xtask asm-lab verify asm-lab/build/7lzma-<variant>` over both project fixtures plus 63 small
 streams (7 corpora x 9 `xz --format=lzma` settings: presets 0/6/9e and
 lc/lp/pb combinations `0,0,0` / `0,2,0` / `1,1,1` / `4,0,3` / `8,0,0` and a
 1 MiB dictionary). Corpora: dictionary text (literal-heavy), urandom
