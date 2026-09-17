@@ -49,6 +49,12 @@ XzReader::new(File::open("archive.tar.xz")?)
 # }
 ```
 
+A file that is seekable decodes block-parallel with `xz::XzParallelReader`,
+and one that is still arriving decodes with `xz::XzAdaptiveDecoder`: input is
+fed as it lands, output is drained as `(offset, bytes)`, and each block is
+either handed whole to a worker or chased on the caller's thread depending on
+whether all of it has arrived.
+
 ### wasm
 
 The crate builds for `wasm32-unknown-unknown` with `--no-default-features` and

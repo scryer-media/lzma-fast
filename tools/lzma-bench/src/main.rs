@@ -25,6 +25,7 @@
 //! library has none.
 
 mod sevenz;
+mod xz;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
@@ -53,6 +54,10 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
   --threads LIST multi-threaded LZMA2: a comma-separated list of thread counts,
                  where \"all\" means this machine's available parallelism.
                  \"--threads sweep\" is shorthand for 1,2,4,8,16,all
+  --xz           treat the inputs as whole `.xz` files and time the container
+                 layer instead of one LZMA2 stream: `XzReader` sequentially,
+                 `XzParallelReader` at each `--threads` count, against
+                 `xz -dc -T<n>`, `7zz t` and the liblzma crate
   --checksum K   have the decoder's own workers checksum their output:
                  none (default), crc32, crc64 or sha256. The CRCs are cut into
                  segments every 16 MiB, so the row also shows what splitting
@@ -66,6 +71,7 @@ fn main() {
     let mut portable = false;
     let mut threads: Vec<usize> = Vec::new();
     let mut index = false;
+    let mut xz_mode = false;
     let mut checksum = Checksum::None;
     let mut files: Vec<PathBuf> = Vec::new();
 
@@ -79,6 +85,7 @@ fn main() {
                     .unwrap_or_else(|| fail("--runs needs a number"));
             }
             "--no-oracles" | "--only-ours" => oracles = false,
+            "--xz" => xz_mode = true,
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -126,6 +133,8 @@ fn main() {
     for file in &files {
         if index {
             run_index(file);
+        } else if xz_mode {
+            xz::bench(file, runs, oracles, &threads);
         } else if threads.is_empty() {
             bench_one(file, runs, oracles, portable);
         } else {

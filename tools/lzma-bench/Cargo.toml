@@ -11,3 +11,5 @@ publish = false
 [dependencies]
 lzma-fast = { workspace = true }
 lzma-rust2 = "0.20.1"
+# The C library this crate exists to replace, for the `--xz` lane only.
+liblzma = { version = "0.4.8", features = ["parallel"] }

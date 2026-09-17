@@ -64,12 +64,46 @@ with `-mmt=on`, so it has many independently decodable runs and should scale.
 decoder has to fall back to decoding it single-threaded, streaming, with no
 penalty against `7zz t -mmt=1`.
 
+### The `.xz` container
+
+```bash
+cargo run --release -p lzma-bench -- --xz bench/fixtures/p256.bin.xz
+cargo run --release -p lzma-bench -- --xz --threads sweep bench/fixtures/p256.t8.xz
+```
+
+`--xz` times whole files rather than one LZMA2 stream: `XzReader`
+sequentially, `XzParallelReader` at each `--threads` count, with headers,
+filters, checks and the index inside the measurement. The oracles are the ones
+a consumer would otherwise use - `xz -dc -T<n>`, `7zz t`, and the `liblzma`
+crate driving the C library through `lzma_stream_decoder_mt`, which is the
+call this crate exists to replace. `liblzma` is a dependency of the bench
+harness only; the library still has none.
+
+The gates:
+
+| Lane | Gate |
+| --- | --- |
+| Sequential | within 3% of `xz -dc -T1` and of `7zz t -mmt=1` |
+| Multi-block, parallel | within 5% of `xz -dc -T8`, and faster than the C library MT at 1, 2, 4, 8 and 16 threads |
+
+Only a multi-block file can be decoded in parallel at all, which is what
+`p256.t8.xz` and `p256.b16.xz` are for; `p256.bin.xz` is one block and is the
+sequential case. `multi.xz` is three streams concatenated, the shape weaver's
+decoder is configured for.
+
 ## Differential correctness
 
 `cargo test -p lzma-fast` decodes every fixture it can find under
 `bench/fixtures` and small committed vectors under `crates/lzma-fast/tests`,
 and compares the bytes with `xz -dc`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.
+
+The `decode_xz` target does the same for the container: it decodes arbitrary
+bytes as an `.xz` file with both the sequential reader and the adaptive
+decoder under a small memory limit and requires them to agree, which is what
+caught two ways of waiting forever - a block whose declared compressed size
+runs out before its end marker, and one too large to buffer under the caller's
+limit.
 
 The `decode_lzma2_mt` fuzz target is stronger than that: it decodes the same
 arbitrary bytes with the single-threaded, parallel and adaptive decoders and
