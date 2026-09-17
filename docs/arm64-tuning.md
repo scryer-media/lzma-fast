@@ -237,7 +237,7 @@ extra state, audit every `jmp` into a `BIT_*` sequence.
   from `chainbench.c` latency microbenchmarks, and from in-situ "add N dead
   instructions and measure" probes. The claims are well-replicated but they are
   inferences.
-* The machine is shared. the lab's timing helper (since removed) reported **min-of-N child CPU time**,
+* The machine is shared. The lab's timing helper (since removed) reported **min-of-N child CPU time**,
   not median wall time, specifically because other builds on the box were
   saturating all 18 cores for much of this session (load average peaked at 24).
   Quiet-box repeatability is ~±0.5%; under load ~±3%. Check `uptime` before
