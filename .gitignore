@@ -39,6 +39,7 @@
 **/fuzz/target/
 **/fuzz/artifacts/
 **/fuzz/coverage/
+**/fuzz/fuzz-*.log
 **/fuzz/Cargo.lock
 **/*.pyc
 asm-lab/build/

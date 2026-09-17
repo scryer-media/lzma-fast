@@ -16,7 +16,7 @@ lzma-fast = { path = "..", default-features = false }
 # features --features portable` fuzzes the portable Rust loop.
 [features]
 default = ["lzma-fast/default"]
-portable = ["lzma-fast/std"]
+portable = ["lzma-fast/std", "lzma-fast/crc", "lzma-fast/xz"]
 
 [[bin]]
 name = "decode_lzma"
@@ -28,6 +28,13 @@ bench = false
 [[bin]]
 name = "decode_lzma2"
 path = "fuzz_targets/decode_lzma2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_xz"
+path = "fuzz_targets/decode_xz.rs"
 test = false
 doc = false
 bench = false
