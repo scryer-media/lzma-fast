@@ -16,7 +16,8 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lzma_fast::xz::{XzOptions, XzReader};
+use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
+use std::io::Cursor;
 
 /// Compresses `data` with the `xz` binary, or `None` if it is not installed.
 ///
@@ -284,4 +285,143 @@ fn an_output_cap_stops_a_decode() {
         .expect_err("cap");
     assert!(format!("{err}").contains("cap"), "{err}");
     assert!(out.len() <= 100);
+}
+
+/// Decodes with the parallel reader at `threads`, in `chunk`-sized reads.
+fn decode_parallel(data: &[u8], threads: usize, chunk: usize) -> std::io::Result<Vec<u8>> {
+    let opts = XzOptions::default().with_threads(threads);
+    let mut r = XzParallelReader::with_options(Cursor::new(data.to_vec()), opts)?;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; chunk];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+#[test]
+fn parallel_matches_sequential_byte_for_byte() {
+    let data = payloads()
+        .into_iter()
+        .find(|(n, _)| *n == "mixed")
+        .expect("mixed")
+        .1;
+    for args in [
+        vec!["-T4", "--block-size=8192", "-1"],
+        vec!["--block-size=4096", "-1"],
+        vec!["--x86", "--block-size=16384", "-1"],
+        vec!["--delta=dist=4", "--block-size=16384", "-1"],
+        vec!["--check=sha256", "--block-size=16384", "-1"],
+        vec!["--check=none", "--block-size=16384", "-1"],
+        vec!["-1"],
+    ] {
+        let Some(stream) = xz_compress(&args, &data) else {
+            return;
+        };
+        let want = decode(&stream).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        assert_eq!(want, data, "{args:?}");
+        for threads in [1usize, 2, 8, 16] {
+            for chunk in [1usize, 7, 4095, 1 << 20] {
+                let have = decode_parallel(&stream, threads, chunk).unwrap_or_else(|e| {
+                    panic!("{args:?} at {threads} threads, chunk {chunk}: {e}")
+                });
+                assert_eq!(have, data, "{args:?} at {threads} threads, chunk {chunk}");
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_reads_concatenated_streams_and_padding() {
+    let a = b"first stream, compressible\n".repeat(400);
+    let b = b"second stream, also compressible\n".repeat(400);
+    let (Some(xa), Some(xb)) = (
+        xz_compress(&["--block-size=4096", "-1"], &a),
+        xz_compress(&["--block-size=4096", "-1"], &b),
+    ) else {
+        return;
+    };
+    let mut both = xa.clone();
+    both.extend_from_slice(&[0, 0, 0, 0]);
+    both.extend_from_slice(&xb);
+    both.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut want = a.clone();
+    want.extend_from_slice(&b);
+    for threads in [1usize, 4] {
+        assert_eq!(
+            decode_parallel(&both, threads, 1 << 16).expect("both"),
+            want
+        );
+    }
+}
+
+#[test]
+fn the_parallel_reader_degrades_threads_to_fit_its_limit() {
+    let data = common::pseudo_random(400_000, 7);
+    let Some(stream) = xz_compress(&["--block-size=32768", "-1"], &data) else {
+        return;
+    };
+    let full = XzParallelReader::with_options(
+        Cursor::new(stream.clone()),
+        XzOptions::default().with_threads(8),
+    )
+    .expect("map");
+    assert!(full.block_count() > 1);
+    let per_worker = full.memory_estimate() / full.threads() as u64;
+
+    // A limit that pays for exactly two workers must produce two, not eight.
+    let two = XzParallelReader::with_options(
+        Cursor::new(stream.clone()),
+        XzOptions::default()
+            .with_threads(8)
+            .with_memory_limit(per_worker * 2),
+    )
+    .expect("map");
+    assert_eq!(two.threads(), 2);
+    assert!(two.memory_estimate() <= per_worker * 2);
+
+    // A limit below one worker is refused rather than silently exceeded.
+    let refused = XzParallelReader::with_options(
+        Cursor::new(stream),
+        XzOptions::default().with_memory_limit(per_worker / 2),
+    );
+    match refused {
+        Ok(_) => panic!("a limit below one worker was accepted"),
+        Err(e) => assert!(
+            matches!(e.kind, lzma_fast::XzErrorKind::MemoryLimit { .. }),
+            "{e}"
+        ),
+    }
+}
+
+#[test]
+fn a_corrupt_block_fails_the_parallel_decode_without_a_panic() {
+    let data = common::pseudo_random(200_000, 11);
+    let Some(stream) = xz_compress(&["--block-size=16384", "-1"], &data) else {
+        return;
+    };
+    // Flip a byte in the middle, which is inside some block's data.
+    for at in [stream.len() / 3, stream.len() / 2, stream.len() - 40] {
+        let mut bad = stream.clone();
+        bad[at] ^= 0x40;
+        let mut out = Vec::new();
+        let r = XzParallelReader::with_options(Cursor::new(bad), XzOptions::default()).and_then(
+            |mut r| {
+                r.read_to_end(&mut out).map_err(|e| {
+                    lzma_fast::XzError::at(
+                        lzma_fast::XzErrorKind::TruncatedInput,
+                        0,
+                        e.raw_os_error().unwrap_or(0) as u64,
+                    )
+                })
+            },
+        );
+        assert!(
+            r.is_err() || out == data,
+            "corruption at {at} went unnoticed"
+        );
+    }
 }

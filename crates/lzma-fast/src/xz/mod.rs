@@ -48,6 +48,8 @@ pub mod stream;
 pub mod vli;
 
 mod blockdec;
+mod parallel;
+mod pool;
 mod reader;
 
 pub use block::{BlockHeader, MAX_BLOCK_HEADER_SIZE};
@@ -58,6 +60,7 @@ pub use index::{
     MAX_INDEX_SIZE, XzBlockEntry, XzIndex, XzIndexRecord, XzStreamIndex,
     is_single_stream_multi_block, read_stream_index_ending_at, single_stream_block_count,
 };
+pub use parallel::XzParallelReader;
 pub use reader::XzReader;
 pub use stream::{CheckType, StreamFlags, StreamFooter, StreamHeader, probe};
 

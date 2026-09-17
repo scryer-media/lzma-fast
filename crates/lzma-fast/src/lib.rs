@@ -73,7 +73,7 @@ pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memor
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 #[cfg(feature = "xz")]
-pub use xz::{XzError, XzErrorKind, XzOptions, XzReader};
+pub use xz::{XzError, XzErrorKind, XzOptions, XzParallelReader, XzReader};
 
 #[cfg(feature = "crc")]
 pub mod crc;

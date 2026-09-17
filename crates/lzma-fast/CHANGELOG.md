@@ -29,6 +29,17 @@ apart for anyone reading the history.
   never returned silently. The check is computed by whoever decoded the block,
   through the same `ChecksumPlan` machinery the LZMA2 workers use, and the
   caller's own split points are computed in the same pass.
+- `xz::XzParallelReader`: block-parallel decoding of a seekable `.xz` file,
+  ported in spirit from `C/XzDecMt.c`. The index of every stream is read
+  first, so every block's offset and both its sizes are known before anything
+  is decoded: blocks are scheduled directly, a worker's output buffer is also
+  its dictionary, and the thread count is *degraded to fit* the caller's
+  memory limit rather than the decode failing halfway through.
+  `memory_estimate`, `threads`, `block_count` and `uncompressed_size` report
+  what it will cost and what it will produce. Concatenated streams and stream
+  padding are handled by walking the file's footers backwards. The source has
+  to be `Read + Seek` but not `Send`; it is only ever read on the caller's
+  thread.
 - `xz::probe`, `xz::single_stream_block_count` and
   `xz::is_single_stream_multi_block`: structural gates over the footer and
   index that decode nothing, for a caller choosing between a sequential and a
