@@ -12,7 +12,7 @@
 use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
-use lzma_fast::{
+use lzma_turbo::{
     DrainStatus, FinishMode, Lzma2AdaptiveDecoder, Lzma2Decoder, Lzma2MtOptions,
     Lzma2ParallelDecoder, Status,
 };

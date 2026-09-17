@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lzma_fast::{Error, FinishMode, Lzma2Decoder, LzmaAloneHeader, LzmaDecoder, Status};
+use lzma_turbo::{Error, FinishMode, Lzma2Decoder, LzmaAloneHeader, LzmaDecoder, Status};
 
 pub fn data_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data")

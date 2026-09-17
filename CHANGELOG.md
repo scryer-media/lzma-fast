@@ -2,6 +2,11 @@
 
 ## 0.3.0 - 2026-09-17
 
+The crate is published as `lzma-turbo`. It was briefly on crates.io as
+`lzma-fast`, with the same contents at the same version; that name is
+withdrawn. Only the crate and library names changed: replace `lzma_fast` with
+`lzma_turbo` in paths and `lzma-fast` with `lzma-turbo` in manifests.
+
 The `.xz` container, behind the new default `xz` feature. 0.2.0's entry is
 kept below as it stands: that work is unreleased, but the container is a
 second public surface of its own size - a module, a reader, a filter set and a
@@ -75,7 +80,7 @@ apart for anyone reading the history.
   which is usually far below the dictionary the stream declares. The limits
   are listed in `docs/security.md`.
 
-### LZMA2, asked for by the `sevenz-fast` fork
+### LZMA2, asked for by the `sevenz-turbo` fork
 
 - `Lzma2AdaptiveDecoder` no longer decodes on the calling thread while a worker
   is outstanding, and `set_chase(false)` turns the chase off for a caller whose
@@ -94,7 +99,7 @@ apart for anyone reading the history.
   because nothing else would decode them.
 - `Lzma2AdaptiveDecoder::drain_upto(limit, sink)`, as on `XzAdaptiveDecoder`
   above and for the same reason.
-- `lzma_fast::run_boundaries(source, dict_prop)`: the runs of an LZMA2 stream
+- `lzma_turbo::run_boundaries(source, dict_prop)`: the runs of an LZMA2 stream
   in a `Read + Seek` source, found by seeking past chunk payloads rather than
   reading them, with the source's position restored. `Lzma2RunScanner` answers
   this for bytes as they arrive; this answers it for bytes already on disk.
@@ -128,10 +133,10 @@ apart for anyone reading the history.
   with a gigabyte fed and 1 MiB runs - what `7zz -mx1` writes for data that
   does not compress - that was most of a gigabyte moved a thousand times. It is
   now dropped once it is half the buffer, or when `feed` needs the room. A
-  1 GiB archive of that shape through the `sevenz-fast` reader at 18 threads:
+  1 GiB archive of that shape through the `sevenz-turbo` reader at 18 threads:
   4.6 s before, 1.3 s after, against 1.1 s for `7zz t`.
 
-Packaging: the crate is the repository root (it was `crates/lzma-fast`), and
+Packaging: the crate is the repository root (it was `crates/lzma-turbo`), and
 its archive carries the library, the README, the changelog and the license
 only. The tests share a helper with the benchmark tool and read repository
 fixtures, so they run from a checkout.

@@ -16,8 +16,8 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lzma_fast::DrainStatus;
-use lzma_fast::xz::{XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader};
+use lzma_turbo::DrainStatus;
+use lzma_turbo::xz::{XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader};
 use std::io::Cursor;
 
 /// Compresses `data` with the `xz` binary, or `None` if it is not installed.
@@ -28,7 +28,7 @@ use std::io::Cursor;
 fn xz_compress(args: &[&str], data: &[u8]) -> Option<Vec<u8>> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "lzma-fast-xz-{}-{}.bin",
+        "lzma-turbo-xz-{}-{}.bin",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -446,7 +446,7 @@ fn the_parallel_reader_degrades_threads_to_fit_its_limit() {
     match refused {
         Ok(_) => panic!("a limit below one worker was accepted"),
         Err(e) => assert!(
-            matches!(e.kind, lzma_fast::XzErrorKind::MemoryLimit { .. }),
+            matches!(e.kind, lzma_turbo::XzErrorKind::MemoryLimit { .. }),
             "{e}"
         ),
     }
@@ -466,8 +466,8 @@ fn a_corrupt_block_fails_the_parallel_decode_without_a_panic() {
         let r = XzParallelReader::with_options(Cursor::new(bad), XzOptions::default()).and_then(
             |mut r| {
                 r.read_to_end(&mut out).map_err(|e| {
-                    lzma_fast::XzError::at(
-                        lzma_fast::XzErrorKind::TruncatedInput,
+                    lzma_turbo::XzError::at(
+                        lzma_turbo::XzErrorKind::TruncatedInput,
                         0,
                         e.raw_os_error().unwrap_or(0) as u64,
                     )
@@ -490,7 +490,7 @@ fn decode_adaptive(
     data: &[u8],
     threads: usize,
     chunk: usize,
-) -> Result<Vec<u8>, lzma_fast::XzError> {
+) -> Result<Vec<u8>, lzma_turbo::XzError> {
     let opts = XzOptions::default().with_threads(threads);
     let mut dec = XzAdaptiveDecoder::new(opts);
     let mut out: Vec<u8> = Vec::new();
@@ -737,7 +737,7 @@ fn the_structural_gates_agree_with_xz_l_robot() {
             }),
         ] {
             let path = std::env::temp_dir()
-                .join(format!("lzma-fast-gate-{}-{name}.xz", std::process::id()));
+                .join(format!("lzma-turbo-gate-{}-{name}.xz", std::process::id()));
             std::fs::write(&path, &bytes).expect("temp file");
             let listed = xz_list(&path);
             let _ = std::fs::remove_file(&path);
@@ -747,12 +747,12 @@ fn the_structural_gates_agree_with_xz_l_robot() {
 
             // `probe` sees a stream header at byte zero either way.
             assert!(
-                lzma_fast::xz::probe(&bytes).is_some(),
+                lzma_turbo::xz::probe(&bytes).is_some(),
                 "{args:?} {name}: probe missed a stream header"
             );
 
             let mut cur = Cursor::new(&bytes);
-            let count = lzma_fast::xz::single_stream_block_count(&mut cur);
+            let count = lzma_turbo::xz::single_stream_block_count(&mut cur);
             if streams == 1 {
                 assert_eq!(
                     count,
@@ -760,14 +760,14 @@ fn the_structural_gates_agree_with_xz_l_robot() {
                     "{args:?} {name}: block count"
                 );
                 assert_eq!(
-                    lzma_fast::xz::is_single_stream_multi_block(&mut cur),
+                    lzma_turbo::xz::is_single_stream_multi_block(&mut cur),
                     blocks > 1,
                     "{args:?} {name}: multi-block gate"
                 );
             } else {
                 // More than one stream is not the shape the gate admits.
                 assert_eq!(count, None, "{args:?} {name}: multi-stream was admitted");
-                assert!(!lzma_fast::xz::is_single_stream_multi_block(&mut cur));
+                assert!(!lzma_turbo::xz::is_single_stream_multi_block(&mut cur));
             }
 
             // And the parallel reader's own view of the file agrees with xz.
@@ -864,7 +864,7 @@ fn decode_adaptive_upto(
     threads: usize,
     chunk: usize,
     limit: usize,
-) -> Result<Vec<u8>, lzma_fast::XzError> {
+) -> Result<Vec<u8>, lzma_turbo::XzError> {
     let opts = XzOptions::default().with_threads(threads);
     let mut dec = XzAdaptiveDecoder::new(opts);
     let mut out: Vec<u8> = Vec::new();
@@ -931,7 +931,7 @@ fn the_block_table_locates_every_block_a_decode_produces() {
         }
         let bytes = std::fs::read(&path).expect("read");
         let mut src = Cursor::new(bytes.clone());
-        let table = lzma_fast::xz::block_table(&mut src, u64::MAX).expect(name);
+        let table = lzma_turbo::xz::block_table(&mut src, u64::MAX).expect(name);
         assert!(!table.is_empty(), "{name} has no blocks");
 
         let mut want_offset = 0u64;

@@ -8,7 +8,7 @@ use std::{env, process::ExitCode};
 use crate::cmd::{capture, capture_all, cargo, read, repo_root, run, succeeds};
 
 /// The crate this repository publishes.
-const CRATE: &str = "lzma-fast";
+const CRATE: &str = "lzma-turbo";
 const CHANGELOG: &str = "CHANGELOG.md";
 const README: &str = "README.md";
 /// Dependencies developed in a sibling checkout. A released manifest must

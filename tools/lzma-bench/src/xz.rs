@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
+use lzma_turbo::xz::{XzOptions, XzParallelReader, XzReader};
 
 use crate::{
     CrcWriter, MtRun, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, human, median, time_command,
@@ -29,7 +29,7 @@ pub fn bench(path: &Path, runs: usize, oracles: bool, threads: &[usize]) {
     };
     let blocks = {
         let mut c = std::io::Cursor::new(&data);
-        lzma_fast::xz::single_stream_block_count(&mut c)
+        lzma_turbo::xz::single_stream_block_count(&mut c)
     };
 
     println!();

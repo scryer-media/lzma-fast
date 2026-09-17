@@ -9,8 +9,8 @@
 
 mod common;
 
-use lzma_fast::crc::{Crc32, Crc64Xz, CrcFolder, crc32, crc64_xz};
-use lzma_fast::{
+use lzma_turbo::crc::{Crc32, Crc64Xz, CrcFolder, crc32, crc64_xz};
+use lzma_turbo::{
     BlockChecks, Checksum, ChecksumPlan, DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions,
     Lzma2ParallelDecoder, Lzma2ParallelReader, Segment, SegmentCheck,
 };
@@ -347,7 +347,7 @@ fn adaptive_segments_fold_to_the_whole() {
 #[cfg(any(feature = "crypto", feature = "native-crypto"))]
 #[test]
 fn sha256_is_per_block_and_ignores_split_points() {
-    use lzma_fast::crypto::Sha256;
+    use lzma_turbo::crypto::Sha256;
 
     let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 4);
     let splits = awkward_splits(plain.len() as u64, (plain.len() / 12).max(1) as u64);

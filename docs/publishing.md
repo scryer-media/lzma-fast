@@ -19,8 +19,8 @@ runs, so a tag that reaches GitHub is one the workflow will accept.
    then pushes the tag. The workflow sees the version on crates.io, skips its
    own upload and creates the GitHub release.
 2. **Turn on trusted publishing** at
-   `https://crates.io/crates/lzma-fast/settings/new-trusted-publisher`:
-   repository owner `scryer-media`, repository `lzma-fast`, workflow
+   `https://crates.io/crates/lzma-turbo/settings/new-trusted-publisher`:
+   repository owner `scryer-media`, repository `lzma-turbo`, workflow
    `release.yml`, environment `crates-io`.
 3. **Create the `crates-io` environment** in the GitHub repository settings.
    Restricting it to tag refs `v*` is enough; no secrets are needed, the
@@ -51,5 +51,5 @@ which it requests for that job only.
    `v<version>` and pushes it.
 3. The workflow verifies the tag against the manifest, tests, publishes to
    crates.io and creates the GitHub release with the changelog section as its
-   notes. Nothing else needs doing; `sevenz-fast` is released separately once
+   notes. Nothing else needs doing; `sevenz-turbo` is released separately once
    this version is on crates.io.

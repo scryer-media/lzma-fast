@@ -59,7 +59,7 @@ struct Plan {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::Read;
-/// use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
+/// use lzma_turbo::xz::{XzOptions, XzParallelReader, XzReader};
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let file = File::open("big.tar.xz")?;

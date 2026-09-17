@@ -350,7 +350,7 @@ borrowing cases:
 
 A 7z coder's input is a bounded view of the archive's source, which is neither
 `Send` nor `'static`, so it belongs in the second row - which is where the
-`sevenz-fast` fork put it, for this reason.
+`sevenz-turbo` fork put it, for this reason.
 
 ## The chase decoder, and when it is the wrong thing
 

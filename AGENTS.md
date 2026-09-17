@@ -1,4 +1,4 @@
-# Agent and contributor rules for lzma-fast
+# Agent and contributor rules for lzma-turbo
 
 These rules apply to every automated agent and every human contributor.
 

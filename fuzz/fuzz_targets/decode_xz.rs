@@ -7,8 +7,8 @@
 use std::io::Read;
 
 use libfuzzer_sys::fuzz_target;
-use lzma_fast::xz::{XzAdaptiveDecoder, XzOptions, XzReader};
-use lzma_fast::DrainStatus;
+use lzma_turbo::xz::{XzAdaptiveDecoder, XzOptions, XzReader};
+use lzma_turbo::DrainStatus;
 
 /// Small enough that a fuzz case cannot ask for a real allocation, large
 /// enough that a `-0` stream still decodes.
@@ -91,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
             got[off..off + bytes.len()].copy_from_slice(bytes);
         });
         match status {
-            Ok(lzma_fast::DrainStatus::Finished) => break,
+            Ok(lzma_turbo::DrainStatus::Finished) => break,
             Ok(DrainStatus::NeedsMoreInput) => {
                 // The input is over and the decoder still wants some: that is
                 // the bug this asserts against.

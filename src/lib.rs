@@ -18,7 +18,7 @@
 #![cfg_attr(not(feature = "std"), doc = "```ignore")]
 //! use std::fs::File;
 //! use std::io::Read;
-//! use lzma_fast::LzmaReader;
+//! use lzma_turbo::LzmaReader;
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let mut out = Vec::new();

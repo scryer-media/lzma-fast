@@ -8,7 +8,7 @@ on:
       - main
 
 concurrency:
-  group: lzma-fast-ci-${{ github.ref }}
+  group: lzma-turbo-ci-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -124,17 +124,17 @@ jobs:
       - name: Test with the assembly decode loop (default)
         run: cargo test --locked --workspace --no-fail-fast
       - name: Test with the portable decode loop
-        run: cargo test --locked -p lzma-fast --no-default-features --features std --no-fail-fast
+        run: cargo test --locked -p lzma-turbo --no-default-features --features std --no-fail-fast
       - name: Test without std
-        run: cargo test --locked -p lzma-fast --no-default-features --no-fail-fast
+        run: cargo test --locked -p lzma-turbo --no-default-features --no-fail-fast
       # The pure-Rust crypto backend on its own: no C toolchain involved, and
       # the shape a consumer that wants none uses.
       - name: Test the RustCrypto backend alone
-        run: cargo test --locked -p lzma-fast --no-default-features --features std,native-crypto --no-fail-fast
+        run: cargo test --locked -p lzma-turbo --no-default-features --features std,native-crypto --no-fail-fast
       # Both backends compiled at once, which is what runs the differential
       # test between them.
       - name: Test both crypto backends against each other
-        run: cargo test --locked -p lzma-fast --features native-crypto --no-fail-fast
+        run: cargo test --locked -p lzma-turbo --features native-crypto --no-fail-fast
 
   wasm:
     name: wasm-${{ matrix.lane }}
@@ -165,10 +165,10 @@ jobs:
         run: |
           set -eu
           if [ -n "${{ matrix.features }}" ]; then
-            cargo check --locked -p lzma-fast --target wasm32-unknown-unknown \
+            cargo check --locked -p lzma-turbo --target wasm32-unknown-unknown \
               --no-default-features --features "${{ matrix.features }}"
           else
-            cargo check --locked -p lzma-fast --target wasm32-unknown-unknown \
+            cargo check --locked -p lzma-turbo --target wasm32-unknown-unknown \
               --no-default-features
           fi
 
@@ -188,7 +188,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - run: cargo check --locked -p lzma-fast --all-features
+      - run: cargo check --locked -p lzma-turbo --all-features
 
   package:
     name: package
@@ -204,12 +204,12 @@ jobs:
       - name: Verify the crates.io archive builds and carries no fixtures
         run: |
           set -eu
-          cargo package --locked -p lzma-fast --list > package-list.txt
+          cargo package --locked -p lzma-turbo --list > package-list.txt
           if grep -E '\.(lzma|xz|7z|bin)$' package-list.txt | grep -v '^tests/data/' ; then
             echo "fixture bytes leaked into the crate archive" >&2
             exit 1
           fi
-          cargo package --locked -p lzma-fast
+          cargo package --locked -p lzma-turbo
 
   ci-complete:
     name: ci-complete

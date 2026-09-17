@@ -10,7 +10,7 @@ mod common;
 use std::io::Read;
 
 use common::*;
-use lzma_fast::{Error, FinishMode, LzmaDecoder, LzmaProps, Status};
+use lzma_turbo::{Error, FinishMode, LzmaDecoder, LzmaProps, Status};
 
 /// Input/output chunk pairs. The small ones force the `tempBuf` and
 /// `LzmaDec_TryDummy` paths on nearly every symbol; the large ones exercise
@@ -105,7 +105,7 @@ fn reader_adapters_round_trip() {
 
         let data = read(&format!("{stem}.p9e.lzma"));
         let mut out = Vec::new();
-        lzma_fast::LzmaReader::new(std::io::Cursor::new(&data))
+        lzma_turbo::LzmaReader::new(std::io::Cursor::new(&data))
             .unwrap()
             .read_to_end(&mut out)
             .unwrap();
@@ -114,7 +114,7 @@ fn reader_adapters_round_trip() {
         let data = read(&format!("{stem}.p1.xz"));
         if let Some((dict_prop, payload)) = xz_lzma2_block(&data) {
             let mut out = Vec::new();
-            lzma_fast::Lzma2Reader::new(std::io::Cursor::new(payload), dict_prop)
+            lzma_turbo::Lzma2Reader::new(std::io::Cursor::new(payload), dict_prop)
                 .unwrap()
                 .read_to_end(&mut out)
                 .unwrap();
@@ -133,7 +133,7 @@ fn reset_restarts_a_stream() {
     let expected = read("src_text.bin");
     let data = read("text.p9e.lzma");
     let header: [u8; 13] = data[..13].try_into().unwrap();
-    let props = lzma_fast::LzmaAloneHeader::parse(&header).unwrap().props;
+    let props = lzma_turbo::LzmaAloneHeader::parse(&header).unwrap().props;
     let mut dec = LzmaDecoder::new(props).unwrap();
 
     for _ in 0..2 {
@@ -174,6 +174,6 @@ fn props_parse_matches_reference_arithmetic() {
 
 #[test]
 fn lzma2_rejects_bad_dict_prop() {
-    assert!(lzma_fast::Lzma2Decoder::new(41).is_err());
-    assert!(lzma_fast::Lzma2Decoder::new(0).is_ok());
+    assert!(lzma_turbo::Lzma2Decoder::new(41).is_err());
+    assert!(lzma_turbo::Lzma2Decoder::new(0).is_ok());
 }
