@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 - 2026-09-17
+
+- The `aarch64` decode loop's assembly file now purges every macro it defines.
+  Its macros are named after x86 mnemonics, and one of them, `shl`, is also a
+  NEON instruction. An assembler macro outlives the file that defined it, so
+  under LTO it shadowed `shl` in other crates' assembly and their build failed
+  with "too many positional arguments". Seen on `aarch64-unknown-linux`; the
+  decoder itself is unchanged.
+
 ## 0.3.1 - 2026-09-17
 
 The crate is published as `lzma-turbo`. It was briefly on crates.io as
