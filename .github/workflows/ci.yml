@@ -46,6 +46,21 @@ jobs:
             echo "test vector too large: $big" >&2
             exit 1
           fi
+      - name: Every committed vector is bytes, not text
+        run: |
+          set -eu
+          # A vector Git thinks is text has its line endings rewritten on a
+          # Windows checkout, and then the differential tests compare the
+          # decoder against bytes no encoder ever produced. `.gitattributes`
+          # marks the whole directory binary; this proves it still covers
+          # every file in it.
+          text="$(git ls-files --eol -- tests/data fuzz/corpus \
+            | grep -v '\.gitignore$' | awk '$3 != "attr/-text"')"
+          if [ -n "$text" ]; then
+            echo "these vectors are not marked binary in .gitattributes:" >&2
+            echo "$text" >&2
+            exit 1
+          fi
 
   fmt:
     name: fmt
@@ -207,8 +222,11 @@ jobs:
       - name: Verify the crates.io archive builds and carries no fixtures
         run: |
           set -eu
-          cargo package --locked -p lzma-turbo --list > package-list.txt
-          if grep -E '\.(lzma|xz|7z|bin)$' package-list.txt | grep -v '^tests/data/' ; then
+          # The listing goes outside the working tree, because the
+          # `cargo package` below refuses to run in a dirty one.
+          list="$RUNNER_TEMP/package-list.txt"
+          cargo package --locked -p lzma-turbo --list > "$list"
+          if grep -E '\.(lzma|xz|7z|bin)$' "$list" | grep -v '^tests/data/' ; then
             echo "fixture bytes leaked into the crate archive" >&2
             exit 1
           fi
