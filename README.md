@@ -65,6 +65,15 @@ portable loop), and SHA-256 has to come from `native-crypto`, because the
 default `crypto` feature builds AWS-LC's C, which wasm has no toolchain for.
 The threaded decoders need real threads and are not part of that set.
 
+### Platforms
+
+Built and tested on macOS aarch64, Linux x86-64 and windows-msvc x86-64. The
+Windows lane is built with `clang-cl` and links AWS-LC statically, both with
+its assembly generated from source by NASM (`AWS_LC_SYS_PREBUILT_NASM=0`) and
+through its prebuilt objects; the test suite is run there in the assembly
+build and in the portable (`--no-default-features --features std,crc`) build,
+and `docs/perf-log.md` carries its `.xz` numbers.
+
 ## Goal
 
 Single-threaded decode within 3% of `7zz -mmt=1` on the same input, on the

@@ -524,9 +524,8 @@ sentence on this box. Only the first is a claim about this crate.
 ## xz container
 
 Measured on x86-box (Arrow Lake-H, 16 threads, gcc 15, no AVX-512) with
-`lzma-bench --xz`, three runs, median, on 2026-09-16. The Mac was under an
-unrelated heavy load that day and its numbers are still owed; nothing below
-depends on them.
+`lzma-bench --xz`, three runs, median, on 2026-09-16. macOS aarch64 and
+windows-msvc numbers follow in their own sections below.
 
 Oracles are `xz -dc -T<n>` (5.8.3), `7zz t -mmt=1` (7-Zip 25.01) and the
 `liblzma` crate 0.4.8 driving the same C library through
@@ -644,3 +643,60 @@ available. Three changes were needed to get the other column:
 With all three, the adaptive decoder is within 3% of the ring at every thread
 count, which is the point: the fork can drop its gigabyte of read-ahead and
 use the driver whose input it can borrow.
+
+### windows-msvc
+
+Measured on windows-box (Ryzen 5 3600, 6C/12T, Windows) on 2026-09-16, same
+`lzma-bench --xz`, three runs, median. The build is `clang-cl` with AWS-LC
+linked statically; the CPU reports itself as "AMD Ryzen 5 3600 6-Core
+Processor", the toolchain is rustc 1.97.1 (8bab26f4f), and `xz` is the 5.8.1
+that ships with Git for Windows (so the oracle there is a version behind the
+Linux box's 5.8.3). The box was checked
+idle first, and nothing else of anyone's was running.
+
+| fixture | shape | `XzReader` | `xz -dc -T1` | ratio | liblzma ST |
+| --- | --- | --- | --- | --- | --- |
+| `p256.bin.xz` | 1 block | 5.028 s | 5.481 s | 0.917 | 5.706 s |
+| `p256.sha256.xz` | SHA-256 check | 5.140 s | 6.207 s | 0.828 | 6.264 s |
+| `delta.xz` | delta + LZMA2 | 5.483 s | 6.065 s | 0.904 | 6.296 s |
+| `p256.t8.xz` | 22 blocks | 5.058 s | 5.491 s | 0.921 | 5.711 s |
+
+`p256.t8.xz`, parallel:
+
+| threads | ours | MiB/s | peak RAM | `xz -T<n>` | liblzma MT | vs xz | vs liblzma |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 5.241 s | 48.8 | 33.3 MiB | 5.691 s | 5.951 s | 0.921 | 0.881 |
+| 2 | 2.702 s | 94.7 | 66.5 MiB | 2.864 s | 3.064 s | 0.943 | 0.882 |
+| 4 | 1.543 s | 165.9 | 211.4 MiB | 1.609 s | 1.718 s | 0.959 | 0.898 |
+| 8 | 0.851 s | 300.8 | 326.0 MiB | 0.922 s | 0.968 s | 0.923 | 0.879 |
+| 12 | 0.668 s | 383.0 | 405.9 MiB | 0.732 s | 0.767 s | 0.913 | 0.872 |
+| 16 | 0.721 s | 355.3 | 482.8 MiB | 0.767 s | 0.829 s | 0.939 | 0.869 |
+
+`p256.b16.xz` (16 blocks of 16 MiB), parallel:
+
+| threads | ours | MiB/s | peak RAM | `xz -T<n>` | liblzma MT | vs xz | vs liblzma |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 5.068 s | 50.5 | 44.3 MiB | 5.464 s | 5.710 s | 0.928 | 0.888 |
+| 2 | 2.615 s | 97.9 | 118.8 MiB | 2.789 s | 2.956 s | 0.937 | 0.884 |
+| 4 | 1.379 s | 185.7 | 251.6 MiB | 1.479 s | 1.534 s | 0.932 | 0.899 |
+| 8 | 0.812 s | 315.2 | 420.3 MiB | 0.881 s | 0.914 s | 0.922 | 0.889 |
+| 12 | 0.797 s | 321.3 | 420.4 MiB | 0.869 s | 0.913 s | 0.917 | 0.873 |
+| 16 | 0.660 s | 387.7 | 482.7 MiB | 0.757 s | 0.757 s | 0.872 | 0.873 |
+
+`p256.b16.xz` sequential: 5.058 s against 5.477 s (0.924) and 5.725 s for
+liblzma ST.
+
+Both gates pass on Windows as they do on Linux: every sequential fixture is
+ahead of `xz -dc -T1`, and every parallel point is ahead of both `xz -T<n>`
+and liblzma MT: the widest spread is 0.959 and the narrowest margin is still
+4%. On this 6-core part the 12- and 16-thread points are within noise of each
+other - both oracles behave the same way there - so the scaling story ends at
+about 8 real cores, as it should.
+
+The same toolchain was used to prove the AWS-LC build twice: once with its
+assembly generated from source by NASM (`AWS_LC_SYS_PREBUILT_NASM=0`, with
+`nasm.exe` visible in `cargo build -vv`) and once through the prebuilt
+objects. Both link and both decode the fixtures to the same CRC-32; the PE
+binaries themselves hash differently, which is expected of two different
+object inputs and is why the decoded content, not the binary, is the thing
+compared.

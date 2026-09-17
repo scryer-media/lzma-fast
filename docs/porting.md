@@ -386,3 +386,29 @@ limit, and anything left when `end_of_input` has been called. A decoder that
 refused these would be a decoder that hangs.
 
 C: no counterpart. `Lzma2DecMt` is given a reader and blocks on it.
+
+## Two invariants the C keeps silently
+
+Both of these were found the hard way, on corrupt or truncated input, and both
+are the kind of thing the C source states only by the order of its statements.
+
+**A block that was not pre-coded must not be coded.** `MtDec`'s worker skips
+`PreCode` for a block interrupted by an earlier block's error, and the C skips
+the code loop under the same `wasInterrupted`. `PreCode` is what lends the
+coder's output buffer to the decoder as its dictionary, so coding without it
+decodes into an empty dictionary: in the portable loop a slice index past the
+end of a zero-length buffer, in the assembly loop a store through the dangling
+pointer `Vec::new()` carries, which on aarch64 is address `0x1`. A segfault on
+one platform and `STATUS_ACCESS_VIOLATION` on another, from one missing
+condition.
+
+**The end of the input is not the end of the stream.** The chase decoder can
+stop wherever the caller's drain budget runs out, including in the middle of a
+chunk that still owes output. If the next input byte is the LZMA2 end marker,
+the input cursor is at the end of the stream while a chunk is unfinished, and
+nothing about the cursor says so. A stream may only end where the decoder is
+between chunks - `Lzma2Decoder::at_chunk_boundary`, the C's
+`LZMA2_STATE_CONTROL` - and the completion test asks for that as well as for
+the cursor. The xz adaptive decoder has this for free: a half-decoded block
+leaves it in `State::Block`, and the block's padding, check and the stream's
+index are all still ahead of it.
