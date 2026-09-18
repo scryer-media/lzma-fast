@@ -267,7 +267,9 @@ fn result(r: Result<(), String>) -> ExitCode {
 /// * `lzma-oracle`, the small harness below, which takes every setting
 ///   `tests/lzma_parity.rs` varies. `LzmaUtil` cannot: it never calls
 ///   `LzmaEnc_SetProps` with anything but the defaults, so on its own it
-///   would pin one level and one match finder.
+///   would pin one level and one match finder;
+/// * `lzma2-oracle`, the same for `C/Lzma2Enc.c`, pinned to one solid block
+///   and one thread, which is the shape this port has.
 ///
 /// Both are built with `-DZ7_ST`, which is what selects the single-threaded
 /// `LzFind.c` over `LzFindMt.c` — the same choice this port made.
@@ -275,21 +277,27 @@ pub fn lzma_util(mut args: impl Iterator<Item = String>) -> ExitCode {
     let dest = args
         .next()
         .map_or_else(|| repo_root().join("target/lzma-util"), PathBuf::from);
-    result(build_lzma_util(&dest).map(|(util, oracle)| {
-        println!("{}", util.display());
-        println!("{}", oracle.display());
+    result(build_lzma_util(&dest).map(|built| {
+        for path in built {
+            println!("{}", path.display());
+        }
     }))
 }
 
-fn build_lzma_util(dest: &Path) -> Result<(PathBuf, PathBuf), String> {
+fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     let sdk = dest.join("sdk");
     if !sdk.join("C/LzmaEnc.c").is_file() {
         git_at_commit(SDK_REPO, SDK_COMMIT, &sdk)?;
     }
     let c = sdk.join("C");
 
-    let oracle_src = dest.join("lzma-oracle.c");
-    fs::write(&oracle_src, ORACLE_C).map_err(|e| format!("write {}: {e}", oracle_src.display()))?;
+    let write_src = |name: &str, body: &str| -> Result<PathBuf, String> {
+        let path = dest.join(name);
+        fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok(path)
+    };
+    let oracle_src = write_src("lzma-oracle.c", ORACLE_C)?;
+    let oracle2_src = write_src("lzma2-oracle.c", ORACLE2_C)?;
 
     // C: the `Z7_ST` build. `-D_7ZIP_ST` is the older spelling the SDK still
     // honours; passing both keeps this working either way.
@@ -330,7 +338,18 @@ fn build_lzma_util(dest: &Path) -> Result<(PathBuf, PathBuf), String> {
     oracle_srcs.extend(core(&["Alloc.c", "CpuArch.c", "LzFind.c", "LzmaEnc.c"]));
     build(&oracle, &oracle_srcs)?;
 
-    Ok((util, oracle))
+    let oracle2 = dest.join("lzma2-oracle");
+    let mut oracle2_srcs = vec![oracle2_src];
+    oracle2_srcs.extend(core(&[
+        "Alloc.c",
+        "CpuArch.c",
+        "LzFind.c",
+        "LzmaEnc.c",
+        "Lzma2Enc.c",
+    ]));
+    build(&oracle2, &oracle2_srcs)?;
+
+    Ok(vec![util, oracle, oracle2])
 }
 
 /// A props-driven LZMA-Alone encoder over the pinned SDK. It is written out by
@@ -386,6 +405,70 @@ int main(int argc, char **argv) {
   FileOut out; out.vt.Write = FileOut_Write; out.f = fo;
   SRes res = LzmaEnc_Encode(enc, &out.vt, &in.vt, NULL, &g_Alloc, &g_Alloc);
   LzmaEnc_Destroy(enc, &g_Alloc, &g_Alloc);
+  fclose(fo);
+  if (res != SZ_OK) { fprintf(stderr, "encode res=%d\n", res); return 7; }
+  return 0;
+}
+"#;
+
+/// The LZMA2 counterpart of [`ORACLE_C`], written out the same way.
+const ORACLE2_C: &str = r#"/* Props-driven LZMA2 encoder over the pinned SDK, for parity testing. It
+   writes the single LZMA2 property byte, then the raw LZMA2 stream.
+   Usage: lzma2-oracle <level> <btMode> <numHashBytes> <lc> <lp> <pb> <fb> <dictSize> <in> <out> */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Lzma2Enc.h"
+#include "Alloc.h"
+
+typedef struct { ISeqInStream vt; const Byte *p; size_t rem; } MemIn;
+static SRes MemIn_Read(ISeqInStreamPtr pp, void *buf, size_t *size) {
+  MemIn *s = Z7_CONTAINER_FROM_VTBL(pp, MemIn, vt);
+  size_t n = *size; if (n > s->rem) n = s->rem;
+  memcpy(buf, s->p, n); s->p += n; s->rem -= n; *size = n; return SZ_OK;
+}
+typedef struct { ISeqOutStream vt; FILE *f; } FileOut;
+static size_t FileOut_Write(ISeqOutStreamPtr pp, const void *buf, size_t size) {
+  FileOut *s = Z7_CONTAINER_FROM_VTBL(pp, FileOut, vt);
+  return fwrite(buf, 1, size, s->f);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 11) { fprintf(stderr, "bad args\n"); return 2; }
+  CLzma2EncProps props; Lzma2EncProps_Init(&props);
+  props.lzmaProps.level = atoi(argv[1]);
+  props.lzmaProps.btMode = atoi(argv[2]);
+  props.lzmaProps.numHashBytes = atoi(argv[3]);
+  props.lzmaProps.lc = atoi(argv[4]);
+  props.lzmaProps.lp = atoi(argv[5]);
+  props.lzmaProps.pb = atoi(argv[6]);
+  props.lzmaProps.fb = atoi(argv[7]);
+  props.lzmaProps.dictSize = (UInt32)strtoul(argv[8], NULL, 10);
+  /* One solid block: this port has no block threads. */
+  props.blockSize = LZMA2_ENC_PROPS_BLOCK_SIZE_SOLID;
+  props.numBlockThreads_Max = 1;
+  props.numBlockThreads_Reduced = 1;
+  props.numTotalThreads = 1;
+  props.lzmaProps.numThreads = 1;
+
+  FILE *fi = fopen(argv[9], "rb"); if (!fi) return 3;
+  fseek(fi, 0, SEEK_END); long n = ftell(fi); fseek(fi, 0, SEEK_SET);
+  Byte *src = (Byte *)malloc((size_t)n + 1);
+  if (n && fread(src, 1, (size_t)n, fi) != (size_t)n) return 3;
+  fclose(fi);
+
+  FILE *fo = fopen(argv[10], "wb"); if (!fo) return 3;
+  CLzma2EncHandle enc = Lzma2Enc_Create(&g_Alloc, &g_Alloc);
+  if (!enc) return 4;
+  if (Lzma2Enc_SetProps(enc, &props) != SZ_OK) { fprintf(stderr, "setprops\n"); return 5; }
+  Lzma2Enc_SetDataSize(enc, (UInt64)n);
+  Byte prop = Lzma2Enc_WriteProperties(enc);
+  fwrite(&prop, 1, 1, fo);
+
+  MemIn in; in.vt.Read = MemIn_Read; in.p = src; in.rem = (size_t)n;
+  FileOut out; out.vt.Write = FileOut_Write; out.f = fo;
+  SRes res = Lzma2Enc_Encode2(enc, &out.vt, NULL, NULL, &in.vt, NULL, 0, NULL);
+  Lzma2Enc_Destroy(enc);
   fclose(fo);
   if (res != SZ_OK) { fprintf(stderr, "encode res=%d\n", res); return 7; }
   return 0;

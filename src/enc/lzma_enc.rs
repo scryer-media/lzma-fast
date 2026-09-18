@@ -71,7 +71,6 @@ impl Optimal {
 ///
 /// Written by `LzmaEnc_SaveState` and read by `LzmaEnc_RestoreState`, both of
 /// which only the LZMA2 encoder calls.
-#[allow(dead_code)]
 struct SaveState {
     lit_probs: Vec<u16>,
     state: u32,
@@ -1867,14 +1866,16 @@ impl LzmaEnc {
 
     /// C: `LzmaEnc_GetCurBuf`, as an offset into the match finder's window.
     ///
-    /// Only the LZMA2 encoder calls this and the three below it.
-    #[allow(dead_code)]
     pub(crate) fn get_cur_buf(&self) -> usize {
         self.mf.cur() - self.additional_offset as usize
     }
 
+    /// The match finder's window, which `get_cur_buf` indexes.
+    pub(crate) fn window(&self) -> &[u8] {
+        &self.mf.buf_base
+    }
+
     /// C: `LzmaEnc_SaveState`, through `COPY_LZMA_ENC_STATE`.
-    #[allow(dead_code)]
     pub(crate) fn save_state(&mut self) {
         let v = &mut self.save_state;
         v.state = self.state;
@@ -1895,7 +1896,6 @@ impl LzmaEnc {
     }
 
     /// C: `LzmaEnc_RestoreState`.
-    #[allow(dead_code)]
     pub(crate) fn restore_state(&mut self) {
         let v = &self.save_state;
         self.state = v.state;
@@ -1918,7 +1918,6 @@ impl LzmaEnc {
 
     /// C: `LzmaEnc_CodeOneMemBlock`, which re-initializes the range encoder
     /// for one LZMA2 chunk and reports how much it packed and unpacked.
-    #[allow(dead_code)]
     pub(crate) fn code_one_mem_block(
         &mut self,
         stream: &mut dyn SeqInStream,
@@ -1958,7 +1957,6 @@ impl LzmaEnc {
 
 /// C: `CLzmaEnc_SeqOutStreamBuf`, the bounded buffer `LzmaEnc_CodeOneMemBlock`
 /// writes into, which records an overflow rather than failing at once.
-#[allow(dead_code)]
 struct LimitedSink<'a> {
     out: &'a mut Vec<u8>,
     rem: usize,

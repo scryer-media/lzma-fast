@@ -7,6 +7,7 @@
 
 mod consts;
 mod lz_find;
+mod lzma2_enc;
 mod lzma_enc;
 mod price;
 mod props;
@@ -20,7 +21,8 @@ use lzma_enc::LzmaEnc;
 
 pub use consts::{LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN};
 pub use lz_find::MatchFinderKind;
-pub use props::LzmaEncProps;
+pub use lzma2_enc::{Lzma2Encoder, encode_lzma2};
+pub use props::{LzmaEncProps, NormalizedProps};
 pub use stream::{SeqInStream, SeqOutStream, SliceStream};
 
 /// An LZMA1 encoder.

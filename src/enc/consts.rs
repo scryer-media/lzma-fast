@@ -172,3 +172,6 @@ pub(crate) const NUM_REFS_ALIGN_MASK: usize = 0xF;
 
 const _: () = assert!(K_BLOCK_SIZE_RESERVE_MIN >= K_BLOCK_SIZE_ALIGN * 2);
 const _: () = assert!(LZMA_MATCH_LEN_MAX == 273);
+
+/// C: `LZMA2_LCLP_MAX` in `C/Lzma2Enc.c`.
+pub(crate) const LZMA2_LCLP_MAX: i32 = 4;

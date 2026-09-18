@@ -1,0 +1,130 @@
+//! The LZMA2 encoder: bit-exactness against the reference, and round trips
+//! back through this crate's own LZMA2 decoders.
+//!
+//! The reference side needs `cargo xtask lzma-util`, exactly as
+//! `tests/lzma_parity.rs` does, and skips with a message when it is missing
+//! unless `LZMA_TURBO_LZMA_UTIL_REQUIRE` is set.
+
+#![cfg(feature = "std")]
+
+mod corpus;
+
+use std::{io::Read, process::Command};
+
+use corpus::{corpus, tempdir, tool};
+use lzma_turbo::{Lzma2Encoder, Lzma2Reader, LzmaEncProps, MatchFinderKind};
+
+/// The arguments `lzma2-oracle` takes, in its order.
+fn oracle_args(props: &LzmaEncProps) -> Vec<String> {
+    let n = props.normalized();
+    [
+        n.level,
+        n.bt_mode,
+        n.num_hash_bytes,
+        n.lc,
+        n.lp,
+        n.pb,
+        n.fb,
+        n.dict_size,
+    ]
+    .iter()
+    .map(u32::to_string)
+    .collect()
+}
+
+fn settings() -> Vec<LzmaEncProps> {
+    let mut out = Vec::new();
+    for level in [0, 1, 5, 6, 9] {
+        out.push(LzmaEncProps::new().with_level(level));
+    }
+    for kind in [
+        MatchFinderKind::Hc4,
+        MatchFinderKind::Hc5,
+        MatchFinderKind::Bt2,
+        MatchFinderKind::Bt3,
+        MatchFinderKind::Bt4,
+        MatchFinderKind::Bt5,
+    ] {
+        out.push(
+            LzmaEncProps::new()
+                .with_level(6)
+                .with_match_finder(kind)
+                .with_dict_size(1 << 18),
+        );
+    }
+    // lc + lp must stay within LZMA2's limit of 4.
+    for (lc, lp, pb) in [(0, 0, 0), (0, 4, 0), (4, 0, 4), (2, 2, 1)] {
+        out.push(
+            LzmaEncProps::new()
+                .with_level(5)
+                .with_lclppb(lc, lp, pb)
+                .with_dict_size(1 << 16),
+        );
+    }
+    out
+}
+
+#[test]
+fn lzma2_round_trips_through_the_decoder() {
+    for props in settings() {
+        for (name, src) in corpus() {
+            let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+            let encoded = enc.encode_to_vec(&src).expect("encode");
+            let mut reader =
+                Lzma2Reader::new(std::io::Cursor::new(&encoded), enc.properties()).expect("reader");
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).expect("decode");
+            assert!(out == src, "round trip lost bytes on {name}");
+        }
+    }
+}
+
+#[test]
+fn lzma2_rejects_lc_plus_lp_above_four() {
+    let props = LzmaEncProps::new().with_lclppb(4, 1, 2);
+    assert!(Lzma2Encoder::new(&props).is_err());
+    assert!(Lzma2Encoder::new(&LzmaEncProps::new().with_lclppb(4, 0, 2)).is_ok());
+}
+
+#[test]
+fn lzma2_matches_the_reference_encoder() {
+    let Some(oracle) = tool("lzma2-oracle") else {
+        return;
+    };
+    let dir = tempdir("lzma2-parity");
+    let src_path = dir.join("in.bin");
+    let ref_path = dir.join("ref.lzma2");
+
+    let settings = settings();
+    let mut compared = 0usize;
+    for (name, src) in corpus() {
+        std::fs::write(&src_path, &src).unwrap();
+        for props in &settings {
+            let status = Command::new(&oracle)
+                .args(oracle_args(props))
+                .arg(&src_path)
+                .arg(&ref_path)
+                .status()
+                .expect("run the reference LZMA2 encoder");
+            assert!(status.success(), "reference failed on {name}");
+
+            let mut enc = Lzma2Encoder::new(props).expect("encoder");
+            enc.set_data_size(src.len() as u64);
+            let mut got = vec![enc.properties()];
+            let mut input = lzma_turbo::SliceStream::new(&src);
+            enc.encode(&mut input, &mut got).expect("encode");
+
+            let expected = std::fs::read(&ref_path).unwrap();
+            assert!(
+                expected == got,
+                "not bit-exact on {name}: reference {} bytes, ours {} bytes",
+                expected.len(),
+                got.len()
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 0);
+    eprintln!("compared {compared} LZMA2 streams against the reference");
+    let _ = std::fs::remove_dir_all(&dir);
+}

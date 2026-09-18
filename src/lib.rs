@@ -58,8 +58,9 @@ mod reader;
 pub mod xz;
 
 pub use enc::{
-    LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, LzmaEncProps, LzmaEncoder, MatchFinderKind,
-    SeqInStream, SeqOutStream, SliceStream, encode_lzma_alone,
+    LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder, LzmaEncProps, LzmaEncoder,
+    MatchFinderKind, NormalizedProps, SeqInStream, SeqOutStream, SliceStream, encode_lzma_alone,
+    encode_lzma2,
 };
 pub use error::{Error, FinishMode, Progress, Status};
 pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};

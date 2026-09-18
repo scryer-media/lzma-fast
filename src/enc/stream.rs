@@ -68,8 +68,6 @@ impl SeqInStream for SliceStream<'_> {
 
 /// C: `CLimitedSeqInStream` in `C/Lzma2Enc.c`, which caps one LZMA2 block's
 /// worth of input and records whether the real stream ended inside it.
-/// Only the LZMA2 encoder uses this.
-#[allow(dead_code)]
 pub(crate) struct LimitedSeqInStream<'s> {
     pub(crate) real_stream: &'s mut dyn SeqInStream,
     pub(crate) limit: u64,
@@ -79,7 +77,6 @@ pub(crate) struct LimitedSeqInStream<'s> {
 
 impl<'s> LimitedSeqInStream<'s> {
     /// C: `LimitedSeqInStream_Init`, plus the assignment of `realStream`.
-    #[allow(dead_code)]
     pub(crate) fn new(real_stream: &'s mut dyn SeqInStream) -> Self {
         LimitedSeqInStream {
             real_stream,

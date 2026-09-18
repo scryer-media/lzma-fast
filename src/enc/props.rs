@@ -192,6 +192,40 @@ impl LzmaEncProps {
         }
     }
 
+    /// This setting with every `-1` resolved, as `LzmaEncProps_Normalize`
+    /// leaves it. The reference encoder takes these numbers on its command
+    /// line, so the parity tests need to see them.
+    #[must_use]
+    pub fn normalized(&self) -> NormalizedProps {
+        let mut p = *self;
+        p.normalize();
+        NormalizedProps {
+            level: p.level as u32,
+            dict_size: p.dict_size,
+            lc: p.lc as u32,
+            lp: p.lp as u32,
+            pb: p.pb as u32,
+            fb: p.fb as u32,
+            bt_mode: p.bt_mode as u32,
+            num_hash_bytes: p.num_hash_bytes as u32,
+            mc: p.mc,
+        }
+    }
+
+    /// C: the `lc + lp > LZMA2_LCLP_MAX` check in `Lzma2Enc_SetProps`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Param`] when the sum is above 4.
+    pub(crate) fn check_lclp_for_lzma2(&self) -> Result<(), Error> {
+        let mut normalized = *self;
+        normalized.normalize();
+        if normalized.lc + normalized.lp > LZMA2_LCLP_MAX {
+            return Err(Error::Param);
+        }
+        Ok(())
+    }
+
     /// The dictionary size this setting ends up with.
     ///
     /// C: `LzmaEncProps_GetDictSize`.
@@ -201,6 +235,33 @@ impl LzmaEncProps {
         props.normalize();
         props.dict_size
     }
+}
+
+/// An [`LzmaEncProps`] with every default resolved.
+///
+/// C: a `CLzmaEncProps` after `LzmaEncProps_Normalize`, minus the fields this
+/// port does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NormalizedProps {
+    /// C: `level`.
+    pub level: u32,
+    /// C: `dictSize`.
+    pub dict_size: u32,
+    /// C: `lc`.
+    pub lc: u32,
+    /// C: `lp`.
+    pub lp: u32,
+    /// C: `pb`.
+    pub pb: u32,
+    /// C: `fb`, the number of fast bytes.
+    pub fb: u32,
+    /// C: `btMode`; 1 for a binary tree, 0 for a hash chain.
+    pub bt_mode: u32,
+    /// C: `numHashBytes`.
+    pub num_hash_bytes: u32,
+    /// C: `mc`, the match finder's cut value.
+    pub mc: u32,
 }
 
 /// C: `LzmaEnc_WriteProperties`.
