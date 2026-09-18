@@ -1,0 +1,19 @@
+[package]
+name = "sdk-oracle"
+description = "The LZMA SDK's own decoder, C and assembly, built from a pinned checkout to test lzma-turbo against"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-turbo"
+publish = false
+build = "build.rs"
+
+[dependencies]
+# Without `crypto`, so the oracle does not build AWS-LC; the decode loops are
+# all that is under test.
+lzma-turbo = { path = "../..", default-features = false, features = ["std", "asm"] }
+
+[build-dependencies]
+cc = "1.4.6"
+sha2 = "0.11.0"
