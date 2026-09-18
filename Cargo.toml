@@ -67,3 +67,13 @@ panic = "abort"
 inherits = "release"
 strip = false
 debug = 1
+
+# The tests decode real streams, and an unoptimized decoder is slow enough to
+# change what the suite can cover: one exhaustive truncation test took over
+# nineteen minutes on a CI runner, and five test invocations across five
+# feature lanes did not fit a forty-minute budget. Only the optimizer is
+# raised - `debug-assertions` and `overflow-checks` stay on, which is the part
+# a debug build is run for. `test` inherits this, so both unit and integration
+# tests get it.
+[profile.dev]
+opt-level = 2
