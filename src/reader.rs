@@ -75,6 +75,10 @@ pub struct LzmaReader<R> {
     src: Source<R>,
     dec: LzmaDecoder,
     remaining: Option<u64>,
+    /// Set once the declared uncompressed size has been produced. The stream
+    /// is not finished then: it still has to be shown to *end* there, which
+    /// [`LzmaReader::check_end`] does before `done`.
+    size_reached: bool,
     done: bool,
 }
 
@@ -94,6 +98,7 @@ impl<R: Read> LzmaReader<R> {
             src,
             dec: LzmaDecoder::new(header.props).map_err(to_io)?,
             remaining: header.uncompressed_size,
+            size_reached: header.uncompressed_size == Some(0),
             done: false,
         })
     }
@@ -113,14 +118,60 @@ impl<R: Read> LzmaReader<R> {
             src: Source::new(inner),
             dec: LzmaDecoder::new(props).map_err(to_io)?,
             remaining: uncompressed_size,
+            size_reached: uncompressed_size == Some(0),
             done: false,
         })
+    }
+
+    /// Checks that the stream really ends where the declared size said it
+    /// would, once that many bytes have been produced.
+    ///
+    /// C: liblzma's `lzma_decode` in `lzma_decoder.c`. Reaching a known
+    /// uncompressed size is not the end of the stream by itself: the range
+    /// coder is normalised and `rc_is_finished` closes the stream, and
+    /// otherwise - `eopm_is_valid` - the next symbol has to be the end
+    /// marker, while a literal or a match that would produce more output is
+    /// `LZMA_DATA_ERROR`. Here that is one more decode call with no room for
+    /// output and [`FinishMode::End`], which is what makes `LzmaDec` take its
+    /// `checkEndMarkNow` path, and it has to happen however the input
+    /// arrives: a reader fed a byte at a time reaches the size in a call that
+    /// ran out of input long before the following symbol was seen.
+    fn check_end(&mut self) -> io::Result<()> {
+        loop {
+            self.src.fill()?;
+            let input = &self.src.buf[self.src.pos..self.src.len];
+            let progress = self
+                .dec
+                .decode(input, &mut [], FinishMode::End)
+                .map_err(to_io)?;
+            self.src.pos += progress.read;
+            if matches!(
+                progress.status,
+                Status::FinishedWithMark | Status::MaybeFinishedWithoutMark
+            ) {
+                self.size_reached = false;
+                self.done = true;
+                return Ok(());
+            }
+            // No progress and nothing more to come, or nothing taken from
+            // input that is there: the end cannot be established.
+            if progress.read == 0 && (self.src.eof || self.src.pos < self.src.len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated LZMA stream",
+                ));
+            }
+        }
     }
 }
 
 impl<R: Read> Read for LzmaReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.done || out.is_empty() {
+            return Ok(0);
+        }
+        if self.size_reached {
+            self.check_end()?;
             return Ok(0);
         }
         let mut written = 0usize;
@@ -132,10 +183,6 @@ impl<R: Read> Read for LzmaReader<R> {
                 Some(r) => (out.len() as u64).min(r) as usize,
                 None => out.len(),
             };
-            if limit == 0 {
-                self.done = true;
-                return Ok(0);
-            }
             let finish = match self.remaining {
                 Some(r) if (r as usize) <= limit => FinishMode::End,
                 _ => FinishMode::Any,
@@ -150,12 +197,22 @@ impl<R: Read> Read for LzmaReader<R> {
             if let Some(r) = self.remaining.as_mut() {
                 *r -= written as u64;
                 if *r == 0 {
-                    self.done = true;
+                    self.size_reached = true;
                 }
             }
 
             match progress.status {
-                Status::FinishedWithMark => self.done = true,
+                Status::FinishedWithMark => {
+                    // C: `eopm_is_valid` in liblzma's `lzma_decoder.c`. The
+                    // end marker closes a stream of unknown size, or one whose
+                    // declared size has just been reached; arriving with output
+                    // still owed makes the stream corrupt, not finished.
+                    if self.remaining.is_some_and(|r| r > 0) {
+                        return Err(to_io(Error::CorruptData));
+                    }
+                    self.size_reached = false;
+                    self.done = true;
+                }
                 Status::NeedsMoreInput if self.src.eof && progress.read == 0 && written == 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -166,6 +223,10 @@ impl<R: Read> Read for LzmaReader<R> {
             }
 
             if written == 0 && self.done {
+                break;
+            }
+            if written == 0 && self.size_reached {
+                self.check_end()?;
                 break;
             }
             if written == 0 && progress.read == 0 && self.src.eof {

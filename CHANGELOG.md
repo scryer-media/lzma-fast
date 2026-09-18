@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.5 - 2026-09-18
+
+- `XzParallelReader` now accepts a stream with no blocks. An empty input is a
+  well-formed `.xz` file - `xz` writes one, and `good-0-empty.xz` and its
+  concatenated and padded variants are in XZ Utils' own test suite - but the
+  block plan built from the index treated an empty plan as an index that could
+  not be mapped, and the reader refused the file with `IndexMismatch` where the
+  sequential reader and the adaptive decoder both returned end of file.
+- A filter chain may use the same filter more than once. The chain validator
+  refused a repeated id, on the claim that xz's decoder refuses one;
+  `lzma_validate_chain` does no such thing - it asks for 1-4 filters, every
+  non-last filter to be usable as non-last, the last one to be usable as last,
+  and at most three size-changing filters - so `good-1-3delta-lzma2.xz`, three
+  delta filters before LZMA2, decodes with xz and was refused here as a bad
+  chain by every reader. The four-filter cap and the BCJ alignment check are
+  unchanged.
+- The parallel block workers now require the LZMA2 end marker. A block was
+  accepted once it had consumed its compressed size and produced the
+  uncompressed size the index promised, but the end-of-stream control byte is
+  inside the compressed size and a stream that stops without it is corrupt
+  however well its sizes line up. `bad-1-lzma2-11.xz` decoded through
+  `XzParallelReader` and through the threaded `XzAdaptiveDecoder`; the
+  sequential `BlockDecoder` had always refused it.
+- `LzmaReader` now refuses an end marker that arrives before the declared
+  uncompressed size. The marker closed the stream wherever it appeared, so
+  `bad-too_big_size-with_eopm.lzma` decoded short and reported success instead
+  of the data error liblzma's `eopm_is_valid` gives it.
+- `LzmaReader` now verifies the end of a known-size stream however the input
+  arrives. Reaching the declared size ended the read there and then, so
+  `bad-too_small_size-without_eopm-1.lzma`, which carries another literal after
+  that point, was caught when the reader held the whole file and missed when it
+  was fed a byte at a time. The reader now asks the decoder to
+  confirm the end, which is the range coder being finished or the next symbol
+  being the end marker, as liblzma does.
+
 ## 0.3.4 - 2026-09-17
 
 - `live_threads()` no longer undercounts. A worker was counted from its own

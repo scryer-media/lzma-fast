@@ -221,48 +221,7 @@ fn every_lzma_reader(data: &[u8]) -> Vec<(&'static str, Outcome)> {
 /// reader. Each is a decoder bug to fix; the test fails on any divergence not
 /// listed here, and on any listed one that no longer happens, so the list can
 /// only shrink.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-    // A stream with no blocks: the parallel reader's index check refuses it.
-    ("good-0-empty.xz", "XzParallelReader, 1 thread"),
-    ("good-0-empty.xz", "XzParallelReader, 4 threads"),
-    ("good-0cat-empty.xz", "XzParallelReader, 1 thread"),
-    ("good-0cat-empty.xz", "XzParallelReader, 4 threads"),
-    ("good-0catpad-empty.xz", "XzParallelReader, 1 thread"),
-    ("good-0catpad-empty.xz", "XzParallelReader, 4 threads"),
-    ("good-0pad-empty.xz", "XzParallelReader, 1 thread"),
-    ("good-0pad-empty.xz", "XzParallelReader, 4 threads"),
-    // Three Delta filters before LZMA2: a repeated filter is refused as a
-    // bad chain, which the format allows.
-    ("good-1-3delta-lzma2.xz", "XzReader"),
-    ("good-1-3delta-lzma2.xz", "XzReader, a byte at a time"),
-    ("good-1-3delta-lzma2.xz", "XzParallelReader, 1 thread"),
-    ("good-1-3delta-lzma2.xz", "XzParallelReader, 4 threads"),
-    ("good-1-3delta-lzma2.xz", "XzAdaptiveDecoder, 1 thread"),
-    (
-        "good-1-3delta-lzma2.xz",
-        "XzAdaptiveDecoder, 4 threads, 7-byte feeds",
-    ),
-    // LZMA2 that stops at the block's declared sizes without its end
-    // marker: the parallel paths take the sizes as the end.
-    ("bad-1-lzma2-11.xz", "XzParallelReader, 1 thread"),
-    ("bad-1-lzma2-11.xz", "XzParallelReader, 4 threads"),
-    (
-        "bad-1-lzma2-11.xz",
-        "XzAdaptiveDecoder, 4 threads, 7-byte feeds",
-    ),
-    // The end marker arrives before the header's declared size.
-    ("bad-too_big_size-with_eopm.lzma", "LzmaReader"),
-    (
-        "bad-too_big_size-with_eopm.lzma",
-        "LzmaReader, a byte at a time",
-    ),
-    // A literal where the end marker should be after the declared size:
-    // caught when the reader holds the whole file, missed a byte at a time.
-    (
-        "bad-too_small_size-without_eopm-1.lzma",
-        "LzmaReader, a byte at a time",
-    ),
-];
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
 
 #[test]
 fn every_xz_utils_test_file_gets_the_verdict_its_readme_gives() {
