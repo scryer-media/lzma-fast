@@ -49,6 +49,9 @@ unsafe impl GlobalAlloc for Guarded {
         let Some(base) = os::map(UNIT + data + UNIT, UNIT, data) else {
             return std::ptr::null_mut();
         };
+        // `dealloc` rounds down to UNIT to find `base`; anything else would
+        // unmap a neighbour's pages.
+        assert_eq!(base as usize % UNIT, 0, "guarded region not UNIT-aligned");
         let start = base as usize + UNIT;
         let ptr = if FRONT.load(Ordering::Relaxed) {
             start
@@ -93,28 +96,44 @@ mod os {
     #[cfg(not(target_vendor = "apple"))]
     const MAP_ANON: c_int = 0x20;
 
-    /// Reserves `total` bytes with no access and opens `len` of them at
-    /// `offset` for reading and writing.
+    /// Reserves `total` bytes with no access, starting on a `UNIT` boundary,
+    /// and opens `len` of them at `offset` for reading and writing.
+    ///
+    /// `mmap` only promises page alignment, and `dealloc` finds the region's
+    /// base by rounding down to `UNIT`, so the reservation is over-sized by a
+    /// `UNIT` and trimmed to an aligned `total` bytes.
     pub fn map(total: usize, offset: usize, len: usize) -> Option<*mut u8> {
+        let span = total + super::UNIT;
         // SAFETY: an anonymous private mapping at an address of the kernel's
-        // choosing, then a protection change inside it.
+        // choosing, the unmapping of its unaligned ends, then a protection
+        // change inside what is left.
         unsafe {
-            let base = mmap(
+            let raw = mmap(
                 std::ptr::null_mut(),
-                total,
+                span,
                 PROT_NONE,
                 MAP_PRIVATE | MAP_ANON,
                 -1,
                 0,
             );
-            if base as isize == -1 {
+            if raw as isize == -1 {
                 return None;
             }
-            if mprotect(base.cast::<u8>().add(offset).cast(), len, PROT_READ_WRITE) != 0 {
-                munmap(base, total);
+            let raw = raw.cast::<u8>();
+            let head = (raw as usize).next_multiple_of(super::UNIT) - raw as usize;
+            let base = raw.add(head);
+            if head > 0 {
+                munmap(raw.cast(), head);
+            }
+            let tail = span - head - total;
+            if tail > 0 {
+                munmap(base.add(total).cast(), tail);
+            }
+            if mprotect(base.add(offset).cast(), len, PROT_READ_WRITE) != 0 {
+                munmap(base.cast(), total);
                 return None;
             }
-            Some(base.cast())
+            Some(base)
         }
     }
 
