@@ -199,6 +199,12 @@ fn git_at_commit(repo: &str, commit: &str, dest: &Path) -> Result<(), String> {
     };
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     git(&["init", "--quiet"])?;
+    // The files are checked against pinned SHA-256s, so they must be the
+    // committed bytes. Windows runners set core.autocrlf, which would rewrite
+    // every LF on checkout; `* -text` in info/attributes outranks both that
+    // and the fetched tree's own .gitattributes.
+    git(&["config", "core.autocrlf", "false"])?;
+    fs::write(dest.join(".git/info/attributes"), "* -text\n").map_err(|e| e.to_string())?;
     git(&["fetch", "--quiet", "--depth", "1", repo, commit])?;
     git(&[
         "-c",
