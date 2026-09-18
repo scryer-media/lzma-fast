@@ -232,10 +232,83 @@ jobs:
           fi
           cargo package --locked -p lzma-turbo
 
+  # The decode loops under src/lzma/decode_opt/ are hand translations of the
+  # LZMA SDK's assembly. This job proves each shipped loop is the SDK's code:
+  # it assembles the SDK's own files with the assemblers 7-Zip builds them
+  # with, compiles the crate for every target that carries a loop, and
+  # compares the two functions (byte for byte on arm64, instruction for
+  # instruction on x86-64). Each runner brings the assemblers native to it.
+  # See docs/asm-trust.md.
+  asm-provenance:
+    name: asm-provenance-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # JWasm is the SDK's Linux x86 assembler; clang its arm64 one.
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            targets: >-
+              aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc
+              x86_64-unknown-linux-gnu x86_64-apple-darwin x86_64-pc-windows-msvc
+          # GCC's assembler as a second, non-LLVM opinion on arm64.
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc
+          # Microsoft's ml64, which the SDK's Windows build uses.
+          - platform: windows-x86_64
+            runner: windows-2025
+            targets: x86_64-unknown-linux-gnu x86_64-apple-darwin x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Standard libraries for every target checked
+        run: rustup target add ${{ matrix.targets }}
+      - name: Fetch the pinned LZMA SDK
+        run: ./.github/scripts/fetch-lzma-sdk.sh "$RUNNER_TEMP/lzma-sdk"
+      - name: Choose the reference assemblers
+        id: assemblers
+        run: |
+          set -euo pipefail
+          args=()
+          case "${{ matrix.platform }}" in
+            linux-x86_64)
+              jwasm="$(./.github/scripts/build-jwasm.sh "$RUNNER_TEMP/jwasm")"
+              args+=(--arm64-cc clang --x86 "jwasm=$jwasm")
+              ;;
+            linux-aarch64)
+              args+=(--arm64-cc gcc)
+              if command -v clang >/dev/null; then args+=(--arm64-cc clang); fi
+              ;;
+            windows-x86_64)
+              vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+              ml64="$("$vswhere" -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/ml64.exe' | head -n1)"
+              test -n "$ml64"
+              args+=(--x86 "ml64=$ml64")
+              ;;
+          esac
+          for target in ${{ matrix.targets }}; do args+=(--target "$target"); done
+          printf '%s\n' "${args[@]}" > "$RUNNER_TEMP/provenance-args"
+      - name: Compare every shipped loop with the SDK's
+        run: |
+          set -euo pipefail
+          mapfile -t args < "$RUNNER_TEMP/provenance-args"
+          cargo run --locked --release -p asm-provenance -- \
+            --sdk "$RUNNER_TEMP/lzma-sdk" "${args[@]}"
+
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
