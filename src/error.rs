@@ -39,6 +39,15 @@ pub enum Error {
     },
     /// The decode was cancelled by the caller.
     Cancelled,
+    /// C: `SZ_ERROR_PARAM`. An encoder setting is out of range.
+    Param,
+    /// C: `SZ_ERROR_READ`. The encoder's input stream failed.
+    Read,
+    /// C: `SZ_ERROR_WRITE`. The encoder's output stream failed.
+    Write,
+    /// C: `SZ_ERROR_OUTPUT_EOF`. The encoder's output buffer is too small for
+    /// the data it was asked to produce.
+    OutputEof,
 }
 
 impl fmt::Display for Error {
@@ -55,6 +64,10 @@ impl fmt::Display for Error {
                 );
             }
             Error::Cancelled => "LZMA decode cancelled",
+            Error::Param => "invalid LZMA encoder parameter",
+            Error::Read => "LZMA encoder input stream failed",
+            Error::Write => "LZMA encoder output stream failed",
+            Error::OutputEof => "LZMA encoder output buffer too small",
         };
         f.write_str(s)
     }

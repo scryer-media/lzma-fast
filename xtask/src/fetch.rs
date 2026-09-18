@@ -257,3 +257,137 @@ fn result(r: Result<(), String>) -> ExitCode {
         }
     }
 }
+
+/// The reference LZMA encoder, for the bit-exactness tests.
+///
+/// Builds two binaries from the pinned SDK into `target/lzma-util/`:
+///
+/// * `lzma`, `C/Util/Lzma/LzmaUtil.c` exactly as it ships, which encodes with
+///   `LzmaEncProps_Init`'s defaults;
+/// * `lzma-oracle`, the small harness below, which takes every setting
+///   `tests/lzma_parity.rs` varies. `LzmaUtil` cannot: it never calls
+///   `LzmaEnc_SetProps` with anything but the defaults, so on its own it
+///   would pin one level and one match finder.
+///
+/// Both are built with `-DZ7_ST`, which is what selects the single-threaded
+/// `LzFind.c` over `LzFindMt.c` — the same choice this port made.
+pub fn lzma_util(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let dest = args
+        .next()
+        .map_or_else(|| repo_root().join("target/lzma-util"), PathBuf::from);
+    result(build_lzma_util(&dest).map(|(util, oracle)| {
+        println!("{}", util.display());
+        println!("{}", oracle.display());
+    }))
+}
+
+fn build_lzma_util(dest: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let sdk = dest.join("sdk");
+    if !sdk.join("C/LzmaEnc.c").is_file() {
+        git_at_commit(SDK_REPO, SDK_COMMIT, &sdk)?;
+    }
+    let c = sdk.join("C");
+
+    let oracle_src = dest.join("lzma-oracle.c");
+    fs::write(&oracle_src, ORACLE_C).map_err(|e| format!("write {}: {e}", oracle_src.display()))?;
+
+    // C: the `Z7_ST` build. `-D_7ZIP_ST` is the older spelling the SDK still
+    // honours; passing both keeps this working either way.
+    let common: &[&str] = &["-O2", "-DZ7_ST", "-D_7ZIP_ST"];
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+
+    let build = |out: &Path, sources: &[PathBuf]| -> Result<(), String> {
+        let mut cmd = Command::new(&cc);
+        cmd.args(common).arg("-I").arg(&c).arg("-o").arg(out);
+        cmd.args(sources);
+        let st = cmd
+            .status()
+            .map_err(|e| format!("run {cc}: {e}; set CC to a C compiler"))?;
+        if !st.success() {
+            return Err(format!("{cc} failed building {}", out.display()));
+        }
+        Ok(())
+    };
+
+    let core = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| c.join(n)).collect() };
+
+    let util = dest.join("lzma");
+    let mut util_srcs = core(&[
+        "Util/Lzma/LzmaUtil.c",
+        "Alloc.c",
+        "CpuArch.c",
+        "LzFind.c",
+        "LzmaDec.c",
+        "LzmaEnc.c",
+        "7zFile.c",
+        "7zStream.c",
+    ]);
+    util_srcs.sort();
+    build(&util, &util_srcs)?;
+
+    let oracle = dest.join("lzma-oracle");
+    let mut oracle_srcs = vec![oracle_src];
+    oracle_srcs.extend(core(&["Alloc.c", "CpuArch.c", "LzFind.c", "LzmaEnc.c"]));
+    build(&oracle, &oracle_srcs)?;
+
+    Ok((util, oracle))
+}
+
+/// A props-driven LZMA-Alone encoder over the pinned SDK. It is written out by
+/// [`lzma_util`] rather than committed, so that nothing in this repository
+/// carries a copy of the reference sources.
+const ORACLE_C: &str = r#"/* Props-driven LZMA-Alone encoder over the pinned SDK, for parity testing.
+   Usage: oracle <level> <btMode> <numHashBytes> <lc> <lp> <pb> <fb> <dictSize> <in> <out> */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "LzmaEnc.h"
+#include "Alloc.h"
+
+typedef struct { ISeqInStream vt; const Byte *p; size_t rem; } MemIn;
+static SRes MemIn_Read(ISeqInStreamPtr pp, void *buf, size_t *size) {
+  MemIn *s = Z7_CONTAINER_FROM_VTBL(pp, MemIn, vt);
+  size_t n = *size; if (n > s->rem) n = s->rem;
+  memcpy(buf, s->p, n); s->p += n; s->rem -= n; *size = n; return SZ_OK;
+}
+typedef struct { ISeqOutStream vt; FILE *f; } FileOut;
+static size_t FileOut_Write(ISeqOutStreamPtr pp, const void *buf, size_t size) {
+  FileOut *s = Z7_CONTAINER_FROM_VTBL(pp, FileOut, vt);
+  return fwrite(buf, 1, size, s->f);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 11) { fprintf(stderr, "bad args\n"); return 2; }
+  CLzmaEncProps props; LzmaEncProps_Init(&props);
+  props.level = atoi(argv[1]);
+  props.btMode = atoi(argv[2]);
+  props.numHashBytes = atoi(argv[3]);
+  props.lc = atoi(argv[4]); props.lp = atoi(argv[5]); props.pb = atoi(argv[6]);
+  props.fb = atoi(argv[7]);
+  props.dictSize = (UInt32)strtoul(argv[8], NULL, 10);
+
+  FILE *fi = fopen(argv[9], "rb"); if (!fi) return 3;
+  fseek(fi, 0, SEEK_END); long n = ftell(fi); fseek(fi, 0, SEEK_SET);
+  Byte *src = (Byte *)malloc((size_t)n + 1);
+  if (n && fread(src, 1, (size_t)n, fi) != (size_t)n) return 3;
+  fclose(fi);
+
+  FILE *fo = fopen(argv[10], "wb"); if (!fo) return 3;
+  CLzmaEncHandle enc = LzmaEnc_Create(&g_Alloc);
+  if (!enc) return 4;
+  if (LzmaEnc_SetProps(enc, &props) != SZ_OK) { fprintf(stderr, "setprops\n"); return 5; }
+
+  Byte header[LZMA_PROPS_SIZE + 8]; size_t hs = LZMA_PROPS_SIZE;
+  if (LzmaEnc_WriteProperties(enc, header, &hs) != SZ_OK) return 6;
+  for (int i = 0; i < 8; i++) header[hs++] = (Byte)((UInt64)n >> (8 * i));
+  fwrite(header, 1, hs, fo);
+
+  MemIn in; in.vt.Read = MemIn_Read; in.p = src; in.rem = (size_t)n;
+  FileOut out; out.vt.Write = FileOut_Write; out.f = fo;
+  SRes res = LzmaEnc_Encode(enc, &out.vt, &in.vt, NULL, &g_Alloc, &g_Alloc);
+  LzmaEnc_Destroy(enc, &g_Alloc, &g_Alloc);
+  fclose(fo);
+  if (res != SZ_OK) { fprintf(stderr, "encode res=%d\n", res); return 7; }
+  return 0;
+}
+"#;
