@@ -98,9 +98,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/v$VERSION" --jq .sha 2>/dev/null || true)"
+          # The peeled line (^{}) names an annotated tag's commit; sorting puts
+          # it last, so it wins over the tag object's own id.
+          tagged="$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | sort -k2 | tail -n1 | cut -f1)"
           if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
             echo "::error::v$VERSION already tags $tagged, not $GITHUB_SHA"
             exit 1
