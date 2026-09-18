@@ -423,8 +423,9 @@ fn plan_blocks(streams: &[XzStreamIndex], opts: &XzOptions) -> XzResult<Vec<Plan
             ));
         }
     }
-    if blocks.is_empty() {
-        return Err(XzError::at(XzErrorKind::IndexMismatch, 0, 0));
-    }
+    // A stream with no blocks at all is well formed - `xz` writes one for an
+    // empty input - so an empty plan is a file that decodes to nothing, not a
+    // file this reader cannot map. C: `XzDecMt_Decode`, whose block loop runs
+    // zero times and still returns `SZ_OK`.
     Ok(blocks)
 }

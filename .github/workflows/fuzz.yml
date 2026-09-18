@@ -1,0 +1,71 @@
+name: fuzz
+
+# The differential target: lzma-turbo's assembly and portable loops and the
+# LZMA SDK's C and assembly loops, call for call, on fuzzer-made input. CI
+# calls this for a short run on every change; the schedule runs it for half
+# an hour a night on both architectures that carry an assembly loop.
+on:
+  workflow_call:
+    inputs:
+      seconds:
+        type: number
+        required: true
+  workflow_dispatch:
+    inputs:
+      seconds:
+        type: number
+        default: 1800
+  schedule:
+    - cron: '41 2 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-fuzz needs a nightly for the sanitizer flags; pinned, so a run is
+  # reproducible and a nightly regression is not mistaken for a finding.
+  FUZZ_TOOLCHAIN: nightly-2026-09-01
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  differential:
+    name: fuzz-differential-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Fetch the pinned LZMA SDK
+        run: cargo "+$FUZZ_TOOLCHAIN" xtask sdk "$RUNNER_TEMP/lzma-sdk"
+      - name: Build JWasm for the SDK's x86 assembly
+        if: matrix.platform == 'linux-x86_64'
+        run: echo "LZMA_ORACLE_ASSEMBLER=$(cargo "+$FUZZ_TOOLCHAIN" xtask jwasm "$RUNNER_TEMP/jwasm")" >> "$GITHUB_ENV"
+      - name: Fuzz
+        env:
+          LZMA_ORACLE_REQUIRE_ASM: "1"
+          SECONDS_TO_RUN: ${{ inputs.seconds || 1800 }}
+        run: |
+          LZMA_SDK="$RUNNER_TEMP/lzma-sdk" \
+            cargo "+$FUZZ_TOOLCHAIN" xtask fuzz-differential "$SECONDS_TO_RUN" "$RUNNER_TEMP/fuzz"
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-differential-${{ matrix.platform }}
+          path: ${{ runner.temp }}/fuzz/artifacts
+          if-no-files-found: ignore

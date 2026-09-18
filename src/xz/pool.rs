@@ -32,7 +32,7 @@ use super::block::{BlockHeader, header_size_from_first_byte};
 use super::check::{BlockCheck, RunningCheck};
 use super::error::XzErrorKind;
 use super::stream::CheckType;
-use crate::error::FinishMode;
+use crate::error::{FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 use crate::mt::checksum::ChecksumPlan;
 
@@ -293,13 +293,20 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     }
     let mut dec = Lzma2Decoder::new_probs_only(header.chain.dict_prop)?;
     dec.set_block_dic(out, want);
-    let (used, _status) = dec.decode_block(want, &bytes[header_size..data_end], FinishMode::End)?;
+    let (used, status) = dec.decode_block(want, &bytes[header_size..data_end], FinishMode::End)?;
     let produced = dec.dic_pos();
+    // Reaching the index's sizes is not the end of an LZMA2 stream: the end
+    // marker is a control byte of its own, inside the compressed size, and a
+    // block that runs out of compressed data without it is corrupt however
+    // well its sizes line up. C: `Lzma2Dec_DecodeToDic`, which only reports
+    // `LZMA_STATUS_FINISHED_WITH_MARK` from `LZMA2_STATE_FINISHED`, and the
+    // `XzUnpacker_Code` caller that will not close a block before it.
+    let marked = status == Status::FinishedWithMark;
     let mut out = dec.take_block_dic();
     // The block's boundaries came from the index, so a block that did not
     // consume exactly its compressed data, or did not produce exactly what
     // the index promised, does not match the file it came from.
-    if used != packed_len || produced != want {
+    if used != packed_len || produced != want || !marked {
         job.out = out;
         job.bytes = bytes;
         return Err(XzErrorKind::SizeMismatch);

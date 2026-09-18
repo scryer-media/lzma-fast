@@ -1,0 +1,14 @@
+[package]
+name = "asm-provenance"
+description = "Proves lzma-turbo's decode-loop assembly is the LZMA SDK's, instruction for instruction"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-turbo"
+publish = false
+
+[dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
+object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "coff", "macho", "std"] }
+sha2 = "0.11.0"
