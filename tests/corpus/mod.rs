@@ -4,6 +4,9 @@
 //! `SplitMix64`, the same generator `xtask/src/vectors.rs` builds the decoder
 //! vectors with, so one seed means one corpus on every machine.
 
+// Three integration tests include this module and each uses part of it.
+#![allow(dead_code)]
+
 /// The same SplitMix64 `xtask/src/vectors.rs` generates the decoder vectors
 /// with, so one seed means one corpus on every machine.
 struct Rng(u64);

@@ -120,20 +120,51 @@ pub(crate) struct MatchFinder {
     pub(crate) expected_data_size: u64,
 }
 
-/// C: `kCrcPoly` in `MatchFinder_Construct`.
-const K_CRC_POLY: u32 = 0xEDB8_8320;
+/// The byte table the hash functions index.
+///
+/// C: `MatchFinder_Construct` builds this from `kCrcPoly` (0xEDB88320) with
+/// the usual eight-shift loop. It is the standard reflected CRC-32 table — the
+/// same one `crate::crc`'s CRC-32 is defined over — so it is derived from that
+/// rather than written out again here.
+///
+/// The identity: a one-shot CRC-32 over the single byte `b` is
+/// `table[0xFF ^ b] ^ 0xFF00_0000`, because the init and final XOR are both
+/// `0xFFFF_FFFF` and one step of the byte-at-a-time loop is
+/// `table[(crc ^ b) & 0xFF] ^ (crc >> 8)`. Inverting it gives the entry.
+/// `the_table_is_the_reflected_crc32_table` checks it against the C's loop.
+///
+/// This is only the table. The hash *functions* over it — `HASH2_CALC` and
+/// friends, with their `kLzHash_CrcShift_*` constants — are the port's own and
+/// are not a CRC of anything.
+fn crc_table() -> [u32; 256] {
+    let mut crc = [0u32; 256];
+    for (i, slot) in crc.iter_mut().enumerate() {
+        *slot = crate::crc::crc32(&[(i as u8) ^ 0xFF]) ^ 0xFF00_0000;
+    }
+    crc
+}
+
+/// C: `cyclicBufferPos - delta + (delta > cyclicBufferPos ? cyclicBufferSize : 0)`,
+/// the wrap back around the cyclic buffer that `GetMatchesSpec1`,
+/// `SkipMatchesSpec` and `Hc_GetMatchesSpec` all open with.
+///
+/// The C evaluates it in `UInt32`, where the subtraction is allowed to wrap
+/// and the addition brings it back. Rust's `usize` subtraction is not, so the
+/// two cases are written out. `delta` is always below `cyclicBufferSize` here
+/// — `cmCheck` is what guarantees it — so the result is always in the buffer.
+#[inline]
+fn cyclic_back(cyclic_buffer_pos: usize, delta: usize, cyclic_buffer_size: u32) -> usize {
+    if cyclic_buffer_pos < delta {
+        cyclic_buffer_pos + cyclic_buffer_size as usize - delta
+    } else {
+        cyclic_buffer_pos - delta
+    }
+}
 
 impl MatchFinder {
     /// C: `MatchFinder_Construct` plus `MatchFinder_SetDefaultSettings`.
     pub(crate) fn new() -> Self {
-        let mut crc = [0u32; 256];
-        for (i, slot) in crc.iter_mut().enumerate() {
-            let mut r = i as u32;
-            for _ in 0..8 {
-                r = (r >> 1) ^ (K_CRC_POLY & (0u32.wrapping_sub(r & 1)));
-            }
-            *slot = r;
-        }
+        let crc = crc_table();
         MatchFinder {
             buffer: 0,
             pos: 0,
@@ -1172,14 +1203,8 @@ impl MatchFinder {
         if cm_check < cur_match {
             loop {
                 let delta = pos - cur_match;
-                let pair = son
-                    + ((cyclic_buffer_pos - delta as usize
-                        + if cyclic_buffer_pos < delta as usize {
-                            cyclic_buffer_size as usize
-                        } else {
-                            0
-                        })
-                        << 1);
+                let pair =
+                    son + (cyclic_back(cyclic_buffer_pos, delta as usize, cyclic_buffer_size) << 1);
                 let pb = cur - delta as usize;
                 let mut len = if len0 < len1 { len0 } else { len1 } as usize;
                 let pair0 = self.hash[pair];
@@ -1251,14 +1276,8 @@ impl MatchFinder {
         if cm_check < cur_match {
             loop {
                 let delta = pos - cur_match;
-                let pair = son
-                    + ((cyclic_buffer_pos - delta as usize
-                        + if cyclic_buffer_pos < delta as usize {
-                            cyclic_buffer_size as usize
-                        } else {
-                            0
-                        })
-                        << 1);
+                let pair =
+                    son + (cyclic_back(cyclic_buffer_pos, delta as usize, cyclic_buffer_size) << 1);
                 let pb = cur - delta as usize;
                 let mut len = if len0 < len1 { len0 } else { len1 } as usize;
                 let buf = &self.buf_base;
@@ -1325,12 +1344,8 @@ impl MatchFinder {
             if delta >= cyclic_buffer_size {
                 break;
             }
-            cur_match = self.hash[son + cyclic_buffer_pos - delta as usize
-                + if cyclic_buffer_pos < delta as usize {
-                    cyclic_buffer_size as usize
-                } else {
-                    0
-                }];
+            cur_match =
+                self.hash[son + cyclic_back(cyclic_buffer_pos, delta as usize, cyclic_buffer_size)];
             let diff = delta as usize;
             let buf = &self.buf_base;
             if buf[cur + max_len as usize] == buf[cur + max_len as usize - diff] {
@@ -1376,6 +1391,28 @@ fn normalize3(sub_value: u32, items: &mut [u32]) {
 
 #[cfg(test)]
 mod tests {
+    /// The table [`crc_table`] derives is the one `MatchFinder_Construct`
+    /// builds with its own loop over `kCrcPoly`.
+    #[test]
+    fn the_table_is_the_reflected_crc32_table() {
+        const K_CRC_POLY: u32 = 0xEDB8_8320;
+        let mut want = [0u32; 256];
+        for (i, slot) in want.iter_mut().enumerate() {
+            let mut r = i as u32;
+            for _ in 0..8 {
+                r = (r >> 1) ^ (K_CRC_POLY & (0u32.wrapping_sub(r & 1)));
+            }
+            *slot = r;
+        }
+        assert_eq!(crc_table(), want);
+        // A few entries written out, so a change to both sides at once still
+        // fails.
+        assert_eq!(want[0], 0x0000_0000);
+        assert_eq!(want[1], 0x7707_3096);
+        assert_eq!(want[128], 0xEDB8_8320);
+        assert_eq!(want[255], 0x2D02_EF8D);
+    }
+
     use super::*;
     use crate::enc::stream::SliceStream;
 

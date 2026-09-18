@@ -82,6 +82,39 @@ pub fn encoded_len(value: u64) -> usize {
     n
 }
 
+/// Encodes `value` as a VLI into the front of `buf`.
+///
+/// Returns how many bytes it used. The encoding is the shortest one, which
+/// is the only one [`decode`] accepts.
+///
+/// # Panics
+///
+/// If `value` is above [`VLI_MAX`], or `buf` is shorter than
+/// [`encoded_len`] of it.
+pub fn encode(value: u64, buf: &mut [u8]) -> usize {
+    assert!(value <= VLI_MAX, "VLI out of range");
+    let mut v = value;
+    let mut i = 0usize;
+    while v >= 0x80 {
+        buf[i] = (v as u8) | 0x80;
+        v >>= 7;
+        i += 1;
+    }
+    buf[i] = v as u8;
+    i + 1
+}
+
+/// Appends `value` to `out` as a VLI.
+///
+/// # Panics
+///
+/// If `value` is above [`VLI_MAX`].
+pub fn push(value: u64, out: &mut alloc::vec::Vec<u8>) {
+    let mut buf = [0u8; VLI_MAX_BYTES];
+    let n = encode(value, &mut buf);
+    out.extend_from_slice(&buf[..n]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +162,9 @@ mod tests {
             i += 1;
             assert_eq!(encoded_len(v), i, "len of {v}");
             assert_eq!(decode(&buf[..i]), Ok((v, i)));
+            let mut enc = [0u8; 9];
+            assert_eq!(encode(v, &mut enc), i, "encode of {v}");
+            assert_eq!(&enc[..i], &buf[..i], "encoding of {v}");
         }
     }
 }

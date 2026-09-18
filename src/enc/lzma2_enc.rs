@@ -316,4 +316,17 @@ mod tests {
         );
         assert!(out.len() > src.len() / 2);
     }
+
+    /// Reusing one encoder for several independent streams must not carry
+    /// state across, whatever the sizes are.
+    #[test]
+    fn reuse_across_streams_of_different_sizes() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let mut enc = Lzma2Encoder::new(&props).expect("new");
+        let src: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let _ = enc.encode_to_vec(&src).expect("whole");
+        for chunk in src.chunks(16 * 1024) {
+            let _ = enc.encode_to_vec(chunk).expect("encode");
+        }
+    }
 }

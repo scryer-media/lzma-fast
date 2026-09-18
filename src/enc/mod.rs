@@ -13,6 +13,10 @@ mod price;
 mod props;
 mod range_enc;
 mod stream;
+#[cfg(feature = "std")]
+mod write;
+#[cfg(feature = "xz")]
+mod xz_enc;
 
 use alloc::vec::Vec;
 
@@ -24,6 +28,12 @@ pub use lz_find::MatchFinderKind;
 pub use lzma2_enc::{Lzma2Encoder, encode_lzma2};
 pub use props::{LzmaEncProps, NormalizedProps};
 pub use stream::{SeqInStream, SeqOutStream, SliceStream};
+#[cfg(feature = "xz")]
+pub use write::XzWriter;
+#[cfg(feature = "std")]
+pub use write::{Lzma2Writer, LzmaWriter};
+#[cfg(feature = "xz")]
+pub use xz_enc::{DEFAULT_BLOCK_SIZE, XzEncoder, encode_xz};
 
 /// An LZMA1 encoder.
 ///

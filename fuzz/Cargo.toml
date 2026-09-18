@@ -20,7 +20,7 @@ sdk-oracle = { path = "../tools/sdk-oracle" }
 # features --features portable` fuzzes the portable Rust loop.
 [features]
 default = ["lzma-turbo/default"]
-portable = ["lzma-turbo/std", "lzma-turbo/crc", "lzma-turbo/xz"]
+portable = ["lzma-turbo/std", "lzma-turbo/crc", "lzma-turbo/xz", "lzma-turbo/enc", "lzma-turbo/native-crypto"]
 
 [[bin]]
 name = "decode_lzma"
@@ -46,6 +46,13 @@ bench = false
 [[bin]]
 name = "decode_lzma2_mt"
 path = "fuzz_targets/decode_lzma2_mt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_round_trip"
+path = "fuzz_targets/encode_round_trip.rs"
 test = false
 doc = false
 bench = false

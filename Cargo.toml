@@ -19,7 +19,7 @@ exclude = [
 ]
 
 [features]
-default = ["std", "asm", "crc", "crypto", "xz"]
+default = ["std", "asm", "crc", "crypto", "xz", "enc"]
 std = ["crc-fast?/std"]
 # The hand-written decode loops ported from the LZMA SDK's Asm/ tree, used on
 # aarch64 and x86_64. Turning it off falls back to the portable Rust port of
@@ -33,6 +33,12 @@ crc = ["std", "dep:crc-fast"]
 # delta filters, and the readers over them. Needs `crc`, because every xz
 # header carries a mandatory CRC-32, and `std`, because the readers are I/O.
 xz = ["std", "crc"]
+# The encoder: the port of the SDK's LzFind.c, LzmaEnc.c and Lzma2Enc.c, plus
+# the .lzma and .xz writers over it. It needs `crc`, because the match
+# finder's byte table is the standard reflected CRC-32 table and is derived
+# from `crate::crc` rather than built again; the .xz writer's checks come from
+# there too. Default, alongside `crc`.
+enc = ["crc"]
 # SHA-256, which is xz check type 10, over AWS-LC. Default, so that the
 # obvious build gets the fast, audited implementation.
 crypto = ["std", "dep:aws-lc-rs"]
