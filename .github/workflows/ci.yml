@@ -274,7 +274,7 @@ jobs:
       - name: Standard libraries for every target checked
         run: rustup target add ${{ matrix.targets }}
       - name: Fetch the pinned LZMA SDK
-        run: ./.github/scripts/fetch-lzma-sdk.sh "$RUNNER_TEMP/lzma-sdk"
+        run: cargo xtask sdk "$RUNNER_TEMP/lzma-sdk"
       - name: Choose the reference assemblers
         id: assemblers
         run: |
@@ -282,7 +282,7 @@ jobs:
           args=()
           case "${{ matrix.platform }}" in
             linux-x86_64)
-              jwasm="$(./.github/scripts/build-jwasm.sh "$RUNNER_TEMP/jwasm")"
+              jwasm="$(cargo xtask jwasm "$RUNNER_TEMP/jwasm")"
               args+=(--arm64-cc clang --x86 "jwasm=$jwasm")
               ;;
             linux-aarch64)
@@ -305,10 +305,154 @@ jobs:
           cargo run --locked --release -p asm-provenance -- \
             --sdk "$RUNNER_TEMP/lzma-sdk" "${args[@]}"
 
+  # The crate's two loops against the SDK's C and assembly ones, call for call,
+  # over the vectors, their truncations, corrupt copies and noise. macOS has
+  # no SDK assembly (its arm64 file does not assemble for Mach-O), so it
+  # compares three decoders; everywhere else the build must have all four.
+  sdk-oracle:
+    name: sdk-oracle-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            require_asm: "1"
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            require_asm: "1"
+          - platform: macos-aarch64
+            runner: macos-15
+            require_asm: "0"
+          - platform: windows-x86_64
+            runner: windows-2025
+            require_asm: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Fetch the pinned LZMA SDK
+        run: cargo xtask sdk "$RUNNER_TEMP/lzma-sdk"
+      - name: Build JWasm for the SDK's x86 assembly
+        if: matrix.platform == 'linux-x86_64'
+        run: echo "LZMA_ORACLE_ASSEMBLER=$(cargo xtask jwasm "$RUNNER_TEMP/jwasm")" >> "$GITHUB_ENV"
+      - name: Four decoders, one answer
+        env:
+          LZMA_ORACLE_REQUIRE: "1"
+          LZMA_ORACLE_REQUIRE_ASM: ${{ matrix.require_asm }}
+        run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo test --locked -p sdk-oracle
+
+  # What a sanitizer cannot give the assembly loop. `guard_pages` puts every
+  # allocation and every input slice against a no-access page, on each OS;
+  # Valgrind's memcheck, which instruments the machine code itself and so
+  # sees inside the loop, runs the asm-against-portable suite on Linux.
+  memory-safety:
+    name: memory-safety-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: windows-x86_64
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Every buffer against a guard page
+        run: cargo test --locked -p lzma-turbo --test guard_pages -- --include-ignored
+      - name: Install Valgrind
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+      - name: Both loops under Valgrind
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+        run: cargo test --locked -p lzma-turbo --test asm_parity
+
+  # Two minutes of the differential fuzz target per assembly architecture;
+  # the nightly schedule in fuzz.yml runs it for half an hour.
+  # Every committed vector and fuzz seed is what `cargo xtask vectors` makes
+  # from sources it generates, with the xz the container tests pin; a blob
+  # that file does not explain does not get in.
+  vectors:
+    name: vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install the pinned xz
+        run: ./.github/scripts/install-xz.sh
+      - name: Regenerate and compare
+        run: cargo xtask vectors --check
+
+  # XZ Utils' own decoder test files, fetched from the pinned release and
+  # checked file by file against tests/xz-utils.manifest, through every reader.
+  xz-utils-suite:
+    name: xz-utils-suite-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: windows-x86_64
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Fetch the XZ Utils test files
+        run: cargo xtask xz-tests
+      - name: Every verdict the README gives
+        env:
+          LZMA_TURBO_XZ_TESTS_REQUIRE: "1"
+        run: cargo test --locked -p lzma-turbo --test xz_utils
+
+  fuzz-differential:
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: 120
+
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, fuzz-differential]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
