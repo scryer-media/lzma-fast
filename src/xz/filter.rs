@@ -109,9 +109,15 @@ impl FilterChain {
     /// # Errors
     ///
     /// [`XzErrorKind::BadFilterChain`] if there is not exactly one last-filter
-    /// (LZMA2) and it is not last, if a non-last filter appears last, if a
-    /// filter is repeated, if there are more than four, or if a BCJ start
-    /// offset is misaligned. Spec §5.2 and §5.3.
+    /// (LZMA2) and it is not last, if a non-last filter appears last, if there
+    /// are more than four, or if a BCJ start offset is misaligned. Spec §5.2
+    /// and §5.3.
+    ///
+    /// A filter may appear more than once: `lzma_validate_chain` in liblzma's
+    /// `filter_common.c` asks only for 1-4 filters, every non-last one to be
+    /// allowed as non-last, the last one to be allowed as last, and at most
+    /// three size-changing filters - and delta and the BCJ family change no
+    /// sizes, so a chain of three deltas before LZMA2 is one xz decodes.
     pub fn validate(filters: &[FilterFlags]) -> Result<Self, XzErrorKind> {
         if filters.is_empty() || filters.len() > MAX_FILTERS {
             return Err(XzErrorKind::BadFilterChain);
@@ -125,14 +131,9 @@ impl FilterChain {
             // dictionaries over 4 GiB.
             return Err(XzErrorKind::BadFilterChain);
         }
-        for (i, f) in rest.iter().enumerate() {
+        for f in rest {
             if f.id == FILTER_LZMA2 {
                 // A last-only filter used as a non-last one.
-                return Err(XzErrorKind::BadFilterChain);
-            }
-            if rest[..i].iter().any(|g| g.id == f.id) {
-                // Spec §5.2 allows chaining but not a filter twice: xz's own
-                // encoder never emits one and its decoder refuses one.
                 return Err(XzErrorKind::BadFilterChain);
             }
             if let Some(kind) = BcjKind::from_filter_id(f.id) {
@@ -323,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_must_end_in_lzma2_and_may_not_repeat_a_filter() {
+    fn a_chain_must_end_in_lzma2_and_may_repeat_a_filter() {
         assert!(FilterChain::validate(&[flags(FILTER_LZMA2, &[20])]).is_ok());
         assert!(FilterChain::validate(&[flags(0x04, &[]), flags(FILTER_LZMA2, &[20])]).is_ok());
         // LZMA2 first is a last-filter used as a non-last one.
@@ -336,14 +337,24 @@ mod tests {
             FilterChain::validate(&[flags(0x04, &[])]),
             Err(XzErrorKind::BadFilterChain)
         );
-        // The same converter twice.
-        assert_eq!(
+        // The same converter twice, which the format allows: good-1-3delta
+        // -lzma2.xz in XZ Utils' own test files stacks three deltas.
+        assert!(
             FilterChain::validate(&[
                 flags(0x04, &[]),
                 flags(0x04, &[]),
                 flags(FILTER_LZMA2, &[20])
-            ]),
-            Err(XzErrorKind::BadFilterChain)
+            ])
+            .is_ok()
+        );
+        assert!(
+            FilterChain::validate(&[
+                flags(FILTER_DELTA, &[0]),
+                flags(FILTER_DELTA, &[1]),
+                flags(FILTER_DELTA, &[2]),
+                flags(FILTER_LZMA2, &[20])
+            ])
+            .is_ok()
         );
         // Five filters.
         assert_eq!(
