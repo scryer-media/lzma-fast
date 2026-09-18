@@ -9,7 +9,6 @@ mod fuzz;
 mod hooks;
 mod release;
 mod rng;
-mod sha256;
 mod vectors;
 
 use std::{env, process::ExitCode};

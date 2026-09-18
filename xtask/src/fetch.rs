@@ -14,7 +14,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use crate::{cmd::repo_root, sha256};
+use crate::cmd::repo_root;
 
 /// The LZMA SDK source the decode loops were ported from (tag 26.03).
 /// tools/asm-provenance and tools/sdk-oracle pin the SHA-256 of every file
@@ -143,7 +143,7 @@ fn xz_tests_into(root: &Path, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     for (file, digest) in &manifest {
         let bytes = fs::read(extracted.join(file)).map_err(|e| format!("read {file}: {e}"))?;
-        let actual = sha256::hex(&bytes);
+        let actual = sha256_hex(&bytes);
         if &actual != digest {
             return Err(format!(
                 "{file}: SHA-256 {actual}, the manifest says {digest}"
@@ -241,7 +241,7 @@ fn download(url: &str, to: &Path, digest: &str) -> Result<(), String> {
         return Err(format!("download of {url} failed"));
     }
     let bytes = fs::read(to).map_err(|e| e.to_string())?;
-    let actual = sha256::hex(&bytes);
+    let actual = sha256_hex(&bytes);
     if actual != digest {
         return Err(format!("{url}: SHA-256 {actual}, pinned {digest}"));
     }
@@ -474,3 +474,15 @@ int main(int argc, char **argv) {
   return 0;
 }
 "#;
+
+/// The SHA-256 of `data`, as lowercase hex, for comparing a download with the
+/// digest pinned above.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(data);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
