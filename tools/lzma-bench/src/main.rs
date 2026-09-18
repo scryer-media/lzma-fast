@@ -24,6 +24,7 @@
 //! at each of them. lzma-rust2 is a dependency of this harness only; the
 //! library has none.
 
+mod encode;
 mod sevenz;
 mod xz;
 
@@ -60,6 +61,11 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
                  layer instead of one LZMA2 stream: `XzReader` sequentially,
                  `XzParallelReader` at each `--threads` count, against
                  `xz -dc -T<n>`, `7zz t` and the liblzma crate
+  --encode LIST  encode instead of decode: compress each input (raw bytes) to
+                 `.xz` at each preset in the list, or \"sweep\" for 1,3,5,6,9,
+                 and time it against `xz -T1 -N` on the same data. Both the
+                 time and the output size are reported, because one without
+                 the other says nothing about a compressor.
   --checksum K   have the decoder's own workers checksum their output:
                  none (default), crc32, crc64 or sha256. The CRCs are cut into
                  segments every 16 MiB, so the row also shows what splitting
@@ -76,6 +82,7 @@ fn main() {
     let mut xz_mode = false;
     let mut adaptive = false;
     let mut checksum = Checksum::None;
+    let mut presets: Vec<u32> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -90,6 +97,10 @@ fn main() {
             "--no-oracles" | "--only-ours" => oracles = false,
             "--xz" => xz_mode = true,
             "--adaptive" => adaptive = true,
+            "--encode" => {
+                let v = args.next().unwrap_or_else(|| fail("--encode needs a list"));
+                presets = encode::parse_presets(&v);
+            }
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -135,7 +146,9 @@ fn main() {
     );
 
     for file in &files {
-        if index {
+        if !presets.is_empty() {
+            encode::bench(file, runs, oracles, &presets);
+        } else if index {
             run_index(file);
         } else if adaptive {
             bench_adaptive(file, runs, &threads);

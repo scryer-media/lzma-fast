@@ -444,6 +444,54 @@ jobs:
           LZMA_TURBO_XZ_TESTS_REQUIRE: "1"
         run: cargo test --locked -p lzma-turbo --test xz_utils
 
+  encoder-parity:
+    name: encoder-parity-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: windows-x86_64
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The external-decode test compares this crate's output with what `xz`
+      # makes of it; without `xz` on PATH it skips, so Linux gets the same
+      # pinned build the container tests use.
+      - name: Install the xz the container tests are written against
+        if: runner.os == 'Linux'
+        run: ./.github/scripts/install-xz.sh
+      # `cargo xtask lzma-util` builds LzmaUtil and the two props-driven
+      # oracles from the pinned SDK sources with gcc-style flags. The Windows
+      # image has MinGW's gcc but no `cc`.
+      - name: Build the reference encoder from the pinned SDK
+        env:
+          CC: ${{ runner.os == 'Windows' && 'gcc' || 'cc' }}
+        run: cargo xtask lzma-util
+      # The encoder must be bit-exact with the reference at every setting, so
+      # a missing oracle is a failure here rather than a skip.
+      - name: Bit-exact with the reference encoder
+        env:
+          LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
+        run: cargo test --locked --release -p lzma-turbo --test lzma_parity --test lzma2_encoder
+      - name: The .xz writer through every reader, and through xz itself
+        run: cargo test --locked --release -p lzma-turbo --test xz_encoder
+
   fuzz-differential:
     uses: ./.github/workflows/fuzz.yml
     with:
@@ -452,7 +500,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, fuzz-differential]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, encoder-parity, fuzz-differential]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -4,13 +4,14 @@
 [![crates.io](https://img.shields.io/crates/v/lzma-turbo.svg)](https://crates.io/crates/lzma-turbo)
 [![docs.rs](https://docs.rs/lzma-turbo/badge.svg)](https://docs.rs/lzma-turbo)
 
-LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for
-its speed, including its hand-written `aarch64` and `x86_64` decode loops. No
-C bindings, no build script, no encoder.
+LZMA and LZMA2 in Rust, ported from the 7-Zip reference implementation for its
+speed, including its hand-written `aarch64` and `x86_64` decode loops. The
+encoder is a port too, and is bit-exact with the SDK's. No C bindings, no
+build script.
 
 ```toml
 [dependencies]
-lzma-turbo = "0.3"
+lzma-turbo = "0.4"
 ```
 
 ## Reading an `.xz` file
@@ -81,7 +82,7 @@ and Windows rows, are in
 
 ## Status
 
-The decoder is real: LZMA1 and LZMA2, decode only, ported function by function
+The decoder is real: LZMA1 and LZMA2, ported function by function
 from the reference decoder. It is byte-identical to
 `xz -dc` on the repository's fixtures (256 MiB LZMA1, 1 GiB LZMA1, 256 MiB
 LZMA2) and on the committed vectors, including non-default `lc`/`lp`/`pb`, and
@@ -117,6 +118,16 @@ induces on every other worker — measured at 16% of an eight-thread decode.
 SHA-256 cannot be folded, so it is offered per whole block only, which is the
 unit an xz stream checks.
 
+The encoder is a port of the same SDK's `LzFind.c`, `LzmaEnc.c` and
+`Lzma2Enc.c`, behind the default `enc` feature: the six match finders, the
+optimal parser and the LZMA2 chunk layer, with `.lzma` and `.xz` writers and
+`std::io::Write` adapters over them. It is bit-exact with the reference
+encoder — the same input at the same settings produces the same bytes — and
+the parity tests check that against binaries built from the pinned SDK sources
+over a generated corpus. What was left out, and how the frame around the
+compressed data is proved instead, is in
+[docs/encoder.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/encoder.md).
+
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md);
 see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/porting.md) for the plan.
@@ -129,6 +140,7 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
 | `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders |
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
+| `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, `XzEncoder`, the `.lzma`/`.xz` writers and the `Write` adapters; implies `crc` |
 | `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the filters, the checks and the index; implies `std` and `crc` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 
@@ -146,7 +158,7 @@ and a check is one of CRC-32, CRC-64/XZ or SHA-256. `crypto` builds AWS-LC,
 which needs a C toolchain and CMake; a build that wants neither takes
 
 ```toml
-lzma-turbo = { version = "0.3", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+lzma-turbo = { version = "0.4", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
 ```
 
 which is pure Rust and works wherever the decoder does. `native-crypto` wins
@@ -178,8 +190,9 @@ and `docs/perf-log.md` carries its `.xz` numbers.
 | Path | What |
 | --- | --- |
 | [`src`](src), [`tests`](tests), [`fuzz`](fuzz) | The library crate (published to crates.io), its tests and its fuzz targets. |
-| [`tools/lzma-bench`](tools/lzma-bench) | Decode-throughput harness used for the acceptance gate. Not published. |
+| [`tools/lzma-bench`](tools/lzma-bench) | Decode- and encode-throughput harness used for the acceptance gate. Not published. |
 | [`docs/porting.md`](docs/porting.md) | Port rules, C-to-Rust file map, acceptance gate. |
+| [`docs/encoder.md`](docs/encoder.md) | The encoder port: C-to-Rust file map, what was left out, how parity is proved. |
 | [`docs/benchmarking.md`](docs/benchmarking.md) | Fixtures, oracles and how to reproduce a measurement. |
 | [`docs/security.md`](docs/security.md) | Every limit the container layer enforces, and what each one stops. |
 | [`docs/publishing.md`](docs/publishing.md) | Release checklist. |
