@@ -205,31 +205,53 @@ impl BlockDecoder {
 
         // The buffered path: LZMA2 into scratch, scratch through the
         // converters, converted bytes into `pending`.
-        let want = self.room(SCRATCH)?;
-        let finish = if want == 0 {
-            FinishMode::End
-        } else {
-            FinishMode::Any
-        };
-        if self.scratch.len() < want {
-            self.scratch.resize(want, 0u8);
-        }
-        let mut scratch = core::mem::take(&mut self.scratch);
-        let decoded = self.decode_lzma2(input, &mut scratch[..want], finish);
-        self.scratch = scratch;
-        let p = decoded?;
-        self.packed += p.read as u64;
-        let produced = &self.scratch[..p.written];
-        if p.status == Status::FinishedWithMark {
-            self.converters.finish(produced, &mut self.pending);
-        } else {
-            self.converters.push(produced, &mut self.pending);
-        }
-        self.unpacked += self.pending.len() as u64;
-        self.check.update(&self.pending);
-        self.note(p.status)?;
-        if want == 0 && !self.finished {
-            return Err(self.at_capacity());
+        //
+        // The loop is what keeps this function's contract true. A converter
+        // can swallow everything LZMA2 produced — the last bytes of a block
+        // whose size is not a whole number of instructions go into its carry
+        // and come out only when the block ends — and LZMA2 can produce those
+        // bytes out of what it already holds, reading no new input. That step
+        // would otherwise return `(0, 0)`, which every caller reads as "give
+        // me more input"; a caller with no more input to give then calls the
+        // block truncated. So keep going until something reaches `pending`,
+        // the block ends, or a call genuinely makes no progress at all.
+        let mut consumed = 0usize;
+        loop {
+            let want = self.room(SCRATCH)?;
+            let finish = if want == 0 {
+                FinishMode::End
+            } else {
+                FinishMode::Any
+            };
+            if self.scratch.len() < want {
+                self.scratch.resize(want, 0u8);
+            }
+            let mut scratch = core::mem::take(&mut self.scratch);
+            let decoded = self.decode_lzma2(&input[consumed..], &mut scratch[..want], finish);
+            self.scratch = scratch;
+            let p = decoded?;
+            consumed += p.read;
+            self.packed += p.read as u64;
+            let produced = &self.scratch[..p.written];
+            let before = self.pending.len();
+            if p.status == Status::FinishedWithMark {
+                self.converters.finish(produced, &mut self.pending);
+            } else {
+                self.converters.push(produced, &mut self.pending);
+            }
+            self.unpacked += (self.pending.len() - before) as u64;
+            self.check.update(&self.pending[before..]);
+            self.note(p.status)?;
+            if want == 0 && !self.finished {
+                return Err(self.at_capacity());
+            }
+            if !self.pending.is_empty() || self.finished {
+                break;
+            }
+            if p.read == 0 && p.written == 0 {
+                // Nothing moved: the block really is waiting for input.
+                break;
+            }
         }
 
         let n = self.pending.len().min(out.len());
@@ -239,7 +261,7 @@ impl BlockDecoder {
             self.pending.clear();
             self.pending_pos = 0;
         }
-        Ok((p.read, n))
+        Ok((consumed, n))
     }
 
     /// One LZMA2 call, with its failure read for what it means here.
