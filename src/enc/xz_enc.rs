@@ -88,15 +88,29 @@ pub struct XzEncoder {
     check: CheckType,
     block_size: u64,
     lzma2: Lzma2Encoder,
+    /// Kept so that the block threads can each build their own encoder.
+    props: LzmaEncProps,
     /// The non-last filters, in the order they are applied and listed, empty
     /// for a bare LZMA2 chain.
     filters: Vec<FilterFlags>,
     /// Bytes waiting to become a block.
     pending: Vec<u8>,
+    /// The last block's buffer, kept to be refilled rather than reallocated.
+    spare: Vec<u8>,
     /// One `(unpadded size, uncompressed size)` per block written. Spec §4.2.
     records: Vec<(u64, u64)>,
     out: Vec<u8>,
     finished: bool,
+    /// How many blocks may be compressed at once. One is the default and is
+    /// the path this writer took before threads existed.
+    threads: usize,
+    /// Whole blocks waiting for the next parallel batch, in stream order.
+    #[cfg(feature = "std")]
+    queue: Vec<Vec<u8>>,
+    /// One LZMA2 encoder per block thread, built on first use and reused
+    /// across batches — the dictionary and hash tables are the expensive part.
+    #[cfg(feature = "std")]
+    pool: Vec<Lzma2Encoder>,
 }
 
 impl XzEncoder {
@@ -113,11 +127,18 @@ impl XzEncoder {
             check: CheckType::Crc64,
             block_size: DEFAULT_BLOCK_SIZE,
             lzma2,
+            props: *props,
             filters: Vec::new(),
             pending: Vec::new(),
+            spare: Vec::new(),
             records: Vec::new(),
             out: Vec::new(),
             finished: false,
+            threads: 1,
+            #[cfg(feature = "std")]
+            queue: Vec::new(),
+            #[cfg(feature = "std")]
+            pool: Vec::new(),
         };
         enc.write_stream_header();
         Ok(enc)
@@ -185,19 +206,7 @@ impl XzEncoder {
     /// The whole chain — the given filters plus this encoder's LZMA2 filter —
     /// validated the way [`crate::xz`] validates one it has just parsed.
     fn chain_for(&self, filters: &[FilterFlags]) -> Result<FilterChain, Error> {
-        let mut whole: Vec<FilterFlags> = Vec::new();
-        whole
-            .try_reserve(filters.len() + 1)
-            .map_err(|_| Error::Alloc)?;
-        whole.extend_from_slice(filters);
-        let mut props = [0u8; 4];
-        props[0] = self.lzma2.properties();
-        whole.push(FilterFlags {
-            id: FILTER_LZMA2,
-            props,
-            props_len: 1,
-        });
-        FilterChain::validate(&whole).map_err(|_| Error::Param)
+        chain_for_props(filters, self.lzma2.properties())
     }
 
     /// How much a single block may decode to before the writer starts
@@ -208,6 +217,23 @@ impl XzEncoder {
         } else {
             bytes
         };
+    }
+
+    /// How many blocks may be compressed at once.
+    ///
+    /// `.xz` blocks are independent by construction, so this changes only how
+    /// fast the stream is produced, never what it contains: at a given block
+    /// size the bytes are identical at one thread and at sixteen. It has no
+    /// effect while the block size is [`DEFAULT_BLOCK_SIZE`], because then
+    /// there is only ever one block.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    /// The thread count set with [`XzEncoder::set_threads`].
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// The bytes produced so far, which the caller now owns.
@@ -238,8 +264,64 @@ impl XzEncoder {
             self.pending.extend_from_slice(&data[..take]);
             data = &data[take..];
             if self.pending.len() as u64 >= self.block_size {
-                self.emit_block()?;
+                self.block_ready()?;
             }
+        }
+        Ok(())
+    }
+
+    /// [`XzEncoder::pending`] holds a whole block: compress it now, or queue
+    /// it for the next parallel batch.
+    fn block_ready(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "std")]
+        if self.threads > 1 {
+            let block = core::mem::take(&mut self.pending);
+            self.queue.try_reserve(1).map_err(|_| Error::Alloc)?;
+            self.queue.push(block);
+            if self.queue.len() >= self.threads {
+                return self.flush_queue();
+            }
+            return Ok(());
+        }
+        self.emit_block()
+    }
+
+    /// Compresses every queued block at once and appends them in order.
+    ///
+    /// Each block gets its own LZMA2 encoder and its own filter converters,
+    /// exactly as [`XzEncoder::emit_block`] builds them, so a block's bytes do
+    /// not depend on which thread produced it or on what came before.
+    #[cfg(feature = "std")]
+    fn flush_queue(&mut self) -> Result<(), Error> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        let want = self.queue.len();
+        while self.pool.len() < want {
+            self.pool.try_reserve(1).map_err(|_| Error::Alloc)?;
+            let enc = Lzma2Encoder::new(&self.props)?;
+            self.pool.push(enc);
+        }
+
+        let (check, filters, dict_prop) = (self.check, &self.filters, self.lzma2.properties());
+        let queue = core::mem::take(&mut self.queue);
+        let mut done: Vec<Result<Block, Error>> = Vec::new();
+        done.try_reserve_exact(want).map_err(|_| Error::Alloc)?;
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(want);
+            for (enc, data) in self.pool.iter_mut().zip(queue) {
+                handles.push(
+                    scope.spawn(move || compress_block(enc, check, filters, dict_prop, data)),
+                );
+            }
+            for h in handles {
+                done.push(h.join().unwrap_or(Err(Error::InternalFailure)));
+            }
+        });
+
+        for block in done {
+            self.append_block(block?)?;
         }
         Ok(())
     }
@@ -256,8 +338,10 @@ impl XzEncoder {
             return Err(Error::Param);
         }
         if !self.pending.is_empty() {
-            self.emit_block()?;
+            self.block_ready()?;
         }
+        #[cfg(feature = "std")]
+        self.flush_queue()?;
         self.write_index();
         self.write_footer();
         self.finished = true;
@@ -283,50 +367,31 @@ impl XzEncoder {
     /// Spec §3: header, compressed data, padding to a multiple of four, then
     /// the check.
     fn emit_block(&mut self) -> Result<(), Error> {
-        let mut data = core::mem::take(&mut self.pending);
-        let uncompressed = data.len() as u64;
-
-        // §3.4: the check covers the block's *uncompressed* data, which is
-        // what came in, not what the filters made of it — so take it before
-        // they run. They are size-preserving, so the header's uncompressed
-        // size is the same either way.
-        let mut check_bytes = Vec::new();
-        compute_check(self.check, &data, &mut check_bytes)?;
-
-        if !self.filters.is_empty() {
-            // Fresh converters for every block: the format resets filter
-            // state at each block boundary, and the reader builds them the
-            // same way.
-            let chain = self.chain_for(&self.filters)?;
-            let mut convs = chain.build().map_err(|_| Error::Param)?;
-            convs.encode_in_place(&mut data);
-        }
-
-        self.lzma2.set_data_size(uncompressed);
-        let compressed = self.lzma2.encode_to_vec(&data)?;
+        let data = core::mem::take(&mut self.pending);
         let dict_prop = self.lzma2.properties();
+        let block = compress_block(&mut self.lzma2, self.check, &self.filters, dict_prop, data)?;
+        // Keep the block's buffer for the next one; the filters worked in
+        // place, so it is the right size already.
+        self.pending = core::mem::take(&mut self.spare);
+        self.pending.clear();
+        self.append_block(block)
+    }
 
-        let header = block_header(
-            &self.filters,
-            dict_prop,
-            compressed.len() as u64,
-            uncompressed,
-        )?;
-        let unpadded = header.len() + compressed.len() + check_size(self.check);
-
+    /// Appends one already-compressed block and records it for the index.
+    fn append_block(&mut self, block: Block) -> Result<(), Error> {
         self.out
-            .try_reserve(unpadded + 3)
+            .try_reserve(block.unpadded + 3)
             .map_err(|_| Error::Alloc)?;
-        self.out.extend_from_slice(&header);
-        self.out.extend_from_slice(&compressed);
+        self.out.extend_from_slice(&block.header);
+        self.out.extend_from_slice(&block.compressed);
         // §3.2 Block Padding: null bytes up to a multiple of four.
-        pad_to_four(&mut self.out, compressed.len());
-        self.out.extend_from_slice(&check_bytes);
+        pad_to_four(&mut self.out, block.compressed.len());
+        self.out.extend_from_slice(&block.check_bytes);
 
         self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
-        self.records.push((unpadded as u64, uncompressed));
-        self.pending = data;
-        self.pending.clear();
+        self.records
+            .push((block.unpadded as u64, block.uncompressed));
+        self.spare = block.data;
         Ok(())
     }
 
@@ -369,6 +434,80 @@ impl XzEncoder {
         }
         (n as u64).next_multiple_of(4) + 4
     }
+}
+
+/// One compressed block, ready to be appended in stream order.
+struct Block {
+    header: Vec<u8>,
+    compressed: Vec<u8>,
+    check_bytes: Vec<u8>,
+    unpadded: usize,
+    uncompressed: u64,
+    /// The block's own buffer, handed back so it can be reused.
+    data: Vec<u8>,
+}
+
+/// The whole chain — the given filters plus an LZMA2 filter with this
+/// dictionary property byte — validated the way [`crate::xz`] validates one it
+/// has just parsed.
+fn chain_for_props(filters: &[FilterFlags], dict_prop: u8) -> Result<FilterChain, Error> {
+    let mut whole: Vec<FilterFlags> = Vec::new();
+    whole
+        .try_reserve(filters.len() + 1)
+        .map_err(|_| Error::Alloc)?;
+    whole.extend_from_slice(filters);
+    let mut props = [0u8; 4];
+    props[0] = dict_prop;
+    whole.push(FilterFlags {
+        id: FILTER_LZMA2,
+        props,
+        props_len: 1,
+    });
+    FilterChain::validate(&whole).map_err(|_| Error::Param)
+}
+
+/// Compresses one block's worth of input. Spec §3: header, compressed data,
+/// then the check — the padding is put in by whoever appends it.
+///
+/// This is the whole of a block, and nothing in it depends on any other block,
+/// which is what lets [`XzEncoder::set_threads`] run several at once.
+fn compress_block(
+    lzma2: &mut Lzma2Encoder,
+    check: CheckType,
+    filters: &[FilterFlags],
+    dict_prop: u8,
+    mut data: Vec<u8>,
+) -> Result<Block, Error> {
+    let uncompressed = data.len() as u64;
+
+    // §3.4: the check covers the block's *uncompressed* data, which is what
+    // came in, not what the filters made of it — so take it before they run.
+    // They are size-preserving, so the header's uncompressed size is the same
+    // either way.
+    let mut check_bytes = Vec::new();
+    compute_check(check, &data, &mut check_bytes)?;
+
+    if !filters.is_empty() {
+        // Fresh converters for every block: the format resets filter state at
+        // each block boundary, and the reader builds them the same way.
+        let chain = chain_for_props(filters, dict_prop)?;
+        let mut convs = chain.build().map_err(|_| Error::Param)?;
+        convs.encode_in_place(&mut data);
+    }
+
+    lzma2.set_data_size(uncompressed);
+    let compressed = lzma2.encode_to_vec(&data)?;
+
+    let header = block_header(filters, dict_prop, compressed.len() as u64, uncompressed)?;
+    let unpadded = header.len() + compressed.len() + check_size(check);
+    Ok(Block {
+        header,
+        compressed,
+        check_bytes,
+        unpadded,
+        uncompressed,
+        data,
+    })
 }
 
 /// Appends null bytes until `written` bytes are a multiple of four.
@@ -463,10 +602,32 @@ pub fn encode_xz_with_filters(
     block_size: u64,
     filters: &[FilterFlags],
 ) -> Result<Vec<u8>, Error> {
+    encode_xz_mt(src, props, check, block_size, filters, 1)
+}
+
+/// Encode `src` as a whole `.xz` stream, compressing blocks in parallel.
+///
+/// `threads` is how many blocks may be compressed at once; one is
+/// [`encode_xz_with_filters`]. `.xz` blocks are independent, so the bytes do
+/// not depend on it — only on `block_size`, which must be something other than
+/// zero for there to be more than one block at all.
+///
+/// # Errors
+///
+/// As [`encode_xz_with_filters`].
+pub fn encode_xz_mt(
+    src: &[u8],
+    props: &LzmaEncProps,
+    check: CheckType,
+    block_size: u64,
+    filters: &[FilterFlags],
+    threads: usize,
+) -> Result<Vec<u8>, Error> {
     let mut enc = XzEncoder::new(props)?;
     enc.set_check(check)?;
     enc.set_filters(filters)?;
     enc.set_block_size(block_size);
+    enc.set_threads(threads);
     enc.push(src)?;
     enc.finish()?;
     Ok(enc.take_output())
@@ -475,6 +636,59 @@ pub fn encode_xz_with_filters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threading is a scheduling choice, not a format one: at a given block
+    /// size the stream is byte for byte what one thread writes — with a filter
+    /// chain in front of LZMA2 as much as without one.
+    #[test]
+    #[cfg(feature = "std")]
+    fn threads_do_not_change_the_xz_bytes() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let mut x = 0x9e37_79b9u32;
+        let src: Vec<u8> = (0..400_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let delta = FilterFlags {
+            id: crate::xz::filter::FILTER_DELTA,
+            props: [3, 0, 0, 0],
+            props_len: 1,
+        };
+        let x86 = FilterFlags {
+            id: 0x04,
+            props: [0; 4],
+            props_len: 0,
+        };
+        for chain in [&[][..], &[delta][..], &[x86][..], &[delta, x86][..]] {
+            for &block_size in &[1u64 << 15, 1 << 16, 150_000] {
+                let want =
+                    encode_xz_mt(&src, &props, CheckType::Crc64, block_size, chain, 1).unwrap();
+                for threads in [2usize, 3, 8] {
+                    let got =
+                        encode_xz_mt(&src, &props, CheckType::Crc64, block_size, chain, threads)
+                            .unwrap();
+                    assert_eq!(
+                        got,
+                        want,
+                        "{} filters, block {block_size}, {threads} threads",
+                        chain.len()
+                    );
+                }
+                // And it is still a stream the reader accepts.
+                let mut back = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut crate::xz::XzReader::new(std::io::Cursor::new(&want)),
+                    &mut back,
+                )
+                .expect("round trip");
+                assert_eq!(back, src);
+            }
+        }
+    }
 
     #[test]
     fn an_empty_stream_is_header_empty_index_footer() {

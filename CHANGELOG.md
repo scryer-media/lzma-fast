@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 - 2026-09-18
+
+- Block-parallel LZMA2. `C/MtCoder.c` and the multi-threaded paths of
+  `C/Lzma2Enc.c` are ported: `Lzma2Encoder::set_block_size` divides the input
+  into independent blocks the way `Lzma2EncProps_Normalize` does, and
+  `set_threads` compresses them at once through the `MtCoder` port, which
+  hands the finished blocks to the writer in stream order whichever thread
+  produced them. The bytes do not depend on the thread count: at one block
+  size, one thread and sixteen produce the same stream. Solid, single-threaded
+  output stays the default, so nothing changes for existing callers.
+  `XzEncoder::set_threads`, `XzWriter::set_threads` and `encode_xz_mt` do the
+  same for `.xz`, where the blocks are already independent, filter chains
+  included.
+- `Lzma2Encoder::set_mem_limit` reduces the block-thread count until the
+  estimate fits the budget, the way 7-Zip reduces `numBlockThreads_Reduced`
+  for `memUsage`; the estimate is this port's own allocation arithmetic.
+
 ## 0.4.0 - 2026-09-18
 
 - An encoder. `LzFind.c`, `LzmaEnc.c` and `Lzma2Enc.c` from the same pinned

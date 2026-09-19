@@ -193,6 +193,13 @@ impl<W: Write> XzWriter<W> {
         self.enc.set_block_size(bytes);
     }
 
+    /// Sets how many blocks may be compressed at once. See
+    /// [`XzEncoder::set_threads`]: it changes how fast the stream is written,
+    /// not what it contains, and needs a block size to have any effect.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.enc.set_threads(threads);
+    }
+
     /// Writes the index and footer and returns the wrapped writer.
     ///
     /// # Errors

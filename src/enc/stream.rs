@@ -85,6 +85,14 @@ impl<'s> LimitedSeqInStream<'s> {
             finished: false,
         }
     }
+
+    /// C: `LimitedSeqInStream_Init` with a fresh limit, which is what
+    /// `Lzma2Enc_EncodeMt1` does at the top of every block.
+    pub(crate) fn reset(&mut self, limit: u64) {
+        self.limit = limit;
+        self.processed = 0;
+        self.finished = false;
+    }
 }
 
 impl SeqInStream for LimitedSeqInStream<'_> {

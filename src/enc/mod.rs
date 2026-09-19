@@ -9,6 +9,8 @@ mod consts;
 mod lz_find;
 mod lzma2_enc;
 mod lzma_enc;
+#[cfg(feature = "std")]
+mod mt_coder;
 mod price;
 mod props;
 mod range_enc;
@@ -25,7 +27,9 @@ use lzma_enc::LzmaEnc;
 
 pub use consts::{LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN};
 pub use lz_find::MatchFinderKind;
-pub use lzma2_enc::{Lzma2Encoder, encode_lzma2};
+pub use lzma2_enc::{
+    BLOCK_SIZE_AUTO, BLOCK_SIZE_SOLID, Lzma2Encoder, auto_block_size, encode_lzma2, encode_lzma2_mt,
+};
 pub use props::{LzmaEncProps, NormalizedProps};
 pub use stream::{SeqInStream, SeqOutStream, SliceStream};
 #[cfg(feature = "xz")]
@@ -33,7 +37,7 @@ pub use write::XzWriter;
 #[cfg(feature = "std")]
 pub use write::{Lzma2Writer, LzmaWriter};
 #[cfg(feature = "xz")]
-pub use xz_enc::{DEFAULT_BLOCK_SIZE, XzEncoder, encode_xz, encode_xz_with_filters};
+pub use xz_enc::{DEFAULT_BLOCK_SIZE, XzEncoder, encode_xz, encode_xz_mt, encode_xz_with_filters};
 
 /// An LZMA1 encoder.
 ///

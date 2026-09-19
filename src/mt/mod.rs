@@ -18,10 +18,11 @@
 pub mod adaptive;
 #[cfg(feature = "crc")]
 pub mod checksum;
-mod event;
+pub(crate) mod event;
 mod lzma2;
 mod mtdec;
 mod pool;
+pub(crate) mod sync;
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
