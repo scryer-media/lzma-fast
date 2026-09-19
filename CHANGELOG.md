@@ -1,13 +1,13 @@
 # Changelog
 
-## 0.5.1 - 2026-09-18
+## 0.5.0 - 2026-09-18
 
 - The threaded match finder. `C/LzFindMt.c` and `C/LzFindOpt.c` are ported:
   the hash thread, the bt thread and their two ring buffers, `CMtSync`'s block
   handshake, `GetMatchesSpecN_2` and the `MixMatches*` / `MatchFinderMt*_Skip`
   family. `LzmaEncProps::with_num_threads(2)` turns it on, which is what the
   SDK's `numThreads` does: a second thread behind a *single* block, on top of
-  the block parallelism 0.5.0 added. `Lzma2Encoder::set_total_threads` is the
+  the block parallelism below. `Lzma2Encoder::set_total_threads` is the
   SDK's `numTotalThreads`, block threads times match-finder threads, split the
   way `Lzma2EncProps_Normalize` splits it.
 - It is bit-exact with the C that threads. `cargo xtask lzma-util` now also
@@ -16,7 +16,7 @@
   covers through the threaded finder against that binary, `bigHash`
   dictionaries included. `tests/lzma2_mt_parity.rs` does the same for LZMA2
   with `mfThreads = 2` at two block sizes and two block-thread counts.
-- Correcting 0.5.0: the SDK's threaded match finder does **not** always produce
+- Note that the SDK's threaded match finder does **not** always produce
   the same stream as `LzFind.c`. `Bt5_MatchFinder_GetMatches` extends its hash
   match past `numHashBytes` with `UPDATE_maxLen` and hands that length to the
   binary tree, while `MixMatches4` stops at 4 and the bt thread always starts
@@ -31,8 +31,6 @@
   already routes through them. The existing non-`Send` `encode` is unchanged
   and always uses the single-threaded finder.
 - `tools/lzma-bench --encode` takes `--mf-threads`.
-
-## 0.5.0 - 2026-09-18
 
 - Block-parallel LZMA2. `C/MtCoder.c` and the multi-threaded paths of
   `C/Lzma2Enc.c` are ported: `Lzma2Encoder::set_block_size` divides the input
@@ -57,8 +55,6 @@
   for raw LZMA2 and for filtered `.xz`.
 - `tools/lzma-bench --encode` takes `--threads`, splitting at the block size
   `xz -T` would use and timing against `xz -T<n>` at the same preset.
-- Still not ported at this release: `C/LzFindMt.c`, the threaded match finder
-  inside a single block. 0.5.1 ports it.
 
 ## 0.4.0 - 2026-09-18
 
