@@ -35,6 +35,28 @@ cargo run --release -p lzma-bench -- bench/fixtures/p256.bin.lzma
 - For profiling use `cargo build --profile profiling` (symbols kept) and
   `samply` / `perf`.
 
+### Encoding
+
+```bash
+cargo run --release -p lzma-bench -- --encode sweep bench/fixtures/p256.bin
+```
+
+`--encode` takes a comma-separated list of presets, or `sweep` for `1,3,5,6,9`.
+The input is raw bytes, not a compressed file: the harness compresses it to
+`.xz` with this crate's writer and with `xz -T1 -N` on the same data, at each
+preset, and reports both the wall time and the output size. Both matter — a
+compressor is only faster than another at the same ratio — so every preset
+also prints `size vs xz`, the ratio of the two outputs. A value of `1.0000`
+means the two produced the same number of bytes.
+
+The same rules as above: idle machine, mains power, three runs, report the
+median, and measure the oracle in the same session.
+
+The encoder is bit-exact with the SDK's, which is what the parity tests check;
+`xz`'s presets are its own mapping onto LZMA settings and need not agree with
+`LzmaEncProps_Normalize` at every level, so the size column is the honest way
+to read a row rather than an assumption that the two encoded the same thing.
+
 ### Multi-threaded LZMA2
 
 ```bash

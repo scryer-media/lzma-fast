@@ -43,6 +43,26 @@ impl FilterFlags {
         &self.props[..self.props_len]
     }
 
+    /// A filter-flags field from an id and its property bytes, for a caller
+    /// building a chain for the writer rather than reading one.
+    ///
+    /// # Errors
+    ///
+    /// [`XzErrorKind::BadFilterChain`] if there are more property bytes than
+    /// any filter this crate supports has.
+    pub fn new(id: u64, props: &[u8]) -> Result<Self, XzErrorKind> {
+        if props.len() > MAX_PROPS {
+            return Err(XzErrorKind::BadFilterChain);
+        }
+        let mut buf = [0u8; MAX_PROPS];
+        buf[..props.len()].copy_from_slice(props);
+        Ok(FilterFlags {
+            id,
+            props: buf,
+            props_len: props.len(),
+        })
+    }
+
     /// Parses one filter-flags field at `*pos`, advancing it.
     ///
     /// # Errors
@@ -255,6 +275,23 @@ impl Converters {
                 Conv::Delta(d) => d.decode(data),
                 Conv::Bcj(b) => {
                     b.decode(data);
+                }
+            }
+        }
+    }
+
+    /// The same, in the other direction.
+    ///
+    /// The decoder undoes the converters in `stages` order; an encoder must
+    /// apply them in the opposite one, because `stages` is the header's list
+    /// reversed and the header lists the filter the encoder ran first.
+    pub fn encode_in_place(&mut self, data: &mut [u8]) {
+        debug_assert!(self.stages.iter().all(|s| s.carry.is_empty()));
+        for stage in self.stages.iter_mut().rev() {
+            match &mut stage.conv {
+                Conv::Delta(d) => d.encode(data),
+                Conv::Bcj(b) => {
+                    b.encode(data);
                 }
             }
         }

@@ -7,7 +7,8 @@
 //! limits checked once per symbol under a caller-guaranteed margin, and a
 //! separate careful path for the bytes near buffer edges.
 //!
-//! Decode only. There is no encoder here and none is planned.
+//! The encoder is a port of the same SDK's `LzFind.c`, `LzmaEnc.c` and
+//! `Lzma2Enc.c`, and is bit-exact with it. See `docs/encoder.md`.
 //!
 //! # Example
 //!
@@ -42,6 +43,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "enc")]
+mod enc;
 mod error;
 mod lzma;
 mod lzma2;
@@ -55,6 +58,15 @@ mod reader;
 #[cfg(feature = "xz")]
 pub mod xz;
 
+/// The `.xz` writer, behind the `xz` feature.
+#[cfg(all(feature = "enc", feature = "xz"))]
+pub use enc::{DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz, encode_xz_with_filters};
+#[cfg(feature = "enc")]
+pub use enc::{
+    LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder, Lzma2Writer, LzmaEncProps, LzmaEncoder,
+    LzmaWriter, MatchFinderKind, NormalizedProps, SeqInStream, SeqOutStream, SliceStream,
+    encode_lzma_alone, encode_lzma2,
+};
 pub use error::{Error, FinishMode, Progress, Status};
 pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};
 pub use lzma::{LzmaDecoder, LzmaProps};

@@ -7,6 +7,9 @@ rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
 publish = false
 
-# No dependencies on purpose: this has to build on a fresh clone, on any host,
-# before anything else does.
+# Kept to as close to nothing as possible: this has to build on a fresh clone,
+# on any host, before anything else does. `sha2` is here because checking a
+# downloaded tarball against a pinned digest is hashing, and hashing belongs in
+# a hash library rather than in a hand-written one.
 [dependencies]
+sha2 = { version = "0.11.0", default-features = false }

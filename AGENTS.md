@@ -4,9 +4,12 @@ These rules apply to every automated agent and every human contributor.
 
 ## What this repository is
 
-A decode-only LZMA/LZMA2 library, ported from Igor Pavlov's public-domain
-`LzmaDec.c` / `Lzma2Dec.c`. The point of the crate is speed with parity to
-the reference decoder. Readability that costs throughput is not wanted.
+An LZMA/LZMA2 library ported from Igor Pavlov's public-domain SDK: the decoder
+from `LzmaDec.c` / `Lzma2Dec.c`, and the encoder from `LzFind.c`, `LzmaEnc.c`
+and `Lzma2Enc.c`. The point of the crate is speed with parity to the
+reference — byte-identical output from the decoder, and bit-exact output from
+the encoder. Readability that costs throughput is not wanted. The encoder's
+port rules and what was left out are in `docs/encoder.md`.
 
 ## Porting rules
 

@@ -1,6 +1,65 @@
 # Changelog
 
-## 0.3.6 - 2026-09-18
+## 0.4.0 - 2026-09-18
+
+- An encoder. `LzFind.c`, `LzmaEnc.c` and `Lzma2Enc.c` from the same pinned
+  LZMA SDK checkout the decoder came from, ported function by function: the
+  six match finders (hc4, hc5, bt2, bt3, bt4, bt5), the range encoder, the
+  price tables, the optimal parser, and the LZMA2 chunk layer with its
+  copy-chunk fallback. It is bit-exact with the reference: one input at one
+  setting produces the bytes the C produces, and `tests/lzma_parity.rs` and
+  `tests/lzma2_encoder.rs` check that against binaries built from the pinned
+  sources by `cargo xtask lzma-util`. `docs/encoder.md` has the C-to-Rust map
+  and what was left out - `LzFindMt.c`, multi-threaded `Lzma2Enc`,
+  `directInput`, and two constants the C derives from `sizeof(size_t)` that
+  are pinned to their 64-bit values so one input compresses to one output
+  everywhere.
+- Writers for the three containers: `encode_lzma_alone` for `.lzma`,
+  `Lzma2Encoder` for a raw LZMA2 stream, and `XzEncoder`/`encode_xz` for
+  `.xz` - one stream, one or more blocks that declare both of their sizes, a
+  correct index and footer, and CRC-32, CRC-64/XZ, SHA-256 or no check under
+  the same feature gates the reader uses. The `.xz` frame has no counterpart
+  in the SDK, so it is proved by decoding instead of by parity: every check
+  type at several block sizes goes back through `XzReader`,
+  `XzParallelReader` and `XzAdaptiveDecoder`, and then through `xz -t`,
+  `xz -dc` and `7zz t`.
+- The BCJ and delta filters, in the encode direction. `Delta_Encode` from
+  `C/Delta.c` and the eight branch converters from `C/Bra.c`, `C/Bra86.c` and
+  `C/BraIA64.c` (x86, PPC, IA64, ARM, ARMT, SPARC, ARM64, RISC-V) are ported
+  beside the decode halves they already had, keeping the same carry contract,
+  so encoding a buffer in pieces gives what encoding it whole gives. The `.xz`
+  writer takes a filter chain — `XzEncoder::set_filters`,
+  `encode_xz_with_filters` — validates it the way the reader validates one it
+  has parsed, and writes the matching block-header filter flags.
+  `tests/filter_parity.rs` compares every converter with the SDK's own, in
+  both directions, byte for byte.
+- A decode bug the new writer exposed: a block with a filter chain whose last
+  bytes fell inside a converter's carry could make `XzAdaptiveDecoder` report
+  the stream as truncated. The block decoder returned "no input consumed, no
+  output produced" — its signal for *needs more input* — for a step that had
+  in fact made progress. `XzReader` and `XzParallelReader` were unaffected.
+- `std::io::Write` adapters behind `std`: `LzmaWriter`, `Lzma2Writer` and
+  `XzWriter`, the mirror of the `Read` adapters the decoder has. `XzWriter`
+  really streams - it emits each block as it fills - which the other two
+  cannot, because the size in their header is not known until the writer is
+  closed.
+- A new default feature, `enc`, which carries all of the above and requires
+  `crc`. The match finder's 256-entry byte table is the standard reflected
+  CRC-32 table, and it is now derived from `crate::crc` rather than built
+  again from `kCrcPoly`; the hash functions over it are unchanged. Turning
+  `enc` off builds the crate exactly as 0.3.5 did.
+- `xz::vli` gained `encode` and `push`, the other half of `decode`.
+- Tooling: `cargo xtask lzma-util` builds the reference encoder and two
+  props-driven oracles from the pinned SDK sources, plus `filter-oracle` over
+  the SDK's own `Bra.c`, `Bra86.c`, `BraIA64.c` and `Delta.c`; CI runs them on the same
+  four-platform matrix the XZ Utils suite uses, with
+  `LZMA_TURBO_LZMA_UTIL_REQUIRE=1` so a missing oracle fails rather than
+  skips. `tools/lzma-bench` gained `--encode`, which compresses to `.xz` at
+  each preset and times it against `xz -T1 -N` on the same data, reporting
+  output size alongside throughput. `xtask` no longer carries a hand-written
+  SHA-256 for checking fetched tarballs; it uses the `sha2` crate, with the
+  pinned digests unchanged. A new fuzz target, `encode_round_trip`, drives
+  arbitrary bytes through all three writers and back.
 
 - The bulk checksums can be handed to the embedding host on wasm. Two new
   features, `crc-host` and `crypto-host`, route CRC-32, CRC-64/XZ and SHA-256
