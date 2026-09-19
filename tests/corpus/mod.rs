@@ -83,7 +83,25 @@ fn repeats(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// The longest case the corpus hands out, from `LZMA_TURBO_CORPUS_MAX`.
+///
+/// Unset — which is everywhere a developer and every ordinary CI lane runs —
+/// this is no cap and the corpus is what the generators below build. CI's
+/// `memory-safety` job sets it, because Valgrind's memcheck instruments every
+/// instruction it runs and a three-megabyte encode under it costs minutes
+/// rather than milliseconds. A case past the cap is *truncated*, not dropped,
+/// so every name a test looks up is still there and the shape each one was
+/// chosen for — a run, a repeated phrase, English-like text — survives.
+#[must_use]
+pub fn max_len() -> usize {
+    std::env::var("LZMA_TURBO_CORPUS_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
 pub fn corpus() -> Vec<(String, Vec<u8>)> {
+    let cap = max_len();
     let mut cases: Vec<(String, Vec<u8>)> = vec![
         ("empty".into(), Vec::new()),
         ("one-byte".into(), vec![0x2A]),
@@ -105,6 +123,9 @@ pub fn corpus() -> Vec<(String, Vec<u8>)> {
         cases.push((format!("random-{name}"), random(0x1234 ^ len as u64, len)));
         cases.push((format!("text-{name}"), text(0x5678 ^ len as u64, len)));
         cases.push((format!("repeats-{name}"), repeats(0x9ABC ^ len as u64, len)));
+    }
+    for (_, data) in &mut cases {
+        data.truncate(cap);
     }
     cases
 }

@@ -359,3 +359,221 @@ fn both_loops_stay_inside_every_buffer() {
     one_pass();
     FRONT.store(false, Ordering::Relaxed);
 }
+
+// ---------------------------------------------------------------------------
+// The encoder.
+// ---------------------------------------------------------------------------
+//
+// The decode side above is driven through slices the caller owns; the encode
+// side owns almost everything it touches — the match finder's window, its hash
+// and `son` tables, the probability arrays, the optimal parser's `opt` array
+// and the range encoder's 64 KiB buffer — and the C it is ported from indexes
+// several of those past their logical end on purpose (`kMatchSpecLenStart`
+// sentinels, `MatchFinder_Normalize3`'s pass over the whole table,
+// `GetMatchesSpecN_2`'s `cur + 4` reads). Under this allocator every one of
+// those ends flush against a page that faults, so an index one element too far
+// is a fault rather than a silently wrong byte, and the threaded finder's
+// three threads are watched over the same memory at once.
+
+#[cfg(feature = "enc")]
+mod encoder {
+    use std::sync::atomic::Ordering;
+
+    use lzma_turbo::{
+        Error, Lzma2Encoder, LzmaEncProps, LzmaEncoder, MatchFinderKind, SeqOutStream, SliceStream,
+    };
+
+    use super::FRONT;
+
+    /// A sink of exactly the length the encode is known to produce, so its
+    /// last byte is the last byte before a guard.
+    ///
+    /// A `Vec` that grows cannot do this: its buffer is a power-of-two
+    /// capacity with slack at the end, and the slack is what an overrun lands
+    /// in. Every case below therefore encodes twice — once into a `Vec` to
+    /// learn the length, once into this — and requires the two to agree.
+    struct ExactSink {
+        buf: Vec<u8>,
+        at: usize,
+    }
+
+    impl ExactSink {
+        fn new(len: usize) -> Self {
+            let mut buf = Vec::with_capacity(len);
+            buf.resize(len, 0);
+            ExactSink { buf, at: 0 }
+        }
+    }
+
+    impl SeqOutStream for ExactSink {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            let end = self.at + data.len();
+            assert!(end <= self.buf.len(), "the encoder wrote more than it did");
+            self.buf[self.at..end].copy_from_slice(data);
+            self.at = end;
+            Ok(())
+        }
+    }
+
+    /// `src` copied into an allocation of exactly its length: the byte after
+    /// it is a guard, so a match finder that reads one past the input it was
+    /// given faults here.
+    fn exact(src: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(src.len());
+        v.extend_from_slice(src);
+        v
+    }
+
+    /// Shapes the parser and the match finder take different branches on,
+    /// kept small: every allocation here costs three pages of address space
+    /// and the point is the edges, not the volume.
+    fn inputs() -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = vec![
+            ("empty".into(), Vec::new()),
+            ("one".into(), vec![0x2A]),
+            ("zeros".into(), vec![0; 70_000]),
+        ];
+        // A run-and-phrase mix, which is what gives the binary tree long
+        // chains, and incompressible bytes, which is what makes the copy-chunk
+        // fallback run.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut mixed = Vec::with_capacity(80_000);
+        while mixed.len() < 80_000 {
+            let n = (next() >> 40) as usize % 60 + 1;
+            let b = (next() >> 32) as u8;
+            if next() & 1 == 0 {
+                mixed.extend(std::iter::repeat_n(b, n));
+            } else {
+                mixed.extend((0..n).map(|_| next() as u8));
+            }
+        }
+        out.push(("mixed".into(), mixed));
+        out.push((
+            "random".into(),
+            (0..70_000).map(|_| next() as u8).collect::<Vec<u8>>(),
+        ));
+        out
+    }
+
+    /// Small enough that the window slides and the hash normalizes over these
+    /// inputs, and large enough for the other one to stay solid.
+    const DICTS: [u32; 2] = [1 << 16, 1 << 20];
+
+    fn lzma1_pass() {
+        for (name, data) in inputs() {
+            let src = exact(&data);
+            for kind in [
+                MatchFinderKind::Hc4,
+                MatchFinderKind::Bt2,
+                MatchFinderKind::Bt4,
+                MatchFinderKind::Bt5,
+            ] {
+                for dict in DICTS {
+                    for level in [1u32, 9] {
+                        let props = LzmaEncProps::new()
+                            .with_level(level)
+                            .with_match_finder(kind)
+                            .with_dict_size(dict);
+                        let what = format!("{name} {kind:?} dict={dict} level={level}");
+                        let reference = LzmaEncoder::new(&props)
+                            .expect("encoder")
+                            .encode_to_vec(&src)
+                            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                        let mut sink = ExactSink::new(reference.len());
+                        let mut enc = LzmaEncoder::new(&props).expect("encoder");
+                        let mut input = SliceStream::new(&src);
+                        enc.encode_sized(&mut input, &mut sink, src.len() as u64)
+                            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                        assert!(sink.buf == reference, "{what}: exact sink differs");
+                    }
+                }
+            }
+        }
+    }
+
+    fn lzma2_pass() {
+        for (name, data) in inputs() {
+            let src = exact(&data);
+            for dict in DICTS {
+                // Solid on one thread, then the same input cut into blocks and
+                // encoded on four: the block coder's own buffers, the free
+                // block list and the write turn, all against guards.
+                for (threads, block) in [(1usize, 0u64), (4, 16 * 1024), (4, 1 << 16)] {
+                    let props = LzmaEncProps::new().with_level(5).with_dict_size(dict);
+                    let what = format!("{name} dict={dict} threads={threads} block={block}");
+                    let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+                    if block != 0 {
+                        enc.set_block_size(block);
+                        enc.set_threads(threads);
+                    }
+                    enc.set_data_size(src.len() as u64);
+                    let reference = enc
+                        .encode_to_vec(&src)
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+
+                    let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+                    if block != 0 {
+                        enc.set_block_size(block);
+                        enc.set_threads(threads);
+                    }
+                    enc.set_data_size(src.len() as u64);
+                    let mut sink = ExactSink::new(reference.len());
+                    enc.encode_slice(&src, &mut sink)
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    assert!(sink.buf == reference, "{what}: exact sink differs");
+                }
+            }
+        }
+    }
+
+    /// `LzFindMt.c`: the hash thread, the bt thread and the caller all reading
+    /// and writing one window and one pair of ring buffers. Every one of those
+    /// is a guarded allocation here, so a block index that runs off the end of
+    /// `hashBuf` or `btBuf` faults on whichever thread did it.
+    fn mt_finder_pass() {
+        for (name, data) in inputs() {
+            let src = exact(&data);
+            for dict in DICTS {
+                for kind in [MatchFinderKind::Bt4, MatchFinderKind::Bt5] {
+                    let props = LzmaEncProps::new()
+                        .with_level(9)
+                        .with_match_finder(kind)
+                        .with_dict_size(dict)
+                        .with_num_threads(2);
+                    let what = format!("{name} {kind:?} dict={dict} mf-threads=2");
+                    let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+                    enc.set_data_size(src.len() as u64);
+                    let reference = enc
+                        .encode_to_vec(&src)
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+
+                    let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+                    enc.set_data_size(src.len() as u64);
+                    let mut sink = ExactSink::new(reference.len());
+                    let mut input = SliceStream::new(&src);
+                    enc.encode_send(&mut input, &mut sink)
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    assert!(sink.buf == reference, "{what}: exact sink differs");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "minutes; CI's memory-safety job runs it with --include-ignored"]
+    fn the_encoders_stay_inside_every_buffer() {
+        for front in [false, true] {
+            FRONT.store(front, Ordering::Relaxed);
+            lzma1_pass();
+            lzma2_pass();
+            mt_finder_pass();
+        }
+        FRONT.store(false, Ordering::Relaxed);
+    }
+}

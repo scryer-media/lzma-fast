@@ -394,13 +394,19 @@ jobs:
         run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo test --locked -p sdk-oracle
 
   # What a sanitizer cannot give the assembly loop. `guard_pages` puts every
-  # allocation and every input slice against a no-access page, on each OS;
-  # Valgrind's memcheck, which instruments the machine code itself and so
-  # sees inside the loop, runs the asm-against-portable suite on Linux.
+  # allocation and every input slice against a no-access page, on each OS -
+  # for the decode loops and, since 0.5.1, for the encoder's window, tables and
+  # range buffer too; Valgrind's memcheck, which instruments the machine code
+  # itself and so sees inside the loop, runs the asm-against-portable suite and
+  # the encoder suites on Linux.
   memory-safety:
     name: memory-safety-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Longer than the other trust jobs on purpose: memcheck costs a large
+    # constant factor, and the encoder lanes below are inside it. The corpus
+    # cap is what keeps that factor affordable; widening this instead would be
+    # the wrong knob.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -433,6 +439,79 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
         run: cargo test --locked -p lzma-turbo --test asm_parity
+      # The encoder's oracles, so the lanes below are the real parity sweep
+      # under memcheck rather than a round trip. The oracle binaries are
+      # separate processes and run at full speed; Valgrind traces the test
+      # binary only.
+      - name: Build the reference encoder from the pinned SDK
+        if: runner.os == 'Linux'
+        run: cargo xtask lzma-util
+      # The encoder under memcheck. It owns almost everything it touches - the
+      # match finder's window and tables, the parser's `opt` array, the range
+      # encoder's buffer - and three threads share the first of those in
+      # `LzFindMt.c`, which is exactly what an instrumented run is for.
+      #
+      # `LZMA_TURBO_CORPUS_MAX` is why this fits: memcheck costs tens of times
+      # native, and the generated corpus runs to 300 KiB a case. Capped at
+      # 16 KiB the sweep keeps every setting, every match finder and every
+      # thread count and loses only the long inputs, which the uncapped
+      # `encoder-parity` job runs on all four platforms anyway.
+      - name: The encoder under Valgrind
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+          LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
+          LZMA_TURBO_CORPUS_MAX: "16384"
+        run: |
+          cargo test --locked --release -p lzma-turbo \
+            --test mt_match_finder --test lzma_parity --test lzma2_mt_parity
+      - name: The encoder's unit tests under Valgrind
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
+        run: cargo test --locked --release -p lzma-turbo --lib -- enc::
+
+  # The data races a guard page cannot see. `LzFindMt.c` is three threads over
+  # one window and one pair of ring buffers, partitioned by nothing but the
+  # SDK's own handshake, and `MtCoder.c` hands blocks between workers on a
+  # semaphore and a read token; ThreadSanitizer is what proves the handshake is
+  # really what makes those accesses disjoint. Nightly with `-Zbuild-std`,
+  # because the standard library has to be instrumented too or every
+  # synchronisation edge inside it is invisible and the run is all false
+  # positives. The nightly is pinned exactly as fuzz.yml pins its own.
+  thread-sanitizer:
+    name: thread-sanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TSAN_TOOLCHAIN: nightly-2026-09-01
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly-2026-09-01
+          targets: x86_64-unknown-linux-gnu
+          components: rust-src
+      - name: The threaded encoder and decoder under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          # The default features build AWS-LC, whose assembly TSan cannot see
+          # into and which would report races it has no annotations for. None
+          # of it is under test here.
+          TSAN_OPTIONS: halt_on_error=1
+          # A three-megabyte input instrumented at every memory access is
+          # minutes a case; the threads and their handshakes are what is under
+          # test, not the volume.
+          LZMA_TURBO_CORPUS_MAX: "16384"
+        run: |
+          cargo "+$TSAN_TOOLCHAIN" test -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            --no-default-features --features std,crc,xz,enc,native-crypto \
+            -p lzma-turbo --test mt_match_finder --test lzma2_mt_parity --test mt
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.
@@ -557,7 +636,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, encoder-parity, fuzz-differential]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, thread-sanitizer, vectors, xz-utils-suite, encoder-parity, fuzz-check, fuzz-differential]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
