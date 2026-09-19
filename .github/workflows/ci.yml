@@ -153,6 +153,23 @@ jobs:
       # test between them.
       - name: Test both crypto backends against each other
         run: cargo test --locked -p lzma-turbo --features native-crypto --no-fail-fast
+      # The encoder with nothing else turned on: no container, no crypto
+      # backend, no assembly. `enc` implies `crc`, because the match finder's
+      # byte table is the reflected CRC-32 table and is derived from
+      # `crate::crc` rather than built again, and `crc` implies `std`; this is
+      # the smallest build the encoder has.
+      - name: Test the encoder alone
+        run: cargo test --locked -p lzma-turbo --no-default-features --features enc --no-fail-fast
+      # The encoder behind the .xz writer, with no SHA-256 backend. It is a
+      # `check` rather than a `test` because that feature set cannot decode
+      # one of the committed vectors - `mixed.sha256.xz` carries check type 10
+      # and no backend is compiled in to compute it - which is true with or
+      # without `enc` and is not this lane's business to paper over. What the
+      # lane is for is that the combination compiles.
+      - name: Check the encoder with the .xz writer and no crypto backend
+        run: cargo check --locked -p lzma-turbo --no-default-features --features enc,xz --all-targets
+      - name: Test the encoder with the .xz writer
+        run: cargo test --locked -p lzma-turbo --no-default-features --features enc,xz,native-crypto --no-fail-fast
 
   wasm:
     name: wasm-${{ matrix.lane }}
@@ -176,6 +193,15 @@ jobs:
           # and no SHA extension, so this is the build an embedder ships.
           - lane: std-host-hooks-xz
             features: "std,asm,crc-host,crypto-host,xz"
+          # The same two sets with the encoder in. `enc` is the port of
+          # LzFind.c, LzmaEnc.c and Lzma2Enc.c: it allocates, it has no I/O of
+          # its own, and its threaded paths are behind `std` and simply do not
+          # start on a guest with no threads, so a wasm build of it is a build
+          # anybody embedding a compressor wants.
+          - lane: std-crc-crypto-xz-enc
+            features: "std,asm,crc,native-crypto,xz,enc"
+          - lane: std-host-hooks-xz-enc
+            features: "std,asm,crc-host,crypto-host,xz,enc"
           # Each host feature alone, because they are independent: a
           # `crc-host` build must never need the SHA-256 hooks, or the reverse.
           - lane: crc-host-only
