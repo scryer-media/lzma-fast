@@ -8,7 +8,7 @@
 //! rotates it; this port keeps the same buffer and the same rotation, because
 //! the alternative — a ring with a moving index — changes the inner loop.
 
-use super::error::XzErrorKind;
+use crate::error::XzErrorKind;
 
 /// C: `DELTA_STATE_SIZE`.
 const DELTA_STATE_SIZE: usize = 256;

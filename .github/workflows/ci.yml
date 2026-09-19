@@ -182,6 +182,9 @@ jobs:
             features: "std,crc-host"
           - lane: crypto-host-only
             features: "std,crypto-host"
+          # The converters alone, as a 7z reader takes them: no std, no xz.
+          - lane: filters-only
+            features: "filters"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

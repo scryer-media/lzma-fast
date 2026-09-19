@@ -2,7 +2,7 @@
 name = "lzma-turbo"
 description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
 readme = "README.md"
-version = "0.5.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
@@ -29,10 +29,15 @@ asm = []
 # units. Default because every xz stream carries one of them (check types 1
 # and 4); the decoder itself never touches either.
 crc = ["std", "dep:crc-fast"]
-# The .xz container: stream framing, block headers, the index, the BCJ and
-# delta filters, and the readers over them. Needs `crc`, because every xz
-# header carries a mandatory CRC-32, and `std`, because the readers are I/O.
-xz = ["std", "crc"]
+# The BCJ and delta converters on their own: `no_std`, no dependency. They
+# are xz's filters, but 7z carries the same ones under the same ids, so a 7z
+# reader wants them without the container below.
+filters = []
+# The .xz container: stream framing, block headers, the index, the checks and
+# the readers over them. Implies `filters`, and re-exports them at `xz::bcj`
+# and `xz::delta`. Needs `crc`, because every xz header carries a mandatory
+# CRC-32, and `std`, because the readers are I/O.
+xz = ["std", "crc", "filters"]
 # The encoder: the port of the SDK's LzFind.c, LzmaEnc.c and Lzma2Enc.c, plus
 # the .lzma and .xz writers over it. It needs `crc`, because the match
 # finder's byte table is the standard reflected CRC-32 table and is derived

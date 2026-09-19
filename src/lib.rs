@@ -46,6 +46,8 @@ extern crate std;
 #[cfg(feature = "enc")]
 mod enc;
 mod error;
+#[cfg(feature = "filters")]
+pub mod filters;
 #[cfg(feature = "kernel-ab")]
 mod kernel_ab;
 mod lzma;
@@ -72,7 +74,7 @@ pub use enc::{
 pub use enc::{
     DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz, encode_xz_mt, encode_xz_with_filters,
 };
-pub use error::{Error, FinishMode, Progress, Status};
+pub use error::{Error, FinishMode, Progress, Status, XzErrorKind};
 pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};
 pub use lzma::{LzmaDecoder, LzmaProps};
 pub use lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
@@ -92,7 +94,7 @@ pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memor
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 #[cfg(feature = "xz")]
-pub use xz::{XzAdaptiveDecoder, XzError, XzErrorKind, XzOptions, XzParallelReader, XzReader};
+pub use xz::{XzAdaptiveDecoder, XzError, XzOptions, XzParallelReader, XzReader};
 
 #[cfg(feature = "crc")]
 pub mod crc;

@@ -1,7 +1,15 @@
 # Changelog
 
-## 0.5.1 - 2026-09-18
+## 0.4.0 - 2026-09-19
 
+- A `filters` feature: the BCJ and delta converters on their own, as
+  `filters::bcj` and `filters::delta`, `no_std` and with no dependency. They
+  used to be reachable only through `xz`, which also brings the stream layer,
+  the readers and `crc-fast`; a 7z reader wants the converters and none of
+  that. `xz` implies `filters` and re-exports both modules at `xz::bcj` and
+  `xz::delta`, so nothing that compiled against those paths changes.
+  `XzErrorKind`, which the converters' constructors return, is exported at
+  the crate root in every build; `xz::error::XzErrorKind` still names it.
 - The match finders extend a match eight bytes at a time. `UPDATE_maxLen`,
   `GetMatchesSpec1`, `SkipMatchesSpec` and `Hc_GetMatchesSpec` in `LzFind.c`,
   and `GetMatchesSpecN_2` in `LzFindOpt.c`, all ask the same question with
@@ -47,8 +55,6 @@
   of each of the three, so the measurements above are one binary with the arm
   chosen at run time rather than two builds. It is for benchmarking and nothing
   else.
-
-## 0.5.0 - 2026-09-18
 
 - The threaded match finder. `C/LzFindMt.c` and `C/LzFindOpt.c` are ported:
   the hash thread, the bt thread and their two ring buffers, `CMtSync`'s block
@@ -104,8 +110,6 @@
 - `tools/lzma-bench --encode` takes `--threads`, splitting at the block size
   `xz -T` would use and timing against `xz -T<n>` at the same preset.
 
-## 0.4.0 - 2026-09-18
-
 - An encoder. `LzFind.c`, `LzmaEnc.c` and `Lzma2Enc.c` from the same pinned
   LZMA SDK checkout the decoder came from, ported function by function: the
   six match finders (hc4, hc5, bt2, bt3, bt4, bt5), the range encoder, the
@@ -151,7 +155,7 @@
   `crc`. The match finder's 256-entry byte table is the standard reflected
   CRC-32 table, and it is now derived from `crate::crc` rather than built
   again from `kCrcPoly`; the hash functions over it are unchanged. Turning
-  `enc` off builds the crate exactly as 0.3.5 did.
+  `enc` off builds the crate exactly as 0.3.4 did.
 - `xz::vli` gained `encode` and `push`, the other half of `decode`.
 - Tooling: `cargo xtask lzma-util` builds the reference encoder and two
   props-driven oracles from the pinned SDK sources, plus `filter-oracle` over
@@ -203,8 +207,6 @@
   equal the native decoder's byte for byte, then proves a guest with no hooks
   installed panics with the documented message. `wasmtime` is a
   dev-dependency, target-gated off wasm, and never enters the crate's graph.
-
-## 0.3.5 - 2026-09-18
 
 - `XzParallelReader` now accepts a stream with no blocks. An empty input is a
   well-formed `.xz` file - `xz` writes one, and `good-0-empty.xz` and its

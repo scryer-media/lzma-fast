@@ -28,7 +28,7 @@
 //! These are `pub` on purpose: the 7z crate that sits on this one needs the
 //! same converters, and there should be one copy of them.
 
-use super::error::XzErrorKind;
+use crate::error::XzErrorKind;
 
 // ---------------------------------------------------------------------------
 // Little helpers. `Ui` is little-endian in the C, `Be` big-endian, whatever
@@ -1292,7 +1292,7 @@ mod tests {
         ];
         for kind in kinds {
             for len in [0usize, 1, 5, 17, 64, 1000, 4099] {
-                let src: Vec<u8> = (0..len)
+                let src: alloc::vec::Vec<u8> = (0..len)
                     .map(|i| {
                         let x = (i as u32).wrapping_mul(2_654_435_761);
                         if i % 9 == 0 { 0xE8 } else { (x >> 13) as u8 }
