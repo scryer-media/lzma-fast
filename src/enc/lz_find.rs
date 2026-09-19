@@ -20,6 +20,7 @@
 use alloc::vec::Vec;
 
 use crate::enc::consts::*;
+use crate::enc::match_run::match_run;
 use crate::enc::stream::SeqInStream;
 use crate::error::Error;
 
@@ -748,14 +749,9 @@ impl MatchFinder {
     /// C: `UPDATE_maxLen`.
     #[inline]
     fn update_max_len(&self, cur: usize, d2: u32, max_len: u32, len_limit: u32) -> u32 {
-        let buf = &self.buf_base;
-        let diff = d2 as usize;
-        let mut c = max_len as usize;
-        let lim = len_limit as usize;
-        while c != lim && buf[cur + c - diff] == buf[cur + c] {
-            c += 1;
-        }
-        c as u32
+        let start = cur + max_len as usize;
+        let limit = cur + len_limit as usize;
+        (match_run(&self.buf_base, d2 as usize, start, limit) - cur) as u32
     }
 
     /// C: `Bt2_MatchFinder_GetMatches`.
@@ -1264,17 +1260,18 @@ impl MatchFinder {
                 let pb = cur - delta as usize;
                 let mut len = if len0 < len1 { len0 } else { len1 } as usize;
                 let pair0 = self.hash[pair];
-                let buf = &self.buf_base;
-                if buf[pb + len] == buf[cur + len] {
-                    len += 1;
-                    if len != len_limit as usize && buf[pb + len] == buf[cur + len] {
-                        loop {
-                            len += 1;
-                            if len == len_limit as usize || buf[pb + len] != buf[cur + len] {
-                                break;
-                            }
-                        }
-                    }
+                // C: the byte at `len` decides whether the run is entered at
+                // all, and the two loops after it walk to the first difference.
+                // `match_run` answers both: it returns `len` unchanged exactly
+                // when that first byte differs.
+                let run = match_run(
+                    &self.buf_base,
+                    delta as usize,
+                    cur + len,
+                    cur + len_limit as usize,
+                ) - cur;
+                if run != len {
+                    len = run;
                     if max_len < len as u32 {
                         max_len = len as u32;
                         distances[d] = len as u32;
@@ -1336,14 +1333,14 @@ impl MatchFinder {
                     son + (cyclic_back(cyclic_buffer_pos, delta as usize, cyclic_buffer_size) << 1);
                 let pb = cur - delta as usize;
                 let mut len = if len0 < len1 { len0 } else { len1 } as usize;
-                let buf = &self.buf_base;
-                if buf[pb + len] == buf[cur + len] {
-                    loop {
-                        len += 1;
-                        if len == len_limit as usize || buf[pb + len] != buf[cur + len] {
-                            break;
-                        }
-                    }
+                let run = match_run(
+                    &self.buf_base,
+                    delta as usize,
+                    cur + len,
+                    cur + len_limit as usize,
+                ) - cur;
+                if run != len {
+                    len = run;
                     if len == len_limit as usize {
                         self.hash[ptr1] = self.hash[pair];
                         self.hash[ptr0] = self.hash[pair + 1];
@@ -1405,14 +1402,13 @@ impl MatchFinder {
             let diff = delta as usize;
             let buf = &self.buf_base;
             if buf[cur + max_len as usize] == buf[cur + max_len as usize - diff] {
-                let mut c = cur;
-                while buf[c] == buf[c - diff] {
-                    c += 1;
-                    if c == lim {
-                        distances[d] = (lim - cur) as u32;
-                        distances[d + 1] = delta - 1;
-                        return d + 2;
-                    }
+                // C: the chain walk restarts the scan at `cur` every time
+                // rather than at `maxLen`, so the run starts there too.
+                let c = match_run(buf, diff, cur, lim);
+                if c == lim {
+                    distances[d] = (lim - cur) as u32;
+                    distances[d + 1] = delta - 1;
+                    return d + 2;
                 }
                 let len = (c - cur) as u32;
                 if max_len < len {

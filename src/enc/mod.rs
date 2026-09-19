@@ -12,6 +12,7 @@ mod lz_find;
 mod lz_find_mt;
 mod lzma2_enc;
 mod lzma_enc;
+mod match_run;
 #[cfg(feature = "std")]
 mod mt_coder;
 mod price;

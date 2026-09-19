@@ -37,15 +37,17 @@
 //! dictionary may cost, and [`XzOptions::max_unpack_bytes`], which caps the
 //! output of a whole file.
 
-pub mod bcj;
 pub mod block;
 pub mod check;
-pub mod delta;
 pub mod error;
 pub mod filter;
 pub mod index;
 pub mod stream;
 pub mod vli;
+
+/// The converters live in [`crate::filters`], behind the `filters` feature
+/// that `xz` implies; these are the paths they have always had.
+pub use crate::filters::{bcj, delta};
 
 mod adaptive;
 mod blockdec;

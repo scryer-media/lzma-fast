@@ -103,8 +103,9 @@ The container this crate covers is xz, and only xz. 7z — its header, folders
 and coder graphs, its AES-256 and the `7zAes` key derivation — is out of scope
 here and is handled by a fork of `sevenz-rust2` that depends on this crate.
 The BCJ and delta converters are shared: they are the same filters in both
-formats, so `xz::bcj` and `xz::delta` are public and the 7z fork uses them
-rather than carrying its own.
+formats, so they live in `filters::bcj` and `filters::delta` behind their own
+`filters` feature (`xz` implies it and re-exports them), and the 7z fork uses
+them rather than carrying its own.
 
 Two things the xz layer needs, and which the crate already had: the checksums
 in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check type 1 and

@@ -154,7 +154,8 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders |
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
 | `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, `XzEncoder`, the `.lzma`/`.xz` writers and the `Write` adapters; implies `crc` |
-| `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the filters, the checks and the index; implies `std` and `crc` |
+| `filters` | yes | the BCJ and delta converters, `filters::bcj` and `filters::delta`, on their own: `no_std`, no dependency |
+| `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the checks and the index; implies `std`, `crc` and `filters`, and re-exports the converters at `xz::bcj` and `xz::delta` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 | `crc-host` | no | on `wasm32`, the same CRC API delegated to embedder-installed hooks; implies `crc`. Inert on native targets - see [wasm](#wasm) |
 | `crypto-host` | no | on `wasm32`, the same SHA-256 API delegated to embedder-installed hooks; implies `native-crypto` and `std`. Inert on native targets |

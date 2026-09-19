@@ -114,6 +114,33 @@ pub fn fixtures() -> ExitCode {
             "p256.bin",
         ),
     );
+    // The same filter at a distance wide enough that the decoder can add a
+    // block at a time rather than a byte at a time. `dist=4` above is the
+    // narrow case and this is the wide one; the two do not behave alike, so
+    // timing only one says nothing about the other.
+    make(
+        "delta64.xz",
+        &xz(
+            &["-T1", "-5", "--delta=dist=64", "--lzma2=preset=5"],
+            "p256.bin",
+        ),
+    );
+
+    // The branch filters on enough machine code to time. `bcj-x86.xz` above is
+    // one executable, which is far too small to measure; this is every
+    // executable in the build tree concatenated, so it is real code for
+    // whatever architecture the machine is, and nothing has to be fetched.
+    make("codebin.bin", &|path| {
+        collect_machine_code(&root, path, 64 * MIB).is_ok()
+    });
+    make(
+        "bcj-x86.code.xz",
+        &xz(&["-T1", "-5", "--x86", "--lzma2=preset=5"], "codebin.bin"),
+    );
+    make(
+        "bcj-arm64.code.xz",
+        &xz(&["-T1", "-5", "--arm64", "--lzma2=preset=5"], "codebin.bin"),
+    );
 
     // The checks. CRC-64 is the default and is covered by the rows above.
     make(
@@ -226,6 +253,68 @@ fn tar_xz(root: &Path, path: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::other("tar | xz failed"))
     }
+}
+
+/// Concatenates the executables under the repository's `target/` into one
+/// file of at most `cap` bytes, largest first.
+///
+/// The branch filters only do anything to machine code, and a fixture of it
+/// has to come from somewhere that is not a committed binary. A build tree is
+/// the one place every machine running this already has some: real code, for
+/// this machine's architecture, which is the architecture whose filter is
+/// worth timing here.
+fn collect_machine_code(root: &Path, path: &Path, cap: usize) -> io::Result<()> {
+    let mut found: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    let mut stack = vec![root.join("target")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() && meta.len() >= 256 * 1024 && is_machine_code(&entry.path()) {
+                found.push((meta.len(), entry.path()));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(io::Error::other(
+            "no executables under target/; build the workspace first",
+        ));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut out = BufWriter::new(File::create(path)?);
+    let mut written = 0usize;
+    for (len, file) in found {
+        if written >= cap {
+            break;
+        }
+        let take = (cap - written).min(len as usize) as u64;
+        let mut input = File::open(&file)?.take(take);
+        written += io::copy(&mut input, &mut out)? as usize;
+    }
+    out.flush()
+}
+
+/// Whether a file starts with an ELF, Mach-O or PE magic number.
+fn is_machine_code(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    matches!(
+        magic,
+        [0x7F, b'E', b'L', b'F']                       // ELF
+            | [0xFE, 0xED, 0xFA, 0xCE | 0xCF]          // Mach-O, big endian
+            | [0xCE | 0xCF, 0xFA, 0xED, 0xFE]          // Mach-O, little endian
+            | [0xCA, 0xFE, 0xBA, 0xBE] // Mach-O universal
+    ) || magic[..2] == *b"MZ" // PE
 }
 
 #[cfg(test)]
