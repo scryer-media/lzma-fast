@@ -64,11 +64,12 @@ crypto-host = ["std", "native-crypto"]
 # kernel that replaced a loop from the C, so that the A/B behind the change is
 # one binary with one branch - in the position a target-feature probe's cached
 # bool would sit - rather than two builds whose inlining and layout differ at
-# the couple of percent the comparison is written in. `LZMA_TURBO_MATCH_RUN`
-# takes `scalar` for the byte loop the scan replaced. Without the feature the
+# the couple of percent the comparison is written in. The toggles are
+# `LZMA_TURBO_MATCH_RUN`, `LZMA_TURBO_BCJ_SCAN` and `LZMA_TURBO_DELTA`, each
+# taking `scalar` for the loop the kernel replaced. Without the feature the
 # shipped build has neither the branch nor the environment lookup. See
-# `src/kernel_ab.rs`.
-kernel-ab = ["std", "enc"]
+# `src/kernel_ab.rs` and `docs/simd-kernels-report.md`.
+kernel-ab = ["std", "enc", "xz"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }

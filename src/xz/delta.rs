@@ -69,8 +69,38 @@ impl Delta {
             for i in 0..delta {
                 data[i] = data[i].wrapping_add(self.state[i]);
             }
-            for i in delta..size {
-                data[i] = data[i].wrapping_add(data[i - delta]);
+            // C: `for (i = delta; i < size; i++) buf[i] += buf[i - delta];`
+            //
+            // Written the way the C writes it this is a byte at a time, and it
+            // has to be: `delta` is a runtime value, so nothing may assume the
+            // distance between the two indices. But the recurrence only
+            // reaches back `delta` bytes, so any `delta` consecutive outputs
+            // depend on bytes that are already final and on nothing inside
+            // their own block. Adding a block at a time says exactly that, as
+            // two slices that cannot overlap, and the add vectorizes.
+            //
+            // Only from 16 bytes up. Below that the block is shorter than a
+            // vector register and the per-block bookkeeping costs more than
+            // the byte loop it replaces.
+            #[cfg(feature = "kernel-ab")]
+            let blocked = delta >= 16 && crate::kernel_ab::delta_blocked();
+            #[cfg(not(feature = "kernel-ab"))]
+            let blocked = delta >= 16;
+            if blocked {
+                let mut i = delta;
+                while i < size {
+                    let n = delta.min(size - i);
+                    let (done, rest) = data.split_at_mut(i);
+                    let src = &done[i - delta..i - delta + n];
+                    for (d, s) in rest[..n].iter_mut().zip(src) {
+                        *d = d.wrapping_add(*s);
+                    }
+                    i += n;
+                }
+            } else {
+                for i in delta..size {
+                    data[i] = data[i].wrapping_add(data[i - delta]);
+                }
             }
             self.state[..delta].copy_from_slice(&data[size - delta..]);
         }

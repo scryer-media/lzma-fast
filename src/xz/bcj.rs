@@ -409,32 +409,25 @@ fn x86_conv(data: &mut [u8], pc: u32, state: &mut u32, encoding: bool) -> usize 
                 if p >= lim {
                     break p;
                 }
-                let hit = loop {
-                    let v = get_u32le(data, p) ^ 0xE8E8_E8E8;
-                    p += 4;
-                    if is_bcj_byte(v, 0) {
-                        p -= 3;
-                        break true;
+                // C: `main_loop`, the run between one candidate and the next.
+                // It reads four bytes at a time looking for an `E8` or an
+                // `E9`, and `mask` is zero on every path into here and is not
+                // touched, so the only thing the run decides is where `p` ends
+                // up. Two things about that are load-bearing: a hit leaves `p`
+                // one past the branch byte, and running out leaves `p` at the
+                // end of the four-byte stride, which can be up to three bytes
+                // past `lim` and is what the function then reports as
+                // converted. `stride_end` is that position, so the scan can
+                // look at the same bytes the C does, eight at a time, and stop
+                // where the C stops.
+                let stride_end = p + 4 * ((lim - p).div_ceil(4));
+                match find_branch_byte(&data[p..stride_end]) {
+                    Some(off) => {
+                        p += off + 1;
+                        label = X86Label::A3;
                     }
-                    if is_bcj_byte(v, 1) {
-                        p -= 2;
-                        break true;
-                    }
-                    if is_bcj_byte(v, 2) {
-                        p -= 1;
-                        break true;
-                    }
-                    if is_bcj_byte(v, 3) {
-                        break true;
-                    }
-                    if p >= lim {
-                        break false;
-                    }
-                };
-                if !hit {
-                    break p;
+                    None => break stride_end,
                 }
-                label = X86Label::A3;
             }
             X86Label::A3 => {
                 if p > lim {
@@ -460,6 +453,49 @@ fn x86_conv(data: &mut [u8], pc: u32, state: &mut u32, encoding: bool) -> usize 
 
     *state = mask;
     p
+}
+
+/// The index of the first `0xE8` or `0xE9` in `hay`, eight bytes at a time.
+///
+/// C: the four-byte `main_loop` of `Z7_BRANCH_CONV_ST(X86)`, which is the one
+/// part of the x86 filter that is a search rather than a state machine. On
+/// code the filter is not built for - the wrong architecture, or a data
+/// section - it is nearly the whole cost, because there is nothing to convert
+/// and every byte still has to be looked at.
+///
+/// `0xE8` and `0xE9` differ only in bit 0, so setting bit 0 of every byte maps
+/// both of them onto `0xE9` and maps nothing else onto it. That turns "is one
+/// of two values" into "is one value", which is a zero-byte search, and the
+/// zero-byte test's lowest set flag is at the lowest zero byte, which is the
+/// one the C would have found first.
+#[inline]
+fn find_branch_byte(hay: &[u8]) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const E9S: u64 = 0xE9E9_E9E9_E9E9_E9E9;
+
+    #[cfg(feature = "kernel-ab")]
+    if !crate::kernel_ab::bcj_scan_wide() {
+        return branch_byte_scalar(hay);
+    }
+
+    let mut off = 0usize;
+    for word in hay.chunks_exact(8) {
+        let t = (u64::from_le_bytes(word.try_into().unwrap()) | ONES) ^ E9S;
+        let hits = t.wrapping_sub(ONES) & !t & HIGH;
+        if hits != 0 {
+            return Some(off + (hits.trailing_zeros() as usize >> 3));
+        }
+        off += 8;
+    }
+    branch_byte_scalar(&hay[off..]).map(|i| off + i)
+}
+
+/// The same search one byte at a time: the tail of the word scan, the
+/// differential reference for it, and the `b` arm of the A/B.
+#[inline]
+fn branch_byte_scalar(hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&b| b == 0xE8 || b == 0xE9)
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +929,276 @@ pub fn riscv_encode(data: &mut [u8], pc: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The word scan must name the same byte as the byte scan, for every
+    /// length and every alignment, over bytes chosen to be exactly the ones a
+    /// zero-byte test gets wrong: `0x00`, `0x80`, the high-bit neighbours of
+    /// `0xE8`/`0xE9`, and the two branch opcodes themselves.
+    #[test]
+    fn the_word_scan_finds_the_byte_the_byte_scan_finds() {
+        const ALPHABET: [u8; 8] = [0x00, 0x01, 0x7F, 0x80, 0xE7, 0xE8, 0xE9, 0xEA];
+        // Every three-byte combination, at every offset inside a word and at
+        // every length up to two words plus a tail.
+        let mut hay = alloc::vec::Vec::new();
+        for a in ALPHABET {
+            for b in ALPHABET {
+                for c in ALPHABET {
+                    hay.extend_from_slice(&[a, b, c]);
+                }
+            }
+        }
+        for start in 0..24 {
+            for len in 0..40 {
+                if start + len > hay.len() {
+                    break;
+                }
+                let slice = &hay[start..start + len];
+                assert_eq!(
+                    find_branch_byte(slice),
+                    branch_byte_scalar(slice),
+                    "start {start} len {len}"
+                );
+            }
+        }
+    }
+
+    /// The whole filter, against the four-byte loop it replaced, byte for byte
+    /// and with the same carried state.
+    ///
+    /// The scan is not the only thing that changed shape: running out of
+    /// candidates leaves `p` at the end of a four-byte stride rather than at
+    /// `lim`, and that value is the filter's return, so it decides how much of
+    /// the next call's buffer is re-filtered. Comparing the two conversions
+    /// only proves the bytes; comparing the returns and the states as well is
+    /// what proves the split-call behaviour.
+    #[test]
+    fn the_word_scan_filters_exactly_as_the_four_byte_loop_did() {
+        for seed in 0..64u32 {
+            let src = adversarial_x86(seed, 600);
+            for encoding in [false, true] {
+                // Whole-buffer, at several starting PCs and both carried mask
+                // values the state can arrive with.
+                for pc in [0u32, 1, 3, 0xFFFF_FFFC] {
+                    for start_state in [0u32, 1, 2, 3, 4, 5, 6, 7] {
+                        let (mut a, mut b) = (src.clone(), src.clone());
+                        let (mut sa, mut sb) = (start_state, start_state);
+                        let ra = x86_conv(&mut a, pc, &mut sa, encoding);
+                        let rb = x86_conv_before(&mut b, pc, &mut sb, encoding);
+                        assert_eq!(ra, rb, "return: seed {seed} pc {pc} state {start_state}");
+                        assert_eq!(sa, sb, "state: seed {seed} pc {pc} state {start_state}");
+                        assert!(a == b, "bytes: seed {seed} pc {pc} state {start_state}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same, fed in pieces, so the state and the return are carried the
+    /// way the block pipeline carries them.
+    #[test]
+    fn the_word_scan_filters_exactly_as_the_four_byte_loop_did_across_splits() {
+        for seed in 0..24u32 {
+            let src = adversarial_x86(seed, 400);
+            for chunk in [5usize, 6, 7, 8, 9, 13, 16, 17, 31, 64] {
+                let (mut a, mut b) = (src.clone(), src.clone());
+                let (mut sa, mut sb) = (0u32, 0u32);
+                let (mut pa, mut pb) = (0usize, 0usize);
+                while pa < a.len() && pb < b.len() {
+                    let ea = a.len().min(pa + chunk);
+                    let eb = b.len().min(pb + chunk);
+                    let da = x86_conv(&mut a[pa..ea], pa as u32, &mut sa, false);
+                    let db = x86_conv_before(&mut b[pb..eb], pb as u32, &mut sb, false);
+                    assert_eq!(da, db, "advance: seed {seed} chunk {chunk} at {pa}");
+                    assert_eq!(sa, sb, "state: seed {seed} chunk {chunk} at {pa}");
+                    if da == 0 {
+                        break;
+                    }
+                    pa += da;
+                    pb += db;
+                }
+                assert!(a == b, "bytes: seed {seed} chunk {chunk}");
+            }
+        }
+    }
+
+    /// Bytes shaped like the ones the filter goes wrong on: dense `E8`/`E9`
+    /// runs, branch bytes at every offset inside a four-byte stride, and
+    /// displacements on both sides of the `mask` bookkeeping's thresholds.
+    fn adversarial_x86(seed: u32, len: usize) -> alloc::vec::Vec<u8> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9) | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        let mut out = alloc::vec::Vec::with_capacity(len + 16);
+        while out.len() < len {
+            let r = next();
+            match r % 5 {
+                0 => out.push(0xE8),
+                1 => out.push(0xE9),
+                // The two displacement shapes the converter branches on: one
+                // whose top byte is 0x00/0xFF and one whose is not.
+                2 => out.extend_from_slice(&[
+                    (r >> 8) as u8,
+                    0,
+                    0,
+                    if r & 0x100 != 0 { 0xFF } else { 0 },
+                ]),
+                3 => out.extend_from_slice(&r.to_le_bytes()),
+                _ => out.push((r >> 11) as u8),
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn x86_conv_before(data: &mut [u8], pc: u32, state: &mut u32, encoding: bool) -> usize {
+        let size = data.len();
+        if size < 5 {
+            return 0;
+        }
+        let lim = size - 4;
+        let mut mask = *state;
+        let mut p = 0usize;
+        // C: `pc += 4; BR_PC_INIT`, so BR_PC_GET at index `p` is `pc + 4 + p`.
+        let pc4 = pc.wrapping_add(4);
+
+        let mut label = X86Label::Start;
+        let p = loop {
+            match label {
+                X86Label::Cont => {
+                    mask |= 4;
+                    label = X86Label::Start;
+                }
+                X86Label::Start => {
+                    if p >= lim {
+                        break p;
+                    }
+                    let v = get_u32le(data, p) ^ 0xE8E8_E8E8;
+                    p += 4;
+                    if is_bcj_byte(v, 0) {
+                        p -= 3;
+                        label = X86Label::Mid;
+                        continue;
+                    }
+                    mask >>= 1;
+                    if is_bcj_byte(v, 1) {
+                        p -= 2;
+                        label = X86Label::Mid;
+                        continue;
+                    }
+                    mask >>= 1;
+                    if is_bcj_byte(v, 2) {
+                        p -= 1;
+                        label = X86Label::Mid;
+                        continue;
+                    }
+                    mask = 0;
+                    label = if is_bcj_byte(v, 3) {
+                        X86Label::A3
+                    } else {
+                        X86Label::MainLoop
+                    };
+                }
+                X86Label::Mid => {
+                    if mask == 0 {
+                        label = X86Label::A3;
+                        continue;
+                    }
+                    if p > lim {
+                        p -= 1;
+                        break p;
+                    }
+                    // C: `if (mask > 4 || mask == 3)`, i.e. the masks that say a
+                    // conversion here would overlap one already made.
+                    if mask > 4 || mask == 3 {
+                        mask >>= 1;
+                        label = X86Label::Cont;
+                        continue;
+                    }
+                    mask >>= 1;
+                    if need_conv_ms_byte(u32::from(data[p + mask as usize])) {
+                        label = X86Label::Cont;
+                        continue;
+                    }
+                    let mut v = get_u32le(data, p);
+                    v = v.wrapping_add(1 << 24);
+                    if v & 0xFE00_0000 != 0 {
+                        label = X86Label::Cont;
+                        continue;
+                    }
+                    let c = pc4.wrapping_add(p as u32);
+                    v = convert_val(v, c, encoding);
+                    let sh = mask << 3;
+                    if need_conv_ms_byte(v >> sh) {
+                        v ^= (0x100u32 << sh).wrapping_sub(1);
+                        v = convert_val(v, c, encoding);
+                    }
+                    mask = 0;
+                    v &= (1 << 25) - 1;
+                    v = v.wrapping_sub(1 << 24);
+                    set_u32le(data, p, v);
+                    p += 4;
+                    label = X86Label::MainLoop;
+                }
+                X86Label::MainLoop => {
+                    if p >= lim {
+                        break p;
+                    }
+                    let hit = loop {
+                        let v = get_u32le(data, p) ^ 0xE8E8_E8E8;
+                        p += 4;
+                        if is_bcj_byte(v, 0) {
+                            p -= 3;
+                            break true;
+                        }
+                        if is_bcj_byte(v, 1) {
+                            p -= 2;
+                            break true;
+                        }
+                        if is_bcj_byte(v, 2) {
+                            p -= 1;
+                            break true;
+                        }
+                        if is_bcj_byte(v, 3) {
+                            break true;
+                        }
+                        if p >= lim {
+                            break false;
+                        }
+                    };
+                    if !hit {
+                        break p;
+                    }
+                    label = X86Label::A3;
+                }
+                X86Label::A3 => {
+                    if p > lim {
+                        p -= 1;
+                        break p;
+                    }
+                    let mut v = get_u32le(data, p);
+                    v = v.wrapping_add(1 << 24);
+                    if v & 0xFE00_0000 != 0 {
+                        label = X86Label::Cont;
+                        continue;
+                    }
+                    let c = pc4.wrapping_add(p as u32);
+                    v = convert_val(v, c, encoding);
+                    v &= (1 << 25) - 1;
+                    v = v.wrapping_sub(1 << 24);
+                    set_u32le(data, p, v);
+                    p += 4;
+                    label = X86Label::MainLoop;
+                }
+            }
+        };
+
+        *state = mask;
+        p
+    }
 
     /// Feeding a buffer in pieces, carrying the tail and advancing `pc` as
     /// `Bra.h` says to, must give the same bytes as one call. This is the

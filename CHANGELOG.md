@@ -22,9 +22,31 @@
   has nothing to skip and the figure is +1.7%, never negative. The extension
   loops were 21% of the profile before and the tree walk's own cache misses are
   what is left.
+- The x86 branch filter finds its next candidate a word at a time. The one
+  part of `Z7_BRANCH_CONV_ST(X86)` that is a search rather than a state machine
+  is the run between one `E8`/`E9` and the next, and on code the filter was not
+  built for it is nearly the whole cost. The two opcodes differ only in bit 0,
+  so setting bit 0 of every byte maps both onto one value and nothing else onto
+  it, which turns the search into a zero-byte test over a 64-bit word. The
+  state machine still runs at every hit, and the three bits of mask it carries
+  between calls are untouched.
+- Decoding 64.0 MiB of x86 executables through the filter on an i5-1240P,
+  medians of seven interleaved rounds: 0.305s to 0.297s (+2.6%). The same
+  bytes with no filter in the chain move 0.00%, which is the control.
+- The delta filter adds a block at a time at wide distances. The recurrence
+  only reaches back `distance` bytes, so any `distance` consecutive outputs
+  depend on bytes that are already final and on nothing inside their own block;
+  adding a block at a time says that as two slices that cannot overlap, and the
+  add vectorizes. Below 16 the block is shorter than a vector register and the
+  byte loop stays. At distance 64: 0.424s to 0.411s (+3.1%). At distance 4,
+  where the byte loop still runs: +0.4%.
+- Both filters are byte-for-byte what the SDK's own produce, on the SDK's own
+  harness, and the x86 one is held against the four-byte loop it replaced
+  directly - conversions, returns and carried state, whole and in pieces.
 - `kernel-ab` is a new non-default feature that puts a cached toggle in front
-  of the scan, so the measurement above is one binary with the arm chosen at
-  run time rather than two builds. It is for benchmarking and nothing else.
+  of each of the three, so the measurements above are one binary with the arm
+  chosen at run time rather than two builds. It is for benchmarking and nothing
+  else.
 
 ## 0.5.0 - 2026-09-18
 

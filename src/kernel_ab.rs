@@ -13,6 +13,8 @@
 //! and the crate reads no environment variables.
 //!
 //! - `LZMA_TURBO_MATCH_RUN`: `scalar`, `w8` (default) or `w16`.
+//! - `LZMA_TURBO_BCJ_SCAN`: `scalar` or `wide` (default).
+//! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
 //!
 //! The numbers these produced are in `docs/simd-kernels-report.md`.
 
@@ -41,6 +43,20 @@ pub(crate) fn match_run_arm() -> MatchRunArm {
         2 => MatchRunArm::Word16,
         _ => MatchRunArm::Word8,
     }
+}
+
+/// Whether the x86 branch-byte search runs a word at a time. `false` is the
+/// SDK's four-byte-with-four-tests loop.
+pub(crate) fn bcj_scan_wide() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_BCJ_SCAN", |v| u8::from(v != "scalar")) == 1
+}
+
+/// Whether the delta decoder adds a block at a time at wide distances.
+/// `false` is the C's byte-at-a-time recurrence.
+pub(crate) fn delta_blocked() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_DELTA", |v| u8::from(v != "scalar")) == 1
 }
 
 const UNSET: u8 = 255;
