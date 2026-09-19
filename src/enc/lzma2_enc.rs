@@ -323,6 +323,9 @@ pub struct Lzma2Encoder {
     mem_limit: u64,
     /// C: `me->expectedDataSize`.
     expected_data_size: u64,
+    /// What [`Lzma2Encoder::coder`] was built with, so that a change of block
+    /// size can be noticed.
+    coder_props: LzmaEncProps,
 }
 
 impl Lzma2Encoder {
@@ -347,7 +350,41 @@ impl Lzma2Encoder {
             threads: 1,
             mem_limit: u64::MAX,
             expected_data_size: u64::MAX,
+            coder_props: *props,
         })
+    }
+
+    /// The LZMA settings a block is actually encoded with.
+    ///
+    /// C: the `reduceSize` dance at the top of `Lzma2EncProps_Normalize` — a
+    /// block smaller than the file is all the dictionary a block coder can
+    /// ever see, so `LzmaEncProps_Normalize` is told to shrink the dictionary
+    /// to it. A solid or automatic block size leaves the settings alone, which
+    /// is why `Lzma2Encoder::new` can normalize before the block size is
+    /// known.
+    fn effective_props(&self) -> LzmaEncProps {
+        let mut p = self.props;
+        let bs = self.block_size;
+        if bs != BLOCK_SIZE_SOLID
+            && bs != BLOCK_SIZE_AUTO
+            && (bs < p.reduce_size || p.reduce_size == u64::MAX)
+        {
+            p.reduce_size = bs;
+        }
+        p
+    }
+
+    /// Rebuilds the single-threaded coder if the block size has changed what
+    /// [`Lzma2Encoder::effective_props`] resolves to.
+    fn sync_coder(&mut self) -> Result<(), Error> {
+        let want = self.effective_props();
+        if want == self.coder_props {
+            return Ok(());
+        }
+        self.coder = Lzma2EncInt::new(&want)?;
+        self.dict_size = self.coder.dict_size;
+        self.coder_props = want;
+        Ok(())
     }
 
     /// The single LZMA2 property byte, as the `.xz` filter and the 7z coder
@@ -356,9 +393,10 @@ impl Lzma2Encoder {
     /// C: `Lzma2Enc_WriteProperties`.
     #[must_use]
     pub fn properties(&self) -> u8 {
+        let dict_size = self.dict_size();
         let mut i = 0u32;
         while i < 40 {
-            if self.dict_size <= dic_size_from_prop(i) {
+            if dict_size <= dic_size_from_prop(i) {
                 break;
             }
             i += 1;
@@ -366,10 +404,11 @@ impl Lzma2Encoder {
         i as u8
     }
 
-    /// The dictionary size the property byte rounds up to.
+    /// The dictionary size the property byte rounds up to, with the block
+    /// size's effect on it applied.
     #[must_use]
     pub fn dict_size(&self) -> u32 {
-        self.dict_size
+        self.effective_props().normalized().dict_size
     }
 
     /// C: `Lzma2Enc_SetDataSize`.
@@ -398,7 +437,7 @@ impl Lzma2Encoder {
                     // block".
                     BLOCK_SIZE_SOLID
                 } else {
-                    auto_block_size(self.dict_size)
+                    auto_block_size(self.dict_size())
                 }
             }
             other => other,
@@ -430,12 +469,13 @@ impl Lzma2Encoder {
     #[must_use]
     pub fn mem_usage_per_thread(&mut self) -> u64 {
         let block = match self.block_size() {
-            BLOCK_SIZE_SOLID => u64::from(self.dict_size),
+            BLOCK_SIZE_SOLID => u64::from(self.dict_size()),
             other => other,
         };
         // C: `destBlockSize` in `Lzma2Enc_Encode2`, plus the block's own copy
         // of the input that `MtCoder` holds.
         let bufs = block + (block >> 10) + 16 + block;
+        let _ = self.sync_coder();
         self.coder.enc.mem_usage().saturating_add(bufs)
     }
 
@@ -481,6 +521,7 @@ impl Lzma2Encoder {
         input: &mut dyn SeqInStream,
         out: &mut dyn SeqOutStream,
     ) -> Result<(), Error> {
+        self.sync_coder()?;
         let block_size = self.block_size();
         self.coder
             .encode_mt1_stream(input, out, block_size, self.expected_data_size, true)
@@ -505,6 +546,7 @@ impl Lzma2Encoder {
         src: &[u8],
         out: &mut (dyn SeqOutStream + Send),
     ) -> Result<(), Error> {
+        self.sync_coder()?;
         #[cfg(feature = "std")]
         {
             let threads = self.threads_reduced();
@@ -552,6 +594,7 @@ impl Lzma2Encoder {
         input: &mut (dyn SeqInStream + Send),
         out: &mut (dyn SeqOutStream + Send),
     ) -> Result<(), Error> {
+        self.sync_coder()?;
         let threads = self.threads_reduced();
         if threads <= 1 {
             return self.encode(input, out);
@@ -581,6 +624,7 @@ impl Lzma2Encoder {
         threads: usize,
     ) -> Result<(), Error> {
         let block_size = usize::try_from(self.block_size()).map_err(|_| Error::Param)?;
+        let props = self.coder_props;
 
         // C: `me->coders[i]`, one per block thread, and `me->outBufs[i]`, one
         // per block in flight. The C allocates the out buffers at
@@ -592,7 +636,7 @@ impl Lzma2Encoder {
             .try_reserve_exact(threads)
             .map_err(|_| Error::Alloc)?;
         for _ in 0..threads {
-            coders.push(Mutex::new(Lzma2EncInt::new(&self.props)?));
+            coders.push(Mutex::new(Lzma2EncInt::new(&props)?));
         }
         let mut out_bufs = Vec::new();
         out_bufs

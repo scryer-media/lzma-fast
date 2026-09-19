@@ -519,9 +519,11 @@ jobs:
       - name: Install the xz the container tests are written against
         if: runner.os == 'Linux'
         run: ./.github/scripts/install-xz.sh
-      # `cargo xtask lzma-util` builds LzmaUtil, the two props-driven oracles
-      # and the filter oracle from the pinned SDK sources with gcc-style
-      # flags. The Windows image has MinGW's gcc but no `cc`.
+      # `cargo xtask lzma-util` builds LzmaUtil, the props-driven oracles --
+      # including the LZMA2 one built without `Z7_ST`, which is the only build
+      # that has `MtCoder.c` and `LzFindMt.c` in it -- and the filter oracle
+      # from the pinned SDK sources with gcc-style flags. The Windows image has
+      # MinGW's gcc but no `cc`.
       - name: Build the reference encoder from the pinned SDK
         env:
           CC: ${{ runner.os == 'Windows' && 'gcc' || 'cc' }}
@@ -532,6 +534,12 @@ jobs:
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test lzma_parity --test lzma2_encoder
+      # The threaded encoder has to agree with the threaded reference, and
+      # with itself at every thread count.
+      - name: Bit-exact with the multi-threaded reference encoder
+        env:
+          LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
+        run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity
       # Same rule for the BCJ and delta converters, both directions.
       - name: Bit-exact with the reference filters
         env:
