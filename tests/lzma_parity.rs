@@ -11,7 +11,7 @@
 //! `SplitMix64` away from a handful of shapes, sized to straddle the
 //! dictionary sizes and the 64 KiB range-encoder buffer.
 
-#![cfg(feature = "std")]
+#![cfg(all(feature = "std", feature = "enc"))]
 
 use std::process::Command;
 

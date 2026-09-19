@@ -298,6 +298,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     };
     let oracle_src = write_src("lzma-oracle.c", ORACLE_C)?;
     let oracle2_src = write_src("lzma2-oracle.c", ORACLE2_C)?;
+    let filter_src = write_src("filter-oracle.c", ORACLE_FILTER_C)?;
 
     // C: the `Z7_ST` build. `-D_7ZIP_ST` is the older spelling the SDK still
     // honours; passing both keeps this working either way.
@@ -349,8 +350,82 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     ]));
     build(&oracle2, &oracle2_srcs)?;
 
-    Ok(vec![util, oracle, oracle2])
+    let filters = dest.join("filter-oracle");
+    let mut filter_srcs = vec![filter_src];
+    filter_srcs.extend(core(&[
+        "CpuArch.c",
+        "Bra.c",
+        "Bra86.c",
+        "BraIA64.c",
+        "Delta.c",
+    ]));
+    build(&filters, &filter_srcs)?;
+
+    Ok(vec![util, oracle, oracle2, filters])
 }
+
+/// The SDK's own branch converters and delta filter, driven from the command
+/// line, so the filter port can be compared byte for byte against them.
+const ORACLE_FILTER_C: &str = r##"/* The SDK's BCJ and delta filters, for parity testing.
+   Usage: filter-oracle <name> <enc|dec> <start-offset-or-distance> <in> <out>
+   <name> is one of x86 ppc ia64 arm armt sparc arm64 riscv delta. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Bra.h"
+#include "Delta.h"
+
+int main(int argc, char **argv)
+{
+  if (argc != 6) { fprintf(stderr, "usage: filter-oracle name enc|dec n in out\n"); return 2; }
+  {
+  const char *name = argv[1];
+  const int enc = strcmp(argv[2], "enc") == 0;
+  const UInt32 n = (UInt32)strtoul(argv[3], NULL, 0);
+  FILE *fi = fopen(argv[4], "rb"), *fo;
+  Byte *buf; size_t size;
+  if (!fi) { perror("open in"); return 2; }
+  fseek(fi, 0, SEEK_END); size = (size_t)ftell(fi); fseek(fi, 0, SEEK_SET);
+  buf = (Byte *)malloc(size ? size : 1);
+  if (!buf) return 2;
+  if (size && fread(buf, 1, size, fi) != size) { perror("read"); return 2; }
+  fclose(fi);
+
+  if (strcmp(name, "delta") == 0)
+  {
+    Byte state[DELTA_STATE_SIZE];
+    Delta_Init(state);
+    if (enc) Delta_Encode(state, (unsigned)n, buf, size);
+    else     Delta_Decode(state, (unsigned)n, buf, size);
+  }
+  else if (strcmp(name, "x86") == 0)
+  {
+    UInt32 state = Z7_BRANCH_CONV_ST_X86_STATE_INIT_VAL;
+    if (enc) z7_BranchConvSt_X86_Enc(buf, size, n, &state);
+    else     z7_BranchConvSt_X86_Dec(buf, size, n, &state);
+  }
+#define CONV(s, id) \
+  else if (strcmp(name, s) == 0) \
+  { if (enc) z7_BranchConv_ ## id ## _Enc(buf, size, n); \
+    else     z7_BranchConv_ ## id ## _Dec(buf, size, n); }
+  CONV("ppc",   PPC)
+  CONV("ia64",  IA64)
+  CONV("arm",   ARM)
+  CONV("armt",  ARMT)
+  CONV("sparc", SPARC)
+  CONV("arm64", ARM64)
+  CONV("riscv", RISCV)
+  else { fprintf(stderr, "unknown filter %s\n", name); return 2; }
+
+  fo = fopen(argv[5], "wb");
+  if (!fo) { perror("open out"); return 2; }
+  if (size && fwrite(buf, 1, size, fo) != size) { perror("write"); return 2; }
+  fclose(fo);
+  free(buf);
+  return 0;
+  }
+}
+"##;
 
 /// A props-driven LZMA-Alone encoder over the pinned SDK. It is written out by
 /// [`lzma_util`] rather than committed, so that nothing in this repository

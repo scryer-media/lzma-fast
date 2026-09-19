@@ -121,10 +121,12 @@ unit an xz stream checks.
 The encoder is a port of the same SDK's `LzFind.c`, `LzmaEnc.c` and
 `Lzma2Enc.c`, behind the default `enc` feature: the six match finders, the
 optimal parser and the LZMA2 chunk layer, with `.lzma` and `.xz` writers and
-`std::io::Write` adapters over them. It is bit-exact with the reference
-encoder — the same input at the same settings produces the same bytes — and
-the parity tests check that against binaries built from the pinned SDK sources
-over a generated corpus. What was left out, and how the frame around the
+`std::io::Write` adapters over them. The BCJ and delta filters are ported in
+both directions too, so the `.xz` writer can emit filtered blocks and not only
+plain LZMA2. It is bit-exact with the reference encoder — the same input at
+the same settings produces the same bytes, and every converter agrees with the
+SDK's byte for byte in both directions — and the parity tests check that
+against binaries built from the pinned SDK sources over a generated corpus. What was left out, and how the frame around the
 compressed data is proved instead, is in
 [docs/encoder.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/encoder.md).
 

@@ -1,8 +1,8 @@
-//! The branch/call/jump converters, decode side.
+//! The branch/call/jump converters, both directions.
 //!
-//! C: `C/Bra86.c` (`z7_BranchConvSt_X86_Dec`) and `C/Bra.c`
-//! (`z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64,RISCV}_Dec`), both public
-//! domain. These are ports, goto for goto: the x86 one in particular is not
+//! C: `C/Bra86.c` (`z7_BranchConvSt_X86_Dec` / `_Enc`) and `C/Bra.c`
+//! (`z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64}_Dec` / `_Enc` and
+//! `z7_BranchConv_RISCV_Dec` / `_Enc`), both public domain. These are ports, goto for goto: the x86 one in particular is not
 //! the obvious byte-at-a-time filter but a four-byte scan that tests all four
 //! positions of a word at once, which is why it is worth porting rather than
 //! rewriting.
@@ -16,6 +16,14 @@
 //!   the buffer is shorter than the filter's alignment plus its lookahead.
 //!
 //! The x86 converter additionally carries three bits of state between calls.
+//!
+//! Encoding and decoding are the same function in the C, which takes an
+//! `encoding` flag and expands `BR_CONVERT_VAL(v, c)` to `v += c` or
+//! `v -= c`; that is the whole difference for every converter but IA64, which
+//! masks its `pc` differently, and RISC-V, which the C writes out as two
+//! separate functions. This port keeps that shape: one `*_conv` per converter
+//! taking the flag, with `*_decode` and `*_encode` wrappers, and RISC-V's two
+//! functions written out separately as the C does.
 //!
 //! These are `pub` on purpose: the 7z crate that sits on this one needs the
 //! same converters, and there should be one copy of them.
@@ -56,6 +64,17 @@ fn get_u16le(d: &[u8], i: usize) -> u32 {
 #[inline]
 fn set_u16le(d: &mut [u8], i: usize, v: u16) {
     d[i..i + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+/// C: `BR_CONVERT_VAL(v, c)`, the one line that separates an encoder from a
+/// decoder in every converter but RISC-V's.
+#[inline]
+fn convert_val(v: u32, c: u32, encoding: bool) -> u32 {
+    if encoding {
+        v.wrapping_add(c)
+    } else {
+        v.wrapping_sub(c)
+    }
 }
 
 /// Which converter, and with it the alignment a start offset must respect and
@@ -200,6 +219,65 @@ impl Bcj {
         self.pc = self.pc.wrapping_add(n as u32);
         n
     }
+
+    /// The other direction, with the same contract: converts in place, returns
+    /// how many leading bytes were converted, and leaves the tail for the next
+    /// call. Feeding a buffer in pieces therefore gives the same bytes as
+    /// feeding it whole, exactly as on the decode side.
+    pub fn encode(&mut self, data: &mut [u8]) -> usize {
+        let n = match self.kind {
+            BcjKind::X86 => x86_encode(data, self.pc, &mut self.state),
+            BcjKind::Ppc => ppc_encode(data, self.pc),
+            BcjKind::Ia64 => ia64_encode(data, self.pc),
+            BcjKind::Arm => arm_encode(data, self.pc),
+            BcjKind::ArmThumb => armt_encode(data, self.pc),
+            BcjKind::Sparc => sparc_encode(data, self.pc),
+            BcjKind::Arm64 => arm64_encode(data, self.pc),
+            BcjKind::RiscV => riscv_encode(data, self.pc),
+        };
+        self.pc = self.pc.wrapping_add(n as u32);
+        n
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two directions of each converter. C: the `Z7_BRANCH_CONV_*_FUNC_IMP`
+// macros, which instantiate each shared body with `encoding` 0 and 1.
+// ---------------------------------------------------------------------------
+
+macro_rules! branch_funcs {
+    ($conv:ident, $dec:ident, $enc:ident, $cname:literal) => {
+        #[doc = concat!("C: `z7_BranchConv_", $cname, "_Dec`.")]
+        #[must_use]
+        pub fn $dec(data: &mut [u8], pc: u32) -> usize {
+            $conv(data, pc, false)
+        }
+
+        #[doc = concat!("C: `z7_BranchConv_", $cname, "_Enc`.")]
+        #[must_use]
+        pub fn $enc(data: &mut [u8], pc: u32) -> usize {
+            $conv(data, pc, true)
+        }
+    };
+}
+
+branch_funcs!(arm64_conv, arm64_decode, arm64_encode, "ARM64");
+branch_funcs!(arm_conv, arm_decode, arm_encode, "ARM");
+branch_funcs!(ppc_conv, ppc_decode, ppc_encode, "PPC");
+branch_funcs!(sparc_conv, sparc_decode, sparc_encode, "SPARC");
+branch_funcs!(armt_conv, armt_decode, armt_encode, "ARMT");
+branch_funcs!(ia64_conv, ia64_decode, ia64_encode, "IA64");
+
+/// C: `z7_BranchConvSt_X86_Dec`.
+#[must_use]
+pub fn x86_decode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
+    x86_conv(data, pc, state, false)
+}
+
+/// C: `z7_BranchConvSt_X86_Enc`.
+#[must_use]
+pub fn x86_encode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
+    x86_conv(data, pc, state, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +316,7 @@ enum X86Label {
 /// Ported with the `goto` graph made explicit rather than restructured: the
 /// four-way word scan and the mask bookkeeping only make sense together.
 #[must_use]
-pub fn x86_decode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
+fn x86_conv(data: &mut [u8], pc: u32, state: &mut u32, encoding: bool) -> usize {
     let size = data.len();
     if size < 5 {
         return 0;
@@ -314,11 +392,11 @@ pub fn x86_decode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
                     continue;
                 }
                 let c = pc4.wrapping_add(p as u32);
-                v = v.wrapping_sub(c);
+                v = convert_val(v, c, encoding);
                 let sh = mask << 3;
                 if need_conv_ms_byte(v >> sh) {
                     v ^= (0x100u32 << sh).wrapping_sub(1);
-                    v = v.wrapping_sub(c);
+                    v = convert_val(v, c, encoding);
                 }
                 mask = 0;
                 v &= (1 << 25) - 1;
@@ -370,7 +448,7 @@ pub fn x86_decode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
                     continue;
                 }
                 let c = pc4.wrapping_add(p as u32);
-                v = v.wrapping_sub(c);
+                v = convert_val(v, c, encoding);
                 v &= (1 << 25) - 1;
                 v = v.wrapping_sub(1 << 24);
                 set_u32le(data, p, v);
@@ -388,9 +466,8 @@ pub fn x86_decode(data: &mut [u8], pc: u32, state: &mut u32) -> usize {
 // The RISC converters. C: Bra.c.
 // ---------------------------------------------------------------------------
 
-/// C: `z7_BranchConv_ARM64_Dec`.
-#[must_use]
-pub fn arm64_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_ARM64_Dec` / `_Enc`.
+fn arm64_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     const FLAG: u32 = 1 << (24 - 4);
     const MASK: u32 = (1 << 24) - (FLAG << 1);
     let lim = data.len() & !3;
@@ -402,7 +479,7 @@ pub fn arm64_decode(data: &mut [u8], pc: u32) -> usize {
         let pc_here = pc.wrapping_add(j as u32);
         if v.wrapping_sub(0x9400_0000) & 0xFC00_0000 == 0 {
             let c = pc_here >> 2;
-            v = v.wrapping_sub(c);
+            v = convert_val(v, c, encoding);
             v &= 0x03FF_FFFF;
             v |= 0x9400_0000;
             set_u32le(data, j, v);
@@ -418,7 +495,7 @@ pub fn arm64_decode(data: &mut [u8], pc: u32) -> usize {
             }
             let mut z = (v & 0xFFFF_FFE0) | (v >> 26);
             let c = (pc_here >> (12 - 3)) & !7u32;
-            z = z.wrapping_sub(c);
+            z = convert_val(z, c, encoding);
             v &= 0x1F;
             v |= 0x9000_0000;
             v |= z << 26;
@@ -430,9 +507,8 @@ pub fn arm64_decode(data: &mut [u8], pc: u32) -> usize {
     lim
 }
 
-/// C: `z7_BranchConv_ARM_Dec`.
-#[must_use]
-pub fn arm_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_ARM_Dec` / `_Enc`.
+fn arm_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let lim = data.len() & !3;
     let mut j = 0usize;
     while j != lim {
@@ -441,7 +517,7 @@ pub fn arm_decode(data: &mut [u8], pc: u32) -> usize {
             // C: `pc += 8 - 4` and `p` points past the instruction: an ARM
             // branch offset is relative to the instruction after next.
             let c = pc.wrapping_add(j as u32).wrapping_add(8) >> 2;
-            let mut v = v.wrapping_sub(c);
+            let mut v = convert_val(v, c, encoding);
             v &= 0x00FF_FFFF;
             v |= 0xEB00_0000;
             set_u32le(data, j, v);
@@ -451,16 +527,15 @@ pub fn arm_decode(data: &mut [u8], pc: u32) -> usize {
     lim
 }
 
-/// C: `z7_BranchConv_PPC_Dec`.
-#[must_use]
-pub fn ppc_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_PPC_Dec` / `_Enc`.
+fn ppc_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let lim = data.len() & !3;
     let mut j = 0usize;
     while j != lim {
         let v = get_u32be(data, j);
         if v.wrapping_sub(0x4800_0001) & 0xFC00_0003 == 0 {
             let c = pc.wrapping_add(j as u32);
-            let mut v = v.wrapping_sub(c);
+            let mut v = convert_val(v, c, encoding);
             v &= 0x03FF_FFFF;
             v |= 0x4800_0000;
             set_u32be(data, j, v);
@@ -470,9 +545,9 @@ pub fn ppc_decode(data: &mut [u8], pc: u32) -> usize {
     lim
 }
 
-/// C: `z7_BranchConv_SPARC_Dec`, the branch without `BR_SPARC_USE_ROTATE`.
-#[must_use]
-pub fn sparc_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_SPARC_Dec` / `_Enc`, the branch without
+/// `BR_SPARC_USE_ROTATE`.
+fn sparc_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     const FLAG: u32 = 1 << 22;
     let lim = data.len() & !3;
     let mut j = 0usize;
@@ -484,7 +559,7 @@ pub fn sparc_decode(data: &mut [u8], pc: u32) -> usize {
         if v & (FLAG << 1).wrapping_neg() == 0 {
             v <<= 2;
             let c = pc.wrapping_add(j as u32);
-            v = v.wrapping_sub(c);
+            v = convert_val(v, c, encoding);
             v &= (FLAG << 3) - 1;
             v = v.wrapping_sub(FLAG << 2);
             v >>= 2;
@@ -496,9 +571,8 @@ pub fn sparc_decode(data: &mut [u8], pc: u32) -> usize {
     lim
 }
 
-/// C: `z7_BranchConv_ARMT_Dec`.
-#[must_use]
-pub fn armt_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_ARMT_Dec` / `_Enc`.
+fn armt_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let size = data.len() & !1;
     if size <= 2 {
         return 0;
@@ -533,7 +607,7 @@ pub fn armt_decode(data: &mut [u8], pc: u32) -> usize {
             let v = (get_u16le(data, p - 2) << 11) | (get_u16le(data, p) & 0x7FF);
             p += 2;
             let c = pc.wrapping_add(p as u32) >> 1;
-            let v = v.wrapping_sub(c);
+            let v = convert_val(v, c, encoding);
             set_u16le(data, p - 4, (((v >> 11) & 0x7FF) | 0xF000) as u16);
             set_u16le(data, p - 2, (v | 0xF800) as u16);
         }
@@ -543,9 +617,8 @@ pub fn armt_decode(data: &mut [u8], pc: u32) -> usize {
     }
 }
 
-/// C: `z7_BranchConv_IA64_Dec`.
-#[must_use]
-pub fn ia64_decode(data: &mut [u8], pc: u32) -> usize {
+/// C: `z7_BranchConv_IA64_Dec` / `_Enc`.
+fn ia64_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let lim = data.len() & !15;
     let mut p = 0usize;
     // C: `pc -= 1 << 4; pc >>= 4 - 1;`
@@ -575,10 +648,19 @@ pub fn ia64_decode(data: &mut [u8], pc: u32) -> usize {
             {
                 let mut v = ((0x8F_FFFFu32 << 1) | 1) & z;
                 let mut z = z ^ v;
-                // C: the decode arm sets the top bits of `pc` rather than
-                // masking `v`; it is idempotent, and `v` is masked below.
-                pc |= !((0x1F_FFFFu32 << 1) | 1);
-                v = v.wrapping_sub(pc);
+                // C: the only converter whose two directions differ by
+                // more than `BR_CONVERT_VAL`. The decode arm sets the top
+                // bits of `pc` rather than masking them off; both mutate the
+                // local `pc` in place, and that mutation persists across
+                // iterations exactly as in the C (it is idempotent either
+                // way, since `pc` only ever gains `1 << 1` between turns).
+                if encoding {
+                    pc &= (0x1F_FFFFu32 << 1) | 1;
+                    v = v.wrapping_add(pc);
+                } else {
+                    pc |= !((0x1F_FFFFu32 << 1) | 1);
+                    v = v.wrapping_sub(pc);
+                }
                 v &= !(0x60_0000u32 << 1);
                 v = v.wrapping_add(0x70_0000 << 1);
                 v &= (0x8F_FFFFu32 << 1) | 1;
@@ -595,6 +677,11 @@ pub fn ia64_decode(data: &mut [u8], pc: u32) -> usize {
 }
 
 /// C: `Z7_BRANCH_CONV_DEC(RISCV)` in `Bra.c`, xz filter id 0x0B.
+///
+/// RISC-V is the one converter the C writes out twice instead of taking an
+/// `encoding` flag: the two directions rebuild the instruction pair from
+/// different halves, and the branch that converts is the other one. See
+/// [`riscv_encode`].
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn riscv_decode(data: &mut [u8], pc: u32) -> usize {
@@ -695,6 +782,114 @@ pub fn riscv_decode(data: &mut [u8], pc: u32) -> usize {
     }
 }
 
+/// C: `Z7_BRANCH_CONV_ENC(RISCV)` in `Bra.c`, xz filter id 0x0B.
+///
+/// Not a flag away from [`riscv_decode`]: the scan loop is shared
+/// (`RISCV_SCAN_LOOP`), but the JAL arm rebuilds the three offset bytes from
+/// the whole word rather than from the masked form, and of the two AUIPC arms
+/// it is the *first* (a register other than x0/x2, `RISCV_CHECK_1`) that
+/// converts, where the decoder converts in the second (`RISCV_CHECK_2`).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn riscv_encode(data: &mut [u8], pc: u32) -> usize {
+    /// C: `RISCV_CHECK_1`.
+    #[inline]
+    fn check1(v: u32, b: u32) -> bool {
+        (b.wrapping_sub(3) ^ (v << 8)) & (0xF_8000 + 3) == 0
+    }
+    /// C: `RISCV_CHECK_2`.
+    #[inline]
+    fn check2(v: u32, r: u32) -> bool {
+        (v.wrapping_sub((3 << 12) | (2 << 7) | 8) << 18) < (r & 0x1D)
+    }
+
+    let size = data.len() & !1;
+    if size <= 6 {
+        return 0;
+    }
+    let lim = size - 6;
+    let mut p = 0usize;
+
+    loop {
+        // C: `RISCV_SCAN_LOOP`, byte for byte the decoder's.
+        let mut a;
+        loop {
+            if p >= lim {
+                return p;
+            }
+            a = (get_u16le(data, p) ^ 0x10).wrapping_add(1);
+            if a & 0x77 == 0 {
+                break;
+            }
+            a = (get_u16le(data, p + 2) ^ 0x10).wrapping_add(1);
+            p += 4;
+            if a & 0x77 == 0 {
+                p -= 2;
+                if p >= lim {
+                    return p;
+                }
+                break;
+            }
+        }
+
+        // C: `v = a; a = RISCV_GET_UI32(p);` — `v` stays the scan value and
+        // `a` becomes the whole instruction word.
+        let v0 = a;
+        let a = get_u32le(data, p);
+
+        if v0 & 8 == 0 {
+            // JAL.
+            if v0.wrapping_sub(0x100) & 0xD80 != 0 {
+                p += 2;
+                continue;
+            }
+            let mut v = ((a & (1u32 << 31)) >> 11)
+                | ((a & (0x3FF << 21)) >> 20)
+                | ((a & (1 << 20)) >> 9)
+                | (a & (0xFF << 12));
+            v = v.wrapping_add(pc.wrapping_add(p as u32));
+            data[p + 1] = (((v >> 13) & 0xF0) | ((a >> 8) & 0xF)) as u8;
+            data[p + 2] = (v >> 9) as u8;
+            data[p + 3] = (v >> 1) as u8;
+            p += 4;
+            continue;
+        }
+
+        // AUIPC.
+        if v0 & 0xE80 != 0 {
+            // A register other than x0/x2: this is the arm that converts.
+            let b = get_u32le(data, p + 4);
+            if check1(v0, b) {
+                let temp = (b << 12) | (0x17 + (2 << 7));
+                set_u32le(data, p, temp);
+                let mut w = a & 0xFFFF_F000;
+                // C: the portable emulation of `(Int32)b >> 20`.
+                w = w.wrapping_add((b >> 20).wrapping_sub((b >> 19) & 0x1000));
+                w = w.wrapping_add(pc.wrapping_add(p as u32));
+                set_u32be(data, p + 4, w);
+                p += 8;
+            } else {
+                // C: RISCV_STEP_1.
+                p += 6;
+            }
+        } else {
+            // x0 / x2.
+            let r = a >> 27;
+            if check2(v0, r) {
+                let v = get_u32le(data, p + 4);
+                let w = (r << 7) + 0x17 + (v & 0xFFFF_F000);
+                let a = (a >> 12) | (v << 20);
+                set_u32le(data, p, w);
+                set_u32le(data, p + 4, a);
+                p += 8;
+            } else {
+                // C: RISCV_STEP_2.
+                p += 4;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +966,38 @@ mod tests {
             let mut buf = [0xE8u8; 4];
             let mut f = Bcj::new(kind, 0).expect("aligned");
             assert_eq!(f.decode(&mut buf[..2]), 0, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn encoding_then_decoding_gives_the_input_back() {
+        // A converter is only an involution up to its own lookahead: whatever
+        // it could not convert at the end of the buffer is left alone by both
+        // directions, so the pair is the identity over the whole buffer.
+        let kinds = [
+            BcjKind::X86,
+            BcjKind::Ppc,
+            BcjKind::Ia64,
+            BcjKind::Arm,
+            BcjKind::ArmThumb,
+            BcjKind::Sparc,
+            BcjKind::Arm64,
+            BcjKind::RiscV,
+        ];
+        for kind in kinds {
+            for len in [0usize, 1, 5, 17, 64, 1000, 4099] {
+                let src: Vec<u8> = (0..len)
+                    .map(|i| {
+                        let x = (i as u32).wrapping_mul(2_654_435_761);
+                        if i % 9 == 0 { 0xE8 } else { (x >> 13) as u8 }
+                    })
+                    .collect();
+                let mut buf = src.clone();
+                let start = kind.alignment() * 2;
+                Bcj::new(kind, start).unwrap().encode(&mut buf);
+                Bcj::new(kind, start).unwrap().decode(&mut buf);
+                assert_eq!(buf, src, "{kind:?}, {len} bytes");
+            }
         }
     }
 }

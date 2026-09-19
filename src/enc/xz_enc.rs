@@ -8,16 +8,18 @@
 //! the port in [`super::lzma2_enc`].
 //!
 //! What it writes is one stream: a header, one or more blocks each declaring
-//! both of its sizes, an index over them, and a footer. The filter chain is
-//! always a bare LZMA2 filter — the delta and BCJ converters the decoder
-//! implements are not applied on the way out, because choosing them is a
-//! policy question the format does not answer and `xz` only answers with
-//! command-line flags.
+//! both of its sizes, an index over them, and a footer. The filter chain is a
+//! bare LZMA2 filter unless the caller asks for more with
+//! [`XzEncoder::set_filters`], in which case the delta and BCJ converters run
+//! over each block before LZMA2 sees it and the block header lists them in
+//! that order. Which filter suits which file is a policy question the format
+//! does not answer and `xz` only answers with command-line flags, so this
+//! writer does not choose for the caller either.
 
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::xz::filter::FILTER_LZMA2;
+use crate::xz::filter::{FILTER_LZMA2, FilterChain, FilterFlags, MAX_FILTERS};
 use crate::xz::stream::{CheckType, XZ_FOOTER_MAGIC, XZ_MAGIC};
 use crate::xz::vli;
 
@@ -86,6 +88,9 @@ pub struct XzEncoder {
     check: CheckType,
     block_size: u64,
     lzma2: Lzma2Encoder,
+    /// The non-last filters, in the order they are applied and listed, empty
+    /// for a bare LZMA2 chain.
+    filters: Vec<FilterFlags>,
     /// Bytes waiting to become a block.
     pending: Vec<u8>,
     /// One `(unpadded size, uncompressed size)` per block written. Spec §4.2.
@@ -108,6 +113,7 @@ impl XzEncoder {
             check: CheckType::Crc64,
             block_size: DEFAULT_BLOCK_SIZE,
             lzma2,
+            filters: Vec::new(),
             pending: Vec::new(),
             records: Vec::new(),
             out: Vec::new(),
@@ -138,6 +144,60 @@ impl XzEncoder {
         self.out.clear();
         self.write_stream_header();
         Ok(())
+    }
+
+    /// Sets the non-last filters of every block's chain, in the order they
+    /// are applied: `[delta]`, `[bcj]`, `[delta, bcj]` and so on, with the
+    /// LZMA2 filter appended for you.
+    ///
+    /// Each filter's state is reset at every block boundary, as the format
+    /// requires, so a filtered stream may still be split into blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Param`] if the chain is one [`FilterChain::validate`] refuses
+    /// — more than three non-last filters, an LZMA2 filter among them, a
+    /// filter this crate does not implement, or a misaligned BCJ start offset
+    /// — or if bytes have already gone in.
+    pub fn set_filters(&mut self, filters: &[FilterFlags]) -> Result<(), Error> {
+        if !self.records.is_empty() || !self.pending.is_empty() {
+            return Err(Error::Param);
+        }
+        if filters.len() >= MAX_FILTERS {
+            return Err(Error::Param);
+        }
+        // Validate the chain a reader will see, which is these plus LZMA2.
+        let _ = self.chain_for(filters)?;
+        self.filters
+            .try_reserve(filters.len())
+            .map_err(|_| Error::Alloc)?;
+        self.filters.clear();
+        self.filters.extend_from_slice(filters);
+        Ok(())
+    }
+
+    /// The non-last filters set with [`XzEncoder::set_filters`].
+    #[must_use]
+    pub fn filters(&self) -> &[FilterFlags] {
+        &self.filters
+    }
+
+    /// The whole chain — the given filters plus this encoder's LZMA2 filter —
+    /// validated the way [`crate::xz`] validates one it has just parsed.
+    fn chain_for(&self, filters: &[FilterFlags]) -> Result<FilterChain, Error> {
+        let mut whole: Vec<FilterFlags> = Vec::new();
+        whole
+            .try_reserve(filters.len() + 1)
+            .map_err(|_| Error::Alloc)?;
+        whole.extend_from_slice(filters);
+        let mut props = [0u8; 4];
+        props[0] = self.lzma2.properties();
+        whole.push(FilterFlags {
+            id: FILTER_LZMA2,
+            props,
+            props_len: 1,
+        });
+        FilterChain::validate(&whole).map_err(|_| Error::Param)
     }
 
     /// How much a single block may decode to before the writer starts
@@ -223,12 +283,35 @@ impl XzEncoder {
     /// Spec §3: header, compressed data, padding to a multiple of four, then
     /// the check.
     fn emit_block(&mut self) -> Result<(), Error> {
-        let data = core::mem::take(&mut self.pending);
-        self.lzma2.set_data_size(data.len() as u64);
+        let mut data = core::mem::take(&mut self.pending);
+        let uncompressed = data.len() as u64;
+
+        // §3.4: the check covers the block's *uncompressed* data, which is
+        // what came in, not what the filters made of it — so take it before
+        // they run. They are size-preserving, so the header's uncompressed
+        // size is the same either way.
+        let mut check_bytes = Vec::new();
+        compute_check(self.check, &data, &mut check_bytes)?;
+
+        if !self.filters.is_empty() {
+            // Fresh converters for every block: the format resets filter
+            // state at each block boundary, and the reader builds them the
+            // same way.
+            let chain = self.chain_for(&self.filters)?;
+            let mut convs = chain.build().map_err(|_| Error::Param)?;
+            convs.encode_in_place(&mut data);
+        }
+
+        self.lzma2.set_data_size(uncompressed);
         let compressed = self.lzma2.encode_to_vec(&data)?;
         let dict_prop = self.lzma2.properties();
 
-        let header = block_header(dict_prop, compressed.len() as u64, data.len() as u64)?;
+        let header = block_header(
+            &self.filters,
+            dict_prop,
+            compressed.len() as u64,
+            uncompressed,
+        )?;
         let unpadded = header.len() + compressed.len() + check_size(self.check);
 
         self.out
@@ -238,10 +321,10 @@ impl XzEncoder {
         self.out.extend_from_slice(&compressed);
         // §3.2 Block Padding: null bytes up to a multiple of four.
         pad_to_four(&mut self.out, compressed.len());
-        compute_check(self.check, &data, &mut self.out)?;
+        self.out.extend_from_slice(&check_bytes);
 
         self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
-        self.records.push((unpadded as u64, data.len() as u64));
+        self.records.push((unpadded as u64, uncompressed));
         self.pending = data;
         self.pending.clear();
         Ok(())
@@ -299,16 +382,24 @@ fn pad_to_four(out: &mut Vec<u8>, written: usize) {
 /// Both sizes are declared, which a decoder is required to check the block
 /// against, and the filter chain is the single LZMA2 filter with its one
 /// dictionary property byte (§5.3.1).
-fn block_header(dict_prop: u8, compressed: u64, uncompressed: u64) -> Result<Vec<u8>, Error> {
+fn block_header(
+    filters: &[FilterFlags],
+    dict_prop: u8,
+    compressed: u64,
+    uncompressed: u64,
+) -> Result<Vec<u8>, Error> {
     // §3.1.2 Block Flags: filter count minus one in bits 0-1, and the two
     // size-present bits.
-    const FLAGS: u8 = 0x40 | 0x80;
+    let flags = 0x40 | 0x80 | filters.len() as u8;
 
-    let body = 2
+    let mut body = 2
         + vli::encoded_len(compressed)
         + vli::encoded_len(uncompressed)
-        + 3 // filter id, property size, the property byte
+        + 3 // the LZMA2 filter: id, property size, the property byte
         ;
+    for f in filters {
+        body += vli::encoded_len(f.id) + vli::encoded_len(f.props_len as u64) + f.props_len;
+    }
     let size = body.next_multiple_of(4) + 4;
     if size > MAX_BLOCK_HEADER_SIZE {
         return Err(Error::Param);
@@ -318,9 +409,15 @@ fn block_header(dict_prop: u8, compressed: u64, uncompressed: u64) -> Result<Vec
     h.try_reserve(size).map_err(|_| Error::Alloc)?;
     // §3.1.1: the stored size is the real size in four-byte units, less one.
     h.push((size / 4 - 1) as u8);
-    h.push(FLAGS);
+    h.push(flags);
     vli::push(compressed, &mut h);
     vli::push(uncompressed, &mut h);
+    // §3.1.5: the filters in the order the encoder applied them, LZMA2 last.
+    for f in filters {
+        vli::push(f.id, &mut h);
+        vli::push(f.props_len as u64, &mut h);
+        h.extend_from_slice(f.props());
+    }
     vli::push(FILTER_LZMA2, &mut h);
     vli::push(1, &mut h); // §3.1.4: the size of the properties that follow.
     h.push(dict_prop);
@@ -347,8 +444,28 @@ pub fn encode_xz(
     check: CheckType,
     block_size: u64,
 ) -> Result<Vec<u8>, Error> {
+    encode_xz_with_filters(src, props, check, block_size, &[])
+}
+
+/// Encode `src` as a whole `.xz` stream through a filter chain.
+///
+/// `filters` are the non-last filters in the order they are applied; the
+/// LZMA2 filter is appended for you, so an empty slice is [`encode_xz`].
+///
+/// # Errors
+///
+/// As [`encode_xz`], plus [`Error::Param`] for a chain
+/// [`XzEncoder::set_filters`] refuses.
+pub fn encode_xz_with_filters(
+    src: &[u8],
+    props: &LzmaEncProps,
+    check: CheckType,
+    block_size: u64,
+    filters: &[FilterFlags],
+) -> Result<Vec<u8>, Error> {
     let mut enc = XzEncoder::new(props)?;
     enc.set_check(check)?;
+    enc.set_filters(filters)?;
     enc.set_block_size(block_size);
     enc.push(src)?;
     enc.finish()?;
@@ -371,11 +488,31 @@ mod tests {
 
     #[test]
     fn a_block_header_is_a_multiple_of_four_and_carries_its_crc() {
-        let h = block_header(20, 1234, 65536).expect("header");
+        let h = block_header(&[], 20, 1234, 65536).expect("header");
         assert!(h.len().is_multiple_of(4));
         assert_eq!(h[0] as usize, h.len() / 4 - 1);
+        // §3.1.2: one filter, so the count bits are zero.
+        assert_eq!(h[1], 0xC0);
         let crc = crate::crc::crc32(&h[..h.len() - 4]);
         assert_eq!(&h[h.len() - 4..], &crc.to_le_bytes());
+    }
+
+    #[test]
+    fn a_filtered_block_header_lists_its_filters_in_order() {
+        let delta = FilterFlags::new(crate::xz::filter::FILTER_DELTA, &[3]).expect("props");
+        let bcj = FilterFlags::new(crate::xz::bcj::BcjKind::X86.filter_id(), &[]).expect("props");
+        let h = block_header(&[delta, bcj], 20, 1234, 65536).expect("header");
+        assert!(h.len().is_multiple_of(4));
+        // §3.1.2: three filters in the chain, so the count bits hold two.
+        assert_eq!(h[1], 0xC2);
+        // The header parser must read back what was written, in the order it
+        // was written: delta, then BCJ, then LZMA2.
+        let parsed = crate::xz::BlockHeader::parse(&h).expect("parses");
+        assert_eq!(parsed.chain.converters.len(), 2);
+        // `converters` is the decode order, so it is the list reversed.
+        assert_eq!(parsed.chain.converters[0].id, bcj.id);
+        assert_eq!(parsed.chain.converters[1].id, delta.id);
+        assert_eq!(parsed.chain.dict_prop, 20);
     }
 
     #[test]

@@ -12,6 +12,8 @@ domain (`C/` in the LZMA SDK).
 | `C/LzHash.h` | `HASH2_CALC`…`HASH5_CALC` and the `kLzHash_CrcShift_*` constants | `src/enc/consts.rs`, used in `src/enc/lz_find.rs` |
 | `C/LzmaEnc.h` / `C/LzmaEnc.c` | `CLzmaEncProps` and `LzmaEncProps_Normalize`; the range encoder (`CRangeEnc`, `RangeEnc_ShiftLow`, `RC_BIT`, `RC_NORM`); the price tables (`ProbPrices`, `GET_PRICE*`, `LenPriceEnc_UpdateTables`, `FillDistancesPrices`, `FillAlignPrices`); the parser (`GetOptimum`, `GetOptimumFast`, `Backward`, `COptimal`); `LzmaEnc_CodeOneBlock`, `LzmaEnc_Encode`, `LzmaEnc_WriteProperties` | `src/enc/props.rs`, `src/enc/range_enc.rs`, `src/enc/price.rs`, `src/enc/lzma_enc.rs`, `src/enc/consts.rs` |
 | `C/Lzma2Enc.h` / `C/Lzma2Enc.c` | the chunk layer: `Lzma2EncInt_InitBlock`, `Lzma2EncInt_EncodeSubblock` with its copy-chunk fallback, `CLimitedSeqInStream`, `Lzma2Enc_WriteProperties`, `LZMA2_DIC_SIZE_FROM_PROP` | `src/enc/lzma2_enc.rs`, `src/enc/stream.rs` |
+| `C/Bra.c` / `C/Bra86.c` / `C/BraIA64.c` | the branch converters in the encode direction: `z7_BranchConvSt_X86_Enc` and `z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64,RISCV}_Enc` | `src/xz/bcj.rs`, beside the decode direction |
+| `C/Delta.c` | `Delta_Encode` | `src/xz/delta.rs`, beside `Delta_Decode` |
 | — | the `.xz` frame, from the format specification rather than from `C/XzEnc.c` | `src/enc/xz_enc.rs` |
 | — | `std::io::Write` adapters, which the C has no equivalent of | `src/enc/write.rs` |
 
@@ -37,6 +39,35 @@ same places the reader's do: CRC-32 and CRC-64/XZ from `crate::crc`
 (`crc-fast`), SHA-256 from `crate::crypto` (`aws-lc-rs` behind `crypto`,
 `sha2` behind `native-crypto`). A check this build cannot compute is a
 parameter error rather than a stream written without it.
+
+## The filter encoders
+
+The `.xz` writer can put a filter chain in front of LZMA2 — up to three of the
+delta and BCJ converters, which is what the format allows — and
+`src/enc/xz_enc.rs` writes the matching filter flags into each block header, in
+the order the filters were applied, LZMA2 last.
+
+The converters themselves live beside their decode halves. In the C, both
+directions are one function taking an `encoding` flag, with
+`BR_CONVERT_VAL(v, c)` expanding to `v += c` or `v -= c`; this port keeps that
+shape — one `*_conv` per converter taking the flag, with `*_decode` and
+`*_encode` wrappers built by the same kind of macro the C uses. Two converters
+are not a flag apart and the C says so itself:
+
+- **IA64** masks its running `pc` differently in each direction
+  (`pc &= (0x1fffff << 1) | 1` encoding, `pc |= ~((0x1fffff << 1) | 1)`
+  decoding), and mutates it in place, so the mutation persists across
+  iterations. The port does the same.
+- **RISC-V** is written out as two whole functions in `Bra.c`, because the JAL
+  arm rebuilds the instruction from different halves in each direction and the
+  AUIPC arm that converts is the other one. `riscv_encode` is the port of
+  `Z7_BRANCH_CONV_ENC(RISCV)`; it is not `riscv_decode` with a sign flipped.
+
+`Bcj::encode` keeps the same carry contract as `Bcj::decode`: it converts a
+prefix and leaves the tail of a straddling instruction for the next call, so
+encoding a buffer in pieces gives what encoding it whole gives. That is what
+lets the writer filter a whole block in one call while the readers undo it
+chunk by chunk.
 
 ## What was left out
 
@@ -104,6 +135,25 @@ crate's `.xz` output, and `xz -dc --format=lzma` over its `.lzma` output,
 compared with the original bytes. `7zz t` too where it is installed. Both skip
 with a message when the tool is not on `PATH`.
 
+**Filter parity, `tests/filter_parity.rs`.** `cargo xtask lzma-util` also
+builds `filter-oracle` from the SDK's own `Bra.c`, `Bra86.c`, `BraIA64.c` and
+`Delta.c`. Every BCJ kind and several delta distances are compared with it byte
+for byte, in *both* directions, at several start offsets, over the shared
+corpus plus generated code-like inputs — random bytes rarely contain the
+instructions a branch converter looks for, so the corpus plants each kind's
+opcode at its alignment. The same test checks that feeding a converter one,
+three, seven, sixteen or 4096 bytes at a time gives what feeding it the whole
+buffer gives.
+
+**Filtered round trips and external decode, `tests/xz_encoder.rs`.** Every BCJ
+kind on its own, with and without a start offset, three delta distances and a
+delta-then-BCJ chain, at two block sizes, back through all three readers; and
+`xz -t` and `xz -dc` over one large input per chain. Chains the format forbids
+— LZMA2 as a non-last filter, a misaligned BCJ start offset, four non-last
+filters — are checked to be refused.
+
 **Fuzzing, `fuzz/fuzz_targets/encode_round_trip.rs`.** Arbitrary bytes at
 settings taken from the input: `.lzma` back through `LzmaReader`, raw LZMA2
-back through `Lzma2Decoder`, and `.xz` back through `XzReader`.
+back through `Lzma2Decoder`, and `.xz` back through `XzReader` — then the same
+`.xz` through a filter chain the input picks, back through all three readers,
+the adaptive one fed in chunks the input sizes.

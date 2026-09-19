@@ -5,7 +5,7 @@
 //! `tests/lzma_parity.rs` does, and skips with a message when it is missing
 //! unless `LZMA_TURBO_LZMA_UTIL_REQUIRE` is set.
 
-#![cfg(feature = "std")]
+#![cfg(all(feature = "std", feature = "enc"))]
 
 mod corpus;
 

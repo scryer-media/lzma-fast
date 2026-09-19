@@ -33,7 +33,7 @@ pub use write::XzWriter;
 #[cfg(feature = "std")]
 pub use write::{Lzma2Writer, LzmaWriter};
 #[cfg(feature = "xz")]
-pub use xz_enc::{DEFAULT_BLOCK_SIZE, XzEncoder, encode_xz};
+pub use xz_enc::{DEFAULT_BLOCK_SIZE, XzEncoder, encode_xz, encode_xz_with_filters};
 
 /// An LZMA1 encoder.
 ///

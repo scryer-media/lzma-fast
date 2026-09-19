@@ -60,7 +60,7 @@ pub mod xz;
 
 /// The `.xz` writer, behind the `xz` feature.
 #[cfg(all(feature = "enc", feature = "xz"))]
-pub use enc::{DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz};
+pub use enc::{DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz, encode_xz_with_filters};
 #[cfg(feature = "enc")]
 pub use enc::{
     LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder, Lzma2Writer, LzmaEncProps, LzmaEncoder,

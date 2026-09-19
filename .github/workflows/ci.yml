@@ -476,9 +476,9 @@ jobs:
       - name: Install the xz the container tests are written against
         if: runner.os == 'Linux'
         run: ./.github/scripts/install-xz.sh
-      # `cargo xtask lzma-util` builds LzmaUtil and the two props-driven
-      # oracles from the pinned SDK sources with gcc-style flags. The Windows
-      # image has MinGW's gcc but no `cc`.
+      # `cargo xtask lzma-util` builds LzmaUtil, the two props-driven oracles
+      # and the filter oracle from the pinned SDK sources with gcc-style
+      # flags. The Windows image has MinGW's gcc but no `cc`.
       - name: Build the reference encoder from the pinned SDK
         env:
           CC: ${{ runner.os == 'Windows' && 'gcc' || 'cc' }}
@@ -489,6 +489,11 @@ jobs:
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test lzma_parity --test lzma2_encoder
+      # Same rule for the BCJ and delta converters, both directions.
+      - name: Bit-exact with the reference filters
+        env:
+          LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
+        run: cargo test --locked --release -p lzma-turbo --test filter_parity
       - name: The .xz writer through every reader, and through xz itself
         run: cargo test --locked --release -p lzma-turbo --test xz_encoder
 

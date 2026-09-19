@@ -10,8 +10,14 @@
 use std::io::{Cursor, Read};
 
 use libfuzzer_sys::fuzz_target;
-use lzma_turbo::xz::{CheckType, XzOptions, XzReader};
-use lzma_turbo::{LzmaEncProps, MatchFinderKind, encode_lzma2, encode_lzma_alone, encode_xz};
+use lzma_turbo::xz::bcj::BcjKind;
+use lzma_turbo::xz::{
+    CheckType, FILTER_DELTA, FilterFlags, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader,
+};
+use lzma_turbo::{
+    DrainStatus, LzmaEncProps, MatchFinderKind, encode_lzma2, encode_lzma_alone, encode_xz,
+    encode_xz_with_filters,
+};
 use lzma_turbo::{Lzma2Decoder, LzmaAloneHeader, LzmaReader};
 
 fuzz_target!(|data: &[u8]| {
@@ -82,5 +88,79 @@ fuzz_target!(|data: &[u8]| {
             .read_to_end(&mut out)
             .expect("our own .xz decodes");
         assert_eq!(out, src, ".xz round trip");
+
+        // .xz through a filter chain, which the byte after the settings
+        // picks: a BCJ converter, delta, or nothing.
+        let filters: Vec<FilterFlags> = match cfg[0] % 11 {
+            0 => Vec::new(),
+            n @ 1..=8 => {
+                let kind = [
+                    BcjKind::X86,
+                    BcjKind::Ppc,
+                    BcjKind::Ia64,
+                    BcjKind::Arm,
+                    BcjKind::ArmThumb,
+                    BcjKind::Sparc,
+                    BcjKind::Arm64,
+                    BcjKind::RiscV,
+                ][(n - 1) as usize];
+                vec![FilterFlags::new(kind.filter_id(), &[]).expect("no props")]
+            }
+            9 => vec![FilterFlags::new(FILTER_DELTA, &[cfg[1]]).expect("one prop")],
+            _ => vec![
+                FilterFlags::new(FILTER_DELTA, &[cfg[1]]).expect("one prop"),
+                FilterFlags::new(BcjKind::X86.filter_id(), &[]).expect("no props"),
+            ],
+        };
+        let xz = encode_xz_with_filters(src, &props, check, block_size, &filters)
+            .expect("our own filtered .xz encodes");
+
+        let mut out = Vec::new();
+        XzReader::with_options(Cursor::new(&xz), XzOptions::default())
+            .read_to_end(&mut out)
+            .expect("our own filtered .xz decodes");
+        assert_eq!(out, src, "filtered .xz round trip");
+
+        // The other two readers see the same stream differently — the
+        // parallel one whole, the adaptive one in pieces — and a converter's
+        // carry is exactly what differs between those two paths.
+        let mut out = Vec::new();
+        XzParallelReader::with_options(Cursor::new(&xz), XzOptions::default().with_threads(2))
+            .expect("our own filtered .xz opens")
+            .read_to_end(&mut out)
+            .expect("our own filtered .xz decodes in parallel");
+        assert_eq!(out, src, "filtered .xz parallel round trip");
+
+        let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(2));
+        let mut out: Vec<u8> = Vec::new();
+        let mut pos = 0usize;
+        let chunk = usize::from(cfg[2]).max(1);
+        if xz.is_empty() {
+            dec.end_of_input();
+        }
+        loop {
+            if pos < xz.len() {
+                pos += dec
+                    .feed(&xz[pos..(pos + chunk).min(xz.len())])
+                    .expect("our own filtered .xz feeds");
+                if pos == xz.len() {
+                    dec.end_of_input();
+                }
+            }
+            let status = dec
+                .drain(|off, bytes| {
+                    let off = usize::try_from(off).expect("offset");
+                    if out.len() < off + bytes.len() {
+                        out.resize(off + bytes.len(), 0);
+                    }
+                    out[off..off + bytes.len()].copy_from_slice(bytes);
+                })
+                .expect("our own filtered .xz drains");
+            if status == DrainStatus::Finished {
+                break;
+            }
+            assert!(pos < xz.len() || status != DrainStatus::NeedsMoreInput, "stalled");
+        }
+        assert_eq!(out, src, "filtered .xz adaptive round trip");
     }
 });

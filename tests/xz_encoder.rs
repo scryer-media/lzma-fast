@@ -11,8 +11,58 @@
 use std::io::{Cursor, Read, Write};
 use std::process::{Command, Stdio};
 
-use lzma_turbo::xz::{CheckType, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader};
-use lzma_turbo::{DrainStatus, LzmaEncProps, LzmaWriter, XzWriter, encode_lzma_alone, encode_xz};
+use lzma_turbo::xz::bcj::BcjKind;
+use lzma_turbo::xz::{
+    CheckType, FILTER_DELTA, FilterFlags, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader,
+};
+use lzma_turbo::{
+    DrainStatus, LzmaEncProps, LzmaWriter, XzWriter, encode_lzma_alone, encode_xz,
+    encode_xz_with_filters,
+};
+
+const BCJ_KINDS: [(BcjKind, &str); 8] = [
+    (BcjKind::X86, "x86"),
+    (BcjKind::Ppc, "ppc"),
+    (BcjKind::Ia64, "ia64"),
+    (BcjKind::Arm, "arm"),
+    (BcjKind::ArmThumb, "armt"),
+    (BcjKind::Sparc, "sparc"),
+    (BcjKind::Arm64, "arm64"),
+    (BcjKind::RiscV, "riscv"),
+];
+
+/// Every chain the writer is asked to produce: each BCJ kind on its own, a
+/// couple of delta distances, and delta behind a BCJ filter.
+fn chains() -> Vec<(String, Vec<FilterFlags>)> {
+    let mut v: Vec<(String, Vec<FilterFlags>)> = vec![("plain".into(), Vec::new())];
+    for (kind, name) in BCJ_KINDS {
+        v.push((
+            name.to_owned(),
+            vec![FilterFlags::new(kind.filter_id(), &[]).unwrap()],
+        ));
+        // The four-byte form, with a start offset the kind allows.
+        v.push((
+            format!("{name}-offset"),
+            vec![
+                FilterFlags::new(kind.filter_id(), &(kind.alignment() * 2).to_le_bytes()).unwrap(),
+            ],
+        ));
+    }
+    for distance in [1u8, 3, 255] {
+        v.push((
+            format!("delta-{}", u32::from(distance) + 1),
+            vec![FilterFlags::new(FILTER_DELTA, &[distance]).unwrap()],
+        ));
+    }
+    v.push((
+        "delta-then-x86".into(),
+        vec![
+            FilterFlags::new(FILTER_DELTA, &[3]).unwrap(),
+            FilterFlags::new(BcjKind::X86.filter_id(), &[]).unwrap(),
+        ],
+    ));
+    v
+}
 
 mod corpus;
 use corpus::{corpus, tempdir};
@@ -28,7 +78,7 @@ fn checks() -> Vec<CheckType> {
 
 /// Drives [`XzAdaptiveDecoder`] over a whole stream, as `tests/xz_utils.rs`
 /// does.
-fn adaptive(data: &[u8], threads: usize, chunk: usize) -> Vec<u8> {
+fn adaptive(data: &[u8], threads: usize, chunk: usize, what: &str) -> Vec<u8> {
     let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(threads));
     let mut out = Vec::new();
     let mut pos = 0;
@@ -39,7 +89,7 @@ fn adaptive(data: &[u8], threads: usize, chunk: usize) -> Vec<u8> {
         if pos < data.len() {
             pos += dec
                 .feed(&data[pos..(pos + chunk).min(data.len())])
-                .expect("feed");
+                .unwrap_or_else(|e| panic!("{what}: feed: {e}"));
             if pos == data.len() {
                 dec.end_of_input();
             }
@@ -52,11 +102,11 @@ fn adaptive(data: &[u8], threads: usize, chunk: usize) -> Vec<u8> {
                 }
                 out[off..off + bytes.len()].copy_from_slice(bytes);
             })
-            .expect("drain");
+            .unwrap_or_else(|e| panic!("{what}: drain: {e}"));
         match status {
             DrainStatus::Finished => return out,
             DrainStatus::NeedsMoreInput if pos == data.len() => {
-                panic!("the adaptive decoder wanted input after the stream ended")
+                panic!("{what}: the adaptive decoder wanted input after the stream ended")
             }
             _ => {}
         }
@@ -78,13 +128,17 @@ fn decode_every_way(xz: &[u8], want: &[u8], what: &str) {
         .unwrap_or_else(|e| panic!("{what}: XzParallelReader: {e}"));
     assert_eq!(out, want, "{what}: XzParallelReader");
 
-    assert_eq!(adaptive(xz, 1, 4096), want, "{what}: adaptive, 1 thread");
+    assert_eq!(
+        adaptive(xz, 1, 4096, what),
+        want,
+        "{what}: adaptive, 1 thread"
+    );
     // A byte-at-a-time feed is the interesting case for the adaptive
     // decoder's state machine and a slow one for a large stream, so the
     // small inputs carry it.
     if xz.len() < 64 * 1024 {
         assert_eq!(
-            adaptive(xz, 4, 7),
+            adaptive(xz, 4, 7, what),
             want,
             "{what}: adaptive, 4 threads, 7-byte feeds"
         );
@@ -172,6 +226,43 @@ fn pipe(tool: &str, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[test]
+fn every_filter_chain_round_trips_through_every_reader() {
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    for (tag, filters) in chains() {
+        for (name, data) in corpus() {
+            for block in [0u64, 4096] {
+                let xz = encode_xz_with_filters(&data, &props, CheckType::Crc64, block, &filters)
+                    .expect("encode");
+                decode_every_way(&xz, &data, &format!("{tag} {name} block={block}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_chain_the_format_forbids_is_refused() {
+    let props = LzmaEncProps::new();
+    let lzma2 = FilterFlags::new(0x21, &[0]).unwrap();
+    // LZMA2 is a last-only filter, so it may not appear among the others.
+    assert!(encode_xz_with_filters(b"x", &props, CheckType::Crc32, 0, &[lzma2]).is_err());
+    // A misaligned BCJ start offset (spec 5.3.2).
+    let bad = FilterFlags::new(BcjKind::Arm64.filter_id(), &1u32.to_le_bytes()).unwrap();
+    assert!(encode_xz_with_filters(b"x", &props, CheckType::Crc32, 0, &[bad]).is_err());
+    // More non-last filters than a chain may hold.
+    let delta = FilterFlags::new(FILTER_DELTA, &[0]).unwrap();
+    assert!(
+        encode_xz_with_filters(
+            b"x",
+            &props,
+            CheckType::Crc32,
+            0,
+            &[delta, delta, delta, delta]
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn xz_itself_accepts_what_this_crate_writes() {
     if !have("xz") {
         eprintln!("skipping: `xz` is not on PATH");
@@ -205,6 +296,37 @@ fn xz_itself_accepts_what_this_crate_writes() {
         let got = pipe("xz", &["-dc", "--format=lzma"], &alone)
             .unwrap_or_else(|| panic!("xz -dc --format=lzma failed on {name}"));
         assert_eq!(got, data, "xz -dc --format=lzma on {name}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn xz_itself_accepts_every_filter_chain() {
+    if !have("xz") {
+        eprintln!("skipping: `xz` is not on PATH");
+        return;
+    }
+    let dir = tempdir("xz-filters");
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    // One input big enough to exercise the filters, rather than the whole
+    // corpus times every chain, which `xz` would spend minutes on.
+    let (_, data) = corpus()
+        .into_iter()
+        .find(|(n, _)| n == "text-big")
+        .expect("corpus case");
+    for (tag, filters) in chains() {
+        let xz =
+            encode_xz_with_filters(&data, &props, CheckType::Crc64, 0, &filters).expect("encode");
+        let path = dir.join(format!("{tag}.xz"));
+        std::fs::write(&path, &xz).expect("write");
+        let status = Command::new("xz")
+            .arg("-t")
+            .arg(&path)
+            .status()
+            .expect("run xz -t");
+        assert!(status.success(), "xz -t rejected the {tag} chain");
+        let got = pipe("xz", &["-dc"], &xz).unwrap_or_else(|| panic!("xz -dc failed on {tag}"));
+        assert_eq!(got, data, "xz -dc on the {tag} chain");
     }
     std::fs::remove_dir_all(&dir).ok();
 }

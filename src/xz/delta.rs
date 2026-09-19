@@ -1,6 +1,6 @@
-//! The delta filter, decode side.
+//! The delta filter, both directions.
 //!
-//! C: `C/Delta.c`, `Delta_Decode`. Spec §5.3.3: the properties byte is the
+//! C: `C/Delta.c`, `Delta_Decode` and `Delta_Encode`. Spec §5.3.3: the properties byte is the
 //! distance minus one, so distances run from 1 to 256, and the filter adds
 //! the byte `distance` back to each byte in turn.
 //!
@@ -13,7 +13,7 @@ use super::error::XzErrorKind;
 /// C: `DELTA_STATE_SIZE`.
 const DELTA_STATE_SIZE: usize = 256;
 
-/// A delta decoder carrying the last `distance` bytes between calls.
+/// A delta filter carrying the last `distance` bytes between calls.
 #[derive(Debug, Clone, Copy)]
 pub struct Delta {
     distance: usize,
@@ -75,6 +75,54 @@ impl Delta {
             self.state[..delta].copy_from_slice(&data[size - delta..]);
         }
     }
+
+    /// Encodes `data` in place, the inverse of [`decode`](Self::decode) and
+    /// likewise consuming every byte.
+    ///
+    /// C: `Delta_Encode(state, delta, data, size)`.
+    pub fn encode(&mut self, data: &mut [u8]) {
+        let size = data.len();
+        if size == 0 {
+            return;
+        }
+        let delta = self.distance;
+
+        // C: `Byte temp[DELTA_STATE_SIZE]` — the encoder needs the old history
+        // after it has already overwritten `state` with the new one.
+        let mut temp = [0u8; DELTA_STATE_SIZE];
+        temp[..delta].copy_from_slice(&self.state[..delta]);
+
+        if size <= delta {
+            // C: the `do { b = *data; *data++ = b - temp[i]; temp[i] = b; }`
+            // loop, then the rotation of `temp` by `size` into `state`.
+            for (i, b) in data.iter_mut().enumerate() {
+                let old = *b;
+                *b = old.wrapping_sub(temp[i]);
+                temp[i] = old;
+            }
+            let mut i = size;
+            for slot in self.state[..delta].iter_mut() {
+                if i == delta {
+                    i = 0;
+                }
+                *slot = temp[i];
+                i += 1;
+            }
+        } else {
+            // C: the new history is taken before the data is overwritten, and
+            // the subtraction then walks *backwards*, so that each byte still
+            // sees its unencoded predecessor.
+            self.state[..delta].copy_from_slice(&data[size - delta..]);
+            for i in (delta..size).rev() {
+                data[i] = data[i].wrapping_sub(data[i - delta]);
+            }
+            // C: `do { --p; *p -= temp[--dif]; } while (dif != 0);`
+            #[allow(clippy::needless_range_loop)]
+            for i in (0..delta).rev() {
+                data[i] = data[i].wrapping_sub(temp[i]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +168,40 @@ mod tests {
                     out.extend_from_slice(&piece);
                 }
                 assert_eq!(out, data, "distance {distance}, chunk {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_then_decoding_gives_the_input_back() {
+        for distance in [1usize, 2, 5, 256] {
+            for len in [0usize, 1, 3, 255, 256, 257, 4096] {
+                let src: Vec<u8> = (0..len).map(|i| (i * 7 + i / 3) as u8).collect();
+                let mut buf = src.clone();
+                Delta::new((distance - 1) as u8).unwrap().encode(&mut buf);
+                Delta::new((distance - 1) as u8).unwrap().decode(&mut buf);
+                assert_eq!(buf, src, "distance {distance}, {len} bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_in_pieces_is_encoding_whole() {
+        // The filter carries `distance` bytes of history between calls, so a
+        // chunked encode must be the same as a single one.
+        let src: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        for distance in [1usize, 4, 256] {
+            let mut whole = src.clone();
+            Delta::new((distance - 1) as u8).unwrap().encode(&mut whole);
+            for chunk in [1usize, 3, 256, 1000] {
+                let mut d = Delta::new((distance - 1) as u8).unwrap();
+                let mut out: Vec<u8> = Vec::new();
+                for piece in src.chunks(chunk) {
+                    let mut buf = piece.to_vec();
+                    d.encode(&mut buf);
+                    out.extend_from_slice(&buf);
+                }
+                assert_eq!(out, whole, "distance {distance}, chunk {chunk}");
             }
         }
     }

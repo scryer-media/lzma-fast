@@ -23,6 +23,8 @@ use super::props::LzmaEncProps;
 #[cfg(feature = "xz")]
 use super::xz_enc::XzEncoder;
 #[cfg(feature = "xz")]
+use crate::xz::filter::FilterFlags;
+#[cfg(feature = "xz")]
 use crate::xz::stream::CheckType;
 
 /// Turns an encoder error into the `io::Error` a `Write` must return.
@@ -173,6 +175,16 @@ impl<W: Write> XzWriter<W> {
     /// have already gone in.
     pub fn set_check(&mut self, check: CheckType) -> Result<(), Error> {
         self.enc.set_check(check)
+    }
+
+    /// Sets the non-last filters of every block's chain. Must be called
+    /// before anything is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`XzEncoder::set_filters`].
+    pub fn set_filters(&mut self, filters: &[FilterFlags]) -> Result<(), Error> {
+        self.enc.set_filters(filters)
     }
 
     /// Sets how much one block may decode to. Zero means one block for
