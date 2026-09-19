@@ -24,8 +24,9 @@ cargo xtask jwasm <dir> build the pinned JWasm assembler and print its path (Uni
 cargo xtask xz-tests    fetch XZ Utils' decoder test files, checked against tests/xz-utils.manifest
 cargo xtask lzma-util [dir]
                         build the pinned SDK's reference LZMA encoder for the parity tests
-cargo xtask fuzz-differential <seconds> <workdir>
-                        fuzz lzma-turbo against the LZMA SDK, seeded from the vectors";
+cargo xtask fuzz <seconds> <workdir>
+                        run every fuzz target for a share of <seconds>, seeded from the vectors
+cargo xtask fuzz-check  build every fuzz target without running one";
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -39,7 +40,8 @@ fn main() -> ExitCode {
         Some("jwasm") => fetch::jwasm(args),
         Some("xz-tests") => fetch::xz_tests(args),
         Some("lzma-util") => fetch::lzma_util(args),
-        Some("fuzz-differential") => fuzz::fuzz_differential(args),
+        Some("fuzz") => fuzz::fuzz(args),
+        Some("fuzz-check") => fuzz::fuzz_check(args),
         Some("-h" | "--help") | None => {
             println!("{TASKS}");
             ExitCode::SUCCESS

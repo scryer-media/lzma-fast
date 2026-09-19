@@ -628,6 +628,35 @@ jobs:
       - name: The .xz writer through every reader, and through xz itself
         run: cargo test --locked --release -p lzma-turbo --test xz_encoder
 
+  # A fuzz target is in its own workspace under `fuzz/`, so `cargo test`,
+  # `cargo clippy` and `cargo doc` never build one: an API change can leave a
+  # target uncompilable and nothing says so until someone fuzzes. This builds
+  # every one of them and runs none, in a couple of minutes.
+  fuzz-check:
+    name: fuzz-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-09-01
+      CARGO_FUZZ_VERSION: 0.13.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly-2026-09-01
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      # With the SDK, so the differential target is built with its oracle in
+      # rather than in the shape that compares the crate with itself.
+      - name: Fetch the pinned LZMA SDK
+        run: cargo "+$FUZZ_TOOLCHAIN" xtask sdk "$RUNNER_TEMP/lzma-sdk"
+      - name: Every fuzz target builds
+        env:
+          LZMA_ORACLE_REQUIRE: "1"
+        run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo xtask fuzz-check
+
   fuzz-differential:
     uses: ./.github/workflows/fuzz.yml
     with:
