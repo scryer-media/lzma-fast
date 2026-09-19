@@ -215,6 +215,7 @@ jobs:
           - lane: crypto-host-only
             features: "std,crypto-host"
           # The converters alone, as a 7z reader takes them: no std, no xz.
+          # That includes BCJ2, which is 7z's and has no xz filter id.
           - lane: filters-only
             features: "filters"
     steps:
@@ -658,11 +659,11 @@ jobs:
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity --test mt_match_finder
-      # Same rule for the BCJ and delta converters, both directions.
+      # Same rule for the BCJ, BCJ2 and delta converters, both directions.
       - name: Bit-exact with the reference filters
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test filter_parity
+        run: cargo test --locked --release -p lzma-turbo --test filter_parity --test bcj2_parity
       - name: The .xz writer through every reader, and through xz and 7-Zip
         env:
           LZMA_TURBO_XZ_REQUIRE: "1"
