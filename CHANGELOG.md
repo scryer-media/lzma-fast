@@ -34,6 +34,17 @@
   zero to twice its alignment plus its lookahead, at three start offsets and
   three input alignments, and the delta filter at every length up to twice its
   distance, all against the reference.
+- The readers have a memory budget, checked before anything is allocated.
+  `LzmaReader::new` and `Lzma2Reader::new` refuse a header or property byte
+  whose rounded dictionary, probability table and input buffer would exceed
+  512 MiB, `DEFAULT_MEMORY_LIMIT`; `with_memory_limit` takes the budget
+  explicitly and `u64::MAX` opts out for trusted input, and `memory_required`
+  says what a header would cost. `LzmaReader::with_props` keeps its
+  unrestricted policy for containers that already enforce their own limit;
+  `with_props_and_memory_limit` is the checked form. The `.lzma` header is
+  read from the inner reader directly, so a rejected header allocates nothing,
+  and the remaining-size comparison against the caller's buffer is made in 64
+  bits before it is narrowed, as `CDecoder::Read` does.
 
 ## 0.4.0 - 2026-09-19
 
