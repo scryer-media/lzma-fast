@@ -427,7 +427,7 @@ jobs:
 
   # What a sanitizer cannot give the assembly loop. `guard_pages` puts every
   # allocation and every input slice against a no-access page, on each OS -
-  # for the decode loops and, since 0.5.1, for the encoder's window, tables and
+  # for the decode loops and, since 0.5.0, for the encoder's window, tables and
   # range buffer too; Valgrind's memcheck, which instruments the machine code
   # itself and so sees inside the loop, runs the asm-against-portable suite and
   # the encoder suites on Linux.
