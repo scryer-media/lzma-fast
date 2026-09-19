@@ -16,6 +16,19 @@
 - `Lzma2Encoder::set_mem_limit` reduces the block-thread count until the
   estimate fits the budget, the way 7-Zip reduces `numBlockThreads_Reduced`
   for `memUsage`; the estimate is this port's own allocation arithmetic.
+- Proved against the C that actually threads: `cargo xtask lzma-util` now also
+  builds `lzma2-oracle-mt`, the same props-driven LZMA2 harness compiled
+  without `Z7_ST` so `MtCoder.c`, `LzFindMt.c` and `Threads.c` are in it, and
+  `tests/lzma2_mt_parity.rs` compares against it at four block sizes and three
+  thread counts over the whole corpus. The encoder-parity CI job runs it on all
+  four platforms, and the round-trip fuzz target now asserts thread invariance
+  for raw LZMA2 and for filtered `.xz`.
+- `tools/lzma-bench --encode` takes `--threads`, splitting at the block size
+  `xz -T` would use and timing against `xz -T<n>` at the same preset.
+- Still not ported: `C/LzFindMt.c`, the threaded match finder inside a single
+  block. It does not change the output — the SDK's MT finder is built to find
+  the same matches as the single-threaded one — only how many cores one block
+  can use. `docs/encoder.md` says so.
 
 ## 0.4.0 - 2026-09-18
 

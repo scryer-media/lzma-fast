@@ -15,8 +15,8 @@ use lzma_turbo::xz::{
     CheckType, FILTER_DELTA, FilterFlags, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader,
 };
 use lzma_turbo::{
-    DrainStatus, LzmaEncProps, MatchFinderKind, encode_lzma2, encode_lzma_alone, encode_xz,
-    encode_xz_with_filters,
+    DrainStatus, LzmaEncProps, MatchFinderKind, encode_lzma2, encode_lzma2_mt, encode_lzma_alone,
+    encode_xz, encode_xz_mt, encode_xz_with_filters,
 };
 use lzma_turbo::{Lzma2Decoder, LzmaAloneHeader, LzmaReader};
 
@@ -74,6 +74,36 @@ fuzz_target!(|data: &[u8]| {
         }
         assert_eq!(out, src, "LZMA2 round trip");
 
+        // The same LZMA2 stream again, but cut into blocks and compressed by
+        // several threads at once. The block threads must not change what
+        // comes out: the bytes have to be exactly the solid-block encoder's
+        // for the same block size, whatever the thread count.
+        let block_size = (u64::from(cfg[3]) + 1) * 4096;
+        let threads = usize::from(cfg[2] % 4) + 1;
+        if let Ok((mt_prop, mt_lzma2)) = encode_lzma2_mt(src, &props, block_size, threads) {
+            let (one_prop, one_lzma2) =
+                encode_lzma2_mt(src, &props, block_size, 1).expect("one thread encodes too");
+            assert_eq!(mt_prop, one_prop, "the property byte depends on the threads");
+            assert_eq!(mt_lzma2, one_lzma2, "the bytes depend on the threads");
+
+            let mut dec = Lzma2Decoder::new(mt_prop).expect("our own property byte");
+            let mut out = Vec::new();
+            let mut input = &mt_lzma2[..];
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let p = dec
+                    .decode(input, &mut buf, lzma_turbo::FinishMode::Any)
+                    .expect("our own threaded LZMA2 decodes");
+                out.extend_from_slice(&buf[..p.written]);
+                input = &input[p.read..];
+                if p.status == lzma_turbo::Status::FinishedWithMark {
+                    break;
+                }
+                assert!(p.read != 0 || p.written != 0, "LZMA2 decode stalled");
+            }
+            assert_eq!(out, src, "threaded LZMA2 round trip");
+        }
+
         // .xz, over the same settings.
         let check = match cfg[3] % 4 {
             0 => CheckType::None,
@@ -81,8 +111,8 @@ fuzz_target!(|data: &[u8]| {
             2 => CheckType::Crc64,
             _ => CheckType::Sha256,
         };
-        let block_size = u64::from(cfg[3]) * 1024;
-        let xz = encode_xz(src, &props, check, block_size).expect("our own .xz encodes");
+        let xz_block_size = u64::from(cfg[3]) * 1024;
+        let xz = encode_xz(src, &props, check, xz_block_size).expect("our own .xz encodes");
         let mut out = Vec::new();
         XzReader::with_options(Cursor::new(&xz), XzOptions::default())
             .read_to_end(&mut out)
@@ -112,8 +142,14 @@ fuzz_target!(|data: &[u8]| {
                 FilterFlags::new(BcjKind::X86.filter_id(), &[]).expect("no props"),
             ],
         };
-        let xz = encode_xz_with_filters(src, &props, check, block_size, &filters)
+        let xz = encode_xz_with_filters(src, &props, check, xz_block_size, &filters)
             .expect("our own filtered .xz encodes");
+
+        // And the same filtered stream written by several block threads, which
+        // must be the same bytes again.
+        let xz_mt = encode_xz_mt(src, &props, check, xz_block_size, &filters, threads)
+            .expect("our own threaded filtered .xz encodes");
+        assert_eq!(xz_mt, xz, "the .xz bytes depend on the threads");
 
         let mut out = Vec::new();
         XzReader::with_options(Cursor::new(&xz), XzOptions::default())

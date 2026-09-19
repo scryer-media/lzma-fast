@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lzma_turbo::xz::CheckType;
-use lzma_turbo::{LzmaEncProps, encode_xz};
+use lzma_turbo::{LzmaEncProps, auto_block_size, encode_xz, encode_xz_mt};
 
 use crate::{human, median};
 
@@ -25,13 +25,14 @@ struct Row {
     out: u64,
 }
 
-/// Times `xz -T1 -<preset> -c` over `data`, returning the elapsed time and
-/// the size it produced, or `None` if `xz` is not there.
-fn time_xz(preset: u32, data: &[u8]) -> Option<(Duration, u64)> {
+/// Times `xz -T<threads> -<preset> -c` over `data`, returning the elapsed time
+/// and the size it produced, or `None` if `xz` is not there.
+fn time_xz(preset: u32, threads: usize, data: &[u8]) -> Option<(Duration, u64)> {
     let arg = format!("-{preset}");
+    let t_arg = format!("-T{threads}");
     let t0 = Instant::now();
     let mut child = Command::new("xz")
-        .args(["-T1", "-c", "-k", &arg])
+        .args([&t_arg, "-c", "-k", &arg])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -61,15 +62,30 @@ fn props_for(preset: u32) -> LzmaEncProps {
 
 /// Compresses `data` once and returns how long it took and how big it came
 /// out.
-fn time_ours(preset: u32, data: &[u8]) -> (Duration, u64) {
+///
+/// At one thread this is the solid single-block writer, exactly as before
+/// block threads existed. Above one it splits at the block size `xz -T` would
+/// use, which is what makes the two comparable: the ratio cost of splitting is
+/// the same on both sides.
+fn time_ours(preset: u32, threads: usize, data: &[u8]) -> (Duration, u64) {
     let props = props_for(preset);
     let t0 = Instant::now();
-    let out = encode_xz(data, &props, CheckType::Crc64, 0).expect("encode");
+    let out = if threads <= 1 {
+        encode_xz(data, &props, CheckType::Crc64, 0).expect("encode")
+    } else {
+        let block = auto_block_size(props.normalized().dict_size);
+        encode_xz_mt(data, &props, CheckType::Crc64, block, &[], threads).expect("encode")
+    };
     (t0.elapsed(), out.len() as u64)
 }
 
 /// Runs the lane over one input at each preset in `presets`.
-pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32]) {
+pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32], threads: &[usize]) {
+    let threads: Vec<usize> = if threads.is_empty() {
+        vec![1]
+    } else {
+        threads.to_vec()
+    };
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -90,59 +106,61 @@ pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32]) {
     );
 
     for &preset in presets {
-        // Interleaved, one run of each per round, for the reason the decode
-        // lane gives: a block schedule charges whichever encoder happened to
-        // run during a busy stretch.
-        let mut ours: Vec<Duration> = Vec::new();
-        let mut theirs: Vec<Duration> = Vec::new();
-        let mut ours_size = 0u64;
-        let mut xz_size: Option<u64> = None;
-        let mut xz_gone = !oracles;
+        for &t in &threads {
+            // Interleaved, one run of each per round, for the reason the decode
+            // lane gives: a block schedule charges whichever encoder happened to
+            // run during a busy stretch.
+            let mut ours: Vec<Duration> = Vec::new();
+            let mut theirs: Vec<Duration> = Vec::new();
+            let mut ours_size = 0u64;
+            let mut xz_size: Option<u64> = None;
+            let mut xz_gone = !oracles;
 
-        for _ in 0..runs {
-            let (t, n) = time_ours(preset, &data);
-            ours.push(t);
-            ours_size = n;
-            if !xz_gone {
-                match time_xz(preset, &data) {
-                    Some((t, n)) => {
-                        theirs.push(t);
-                        xz_size = Some(n);
+            for _ in 0..runs {
+                let (dt, n) = time_ours(preset, t, &data);
+                ours.push(dt);
+                ours_size = n;
+                if !xz_gone {
+                    match time_xz(preset, t, &data) {
+                        Some((t, n)) => {
+                            theirs.push(t);
+                            xz_size = Some(n);
+                        }
+                        None => xz_gone = true,
                     }
-                    None => xz_gone = true,
                 }
             }
-        }
 
-        let mut rows = vec![Row {
-            label: format!("lzma-turbo -{preset}"),
-            time: median(ours),
-            out: ours_size,
-        }];
-        if let Some(n) = xz_size {
-            rows.push(Row {
-                label: format!("xz -T1 -{preset}"),
-                time: median(theirs),
-                out: n,
-            });
-        }
+            let mut rows = vec![Row {
+                label: format!("lzma-turbo -{preset} -T{t}"),
+                time: median(ours),
+                out: ours_size,
+            }];
+            if let Some(n) = xz_size {
+                rows.push(Row {
+                    label: format!("xz -T{t} -{preset}"),
+                    time: median(theirs),
+                    out: n,
+                });
+            }
 
-        let base = rows[0].time.as_secs_f64();
-        for r in &rows {
-            let secs = r.time.as_secs_f64();
-            let mibs = (data.len() as f64 / (1024.0 * 1024.0)) / secs;
-            let ratio = secs / base;
-            println!(
-                "  {:<28} {secs:>8.3}s {mibs:>10.2} {:>13} {ratio:>7.3}x",
-                r.label,
-                human(r.out)
-            );
-        }
-        if let Some(n) = xz_size {
-            let d = ours_size as f64 / n as f64;
-            println!("      size vs xz: {d:.4}x ({} vs {})", ours_size, n);
-        } else if oracles {
-            println!("      xz not on PATH; ours only");
+            let base = rows[0].time.as_secs_f64();
+            for r in &rows {
+                let secs = r.time.as_secs_f64();
+                let mibs = (data.len() as f64 / (1024.0 * 1024.0)) / secs;
+                let ratio = secs / base;
+                println!(
+                    "  {:<28} {secs:>8.3}s {mibs:>10.2} {:>13} {ratio:>7.3}x",
+                    r.label,
+                    human(r.out)
+                );
+            }
+            if let Some(n) = xz_size {
+                let d = ours_size as f64 / n as f64;
+                println!("      size vs xz: {d:.4}x ({} vs {})", ours_size, n);
+            } else if oracles {
+                println!("      xz not on PATH; ours only");
+            }
         }
     }
 }

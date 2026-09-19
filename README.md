@@ -126,8 +126,17 @@ both directions too, so the `.xz` writer can emit filtered blocks and not only
 plain LZMA2. It is bit-exact with the reference encoder — the same input at
 the same settings produces the same bytes, and every converter agrees with the
 SDK's byte for byte in both directions — and the parity tests check that
-against binaries built from the pinned SDK sources over a generated corpus. What was left out, and how the frame around the
-compressed data is proved instead, is in
+against binaries built from the pinned SDK sources over a generated corpus.
+
+It compresses in parallel as well, through a port of the SDK's `MtCoder.c` and
+the multi-threaded paths of `Lzma2Enc.c`: give `Lzma2Encoder` or `XzEncoder` a
+block size and a thread count and the blocks are compressed at once, in the
+order the stream wants them. The thread count does not change the bytes — one
+thread and sixteen produce the same stream at the same block size — and that is
+checked against an SDK built without `Z7_ST`, which is the build that actually
+threads. Solid, single-threaded output stays the default. What was left out —
+`LzFindMt.c`, the threaded match finder inside a *single* block — and how the
+frame around the compressed data is proved instead, is in
 [docs/encoder.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/encoder.md).
 
 Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
