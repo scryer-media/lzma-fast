@@ -520,8 +520,9 @@ jobs:
         if: runner.os == 'Linux'
         run: ./.github/scripts/install-xz.sh
       # `cargo xtask lzma-util` builds LzmaUtil, the props-driven oracles --
-      # including the LZMA2 one built without `Z7_ST`, which is the only build
-      # that has `MtCoder.c` and `LzFindMt.c` in it -- and the filter oracle
+      # including the LZMA1 and LZMA2 ones built without `Z7_ST`, which are the
+      # only builds that have `MtCoder.c` and `LzFindMt.c` in them -- and the
+      # filter oracle
       # from the pinned SDK sources with gcc-style flags. The Windows image has
       # MinGW's gcc but no `cc`.
       - name: Build the reference encoder from the pinned SDK
@@ -539,7 +540,7 @@ jobs:
       - name: Bit-exact with the multi-threaded reference encoder
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity
+        run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity --test mt_match_finder
       # Same rule for the BCJ and delta converters, both directions.
       - name: Bit-exact with the reference filters
         env:

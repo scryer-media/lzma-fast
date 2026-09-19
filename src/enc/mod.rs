@@ -6,7 +6,10 @@
 //! `docs/encoder.md` for what was left out and how parity is tested.
 
 mod consts;
+mod finder;
 mod lz_find;
+#[cfg(feature = "std")]
+mod lz_find_mt;
 mod lzma2_enc;
 mod lzma_enc;
 #[cfg(feature = "std")]
@@ -122,12 +125,77 @@ impl LzmaEncoder {
         input: &mut dyn SeqInStream,
         out: &mut dyn SeqOutStream,
     ) -> Result<(), Error> {
+        self.block_loop(input, out)
+    }
+
+    /// C: the `for (;;) { LzmaEnc_CodeOneBlock(...) }` loop of
+    /// `LzmaEnc_Encode2`.
+    fn block_loop(
+        &mut self,
+        input: &mut dyn SeqInStream,
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), Error> {
         loop {
             self.inner.code_one_block(input, out, 0, 0)?;
             if self.inner.finished {
                 return Ok(());
             }
         }
+    }
+
+    /// As [`LzmaEncoder::encode_prepared`], for an input the threaded match
+    /// finder's hash thread can be given. See
+    /// [`LzmaEncProps::with_num_threads`].
+    #[cfg(feature = "std")]
+    fn encode_prepared_send(
+        &mut self,
+        input: &mut (dyn SeqInStream + Send),
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), Error> {
+        if let Some(sh) = self.inner.mt_handle() {
+            return crate::enc::lz_find_mt::with_threads(&sh, input, || {
+                self.block_loop(&mut crate::enc::stream::NoStream, out)
+            });
+        }
+        self.block_loop(input, out)
+    }
+
+    /// Encode a stream that can be sent.
+    ///
+    /// Same bytes as [`LzmaEncoder::encode`]; the `Send` bound is what lets
+    /// [`LzmaEncProps::with_num_threads`] start the match finder's threads.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaEncoder::encode`].
+    #[cfg(feature = "std")]
+    pub fn encode_send(
+        &mut self,
+        input: &mut (dyn SeqInStream + Send),
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), Error> {
+        self.inner.prepare(0)?;
+        self.encode_prepared_send(input, out)
+    }
+
+    /// Encode a stream that can be sent, telling the encoder how long it is.
+    ///
+    /// Same bytes as [`LzmaEncoder::encode_sized`]; the `Send` bound is what
+    /// lets [`LzmaEncProps::with_num_threads`] start the match finder's
+    /// threads.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaEncoder::encode`].
+    #[cfg(feature = "std")]
+    pub fn encode_sized_send(
+        &mut self,
+        input: &mut (dyn SeqInStream + Send),
+        out: &mut dyn SeqOutStream,
+        input_len: u64,
+    ) -> Result<(), Error> {
+        self.inner.mem_prepare(input_len, 0)?;
+        self.encode_prepared_send(input, out)
     }
 
     /// Encode a slice, returning the raw LZMA1 stream.
@@ -140,6 +208,9 @@ impl LzmaEncoder {
     pub fn encode_to_vec(&mut self, src: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         let mut input = SliceStream::new(src);
+        #[cfg(feature = "std")]
+        self.encode_sized_send(&mut input, &mut out, src.len() as u64)?;
+        #[cfg(not(feature = "std"))]
         self.encode_sized(&mut input, &mut out, src.len() as u64)?;
         Ok(out)
     }
@@ -169,6 +240,9 @@ pub fn encode_lzma_alone(src: &[u8], props: &LzmaEncProps) -> Result<Vec<u8>, Er
     out.extend_from_slice(&enc.properties());
     out.extend_from_slice(&(src.len() as u64).to_le_bytes());
     let mut input = SliceStream::new(src);
+    #[cfg(feature = "std")]
+    enc.encode_sized_send(&mut input, &mut out, src.len() as u64)?;
+    #[cfg(not(feature = "std"))]
     enc.encode_sized(&mut input, &mut out, src.len() as u64)?;
     Ok(out)
 }

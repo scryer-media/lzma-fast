@@ -1,0 +1,1750 @@
+//! The threaded match finder.
+//!
+//! C: `C/LzFindMt.c`, `C/LzFindMt.h` and the `GetMatchesSpecN_2` kernel in
+//! `C/LzFindOpt.c`.
+//!
+//! Three threads split the work the single-threaded [`MatchFinder`] does in
+//! one:
+//!
+//! * the **hash** thread reads the stream and turns each position into a head
+//!   distance for the high hash table, writing runs of them into `hash_buf`
+//!   (C: `HashThreadFunc`, with the `GetHeads*` family);
+//! * the **bt** thread consumes those heads, walks and rebalances the binary
+//!   tree in `son`, and writes finished match lists into `bt_buf`
+//!   (C: `BtThreadFunc` over `BtGetMatches` and `GetMatchesSpecN_2`);
+//! * the **lz** thread is whoever called the encoder. It consumes `bt_buf`
+//!   and mixes in the short matches from the low hash table
+//!   (C: `MatchFinderMt_GetMatches` over `MixMatches2/3/4`).
+//!
+//! The matches this produces are the same matches the single-threaded finder
+//! produces, so the encoder's output is bit-exact either way; that is what
+//! `tests/lzma_parity.rs` checks.
+//!
+//! # How the threads share memory
+//!
+//! Everything the three threads touch lives in one [`MtInner`] behind an
+//! [`UnsafeCell`], reached through raw pointers. That is the C's own shape and
+//! the reason the `unsafe` here is what it is: `CMatchFinderMt` is one struct
+//! that three threads write to at once, and it is correct because the
+//! fields - and the *ranges* of the three tables - are partitioned between
+//! them by the block protocol in [`MtSync`], not because anything is locked.
+//!
+//! The partition, which every `SAFETY` comment below refers back to:
+//!
+//! | region | written by | read by |
+//! | --- | --- | --- |
+//! | `win` below `stream_pos` | hash thread (appends) | bt, lz |
+//! | `tab[..fixed_hash_size]` (low hash) | lz | lz |
+//! | `tab[fixed_hash_size..son_base]` (high hash) | hash | hash |
+//! | `tab[son_base..]` (`son`) | bt | bt |
+//! | `hash_buf` block `i` | hash | bt |
+//! | `bt_buf` block `i` | bt | lz |
+//!
+//! A block of `hash_buf` or `bt_buf` is handed over by
+//! [`MtSync::get_next_block`]: the producer releases `filled` only after it
+//! has finished writing the block, and the consumer releases `free` only after
+//! it has finished reading it, so at most one thread is inside any block at a
+//! time. The two `CriticalSection`s exist for the one thing that is *not*
+//! partitioned - `MatchFinder_MoveBlock` slides the whole window - and the
+//! hash thread takes both before it moves, which is the only moment all three
+//! agree to stand still.
+//!
+//! # Not ported
+//!
+//! `p->affinity` / `affinityGroup` (thread affinity, which `LzmaEnc` never
+//! sets), the `MFMT_GM_INLINE`-off fallback loop in `BtGetMatches`, and the
+//! commented-out `MatchFinderMt_GetMatches_Bt4` / `MatchFinderMt4_Skip` /
+//! `BT5_USE_H4` variants.
+
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+
+use crate::enc::consts::*;
+use crate::enc::lz_find::MatchFinder;
+use crate::enc::stream::SeqInStream;
+use crate::error::Error;
+use crate::mt::event::Event;
+use crate::mt::sync::{CriticalSection, Semaphore};
+
+/// C: `kMtHashBlockSize`.
+const HASH_BLOCK_SIZE: u32 = 1 << 17;
+/// C: `kMtHashNumBlocks`.
+const HASH_NUM_BLOCKS: u32 = 1 << 1;
+/// C: `kMtBtBlockSize`.
+const BT_BLOCK_SIZE: u32 = 1 << 16;
+/// C: `kMtBtNumBlocks`.
+const BT_NUM_BLOCKS: u32 = 1 << 4;
+/// C: `kHashBufferSize`.
+const HASH_BUFFER_SIZE: usize = (HASH_BLOCK_SIZE * HASH_NUM_BLOCKS) as usize;
+/// C: `kBtBufferSize`.
+const BT_BUFFER_SIZE: usize = (BT_BLOCK_SIZE * BT_NUM_BLOCKS) as usize;
+/// C: `kMtMaxValForNormalize`.
+const MT_MAX_VAL_FOR_NORMALIZE: u32 = 0xFFFF_FFFF;
+/// C: `BT_HASH_BYTES_MAX`.
+const BT_HASH_BYTES_MAX: u32 = 5;
+
+/// C: `GET_HASH_BLOCK_OFFSET`.
+#[inline]
+const fn hash_block_offset(i: u32) -> usize {
+    ((i & (HASH_NUM_BLOCKS - 1)) * HASH_BLOCK_SIZE) as usize
+}
+
+/// C: `GET_BT_BLOCK_OFFSET`.
+#[inline]
+const fn bt_block_offset(i: u32) -> usize {
+    ((i & (BT_NUM_BLOCKS - 1)) * BT_BLOCK_SIZE) as usize
+}
+
+// ---------------------------------------------------------------------------
+// CMtSync
+// ---------------------------------------------------------------------------
+
+/// The handshake one producer thread has with its consumer.
+///
+/// C: `CMtSync`. `free` and `filled` bound the ring of blocks, `can_start` and
+/// `was_stopped` start and stop a run, and `cs` is held by the *consumer*
+/// across `get_next_block` calls so that the hash thread cannot slide the
+/// window underneath it.
+///
+/// The `BoolInt` and `UInt32` flags the C reads without a lock are atomics
+/// here. Each is touched once per block, and every one of them is already
+/// ordered by a semaphore or an event, so the orderings are not load-bearing;
+/// they are spelled `SeqCst` because nothing here is hot enough to be worth a
+/// weaker argument.
+pub(crate) struct MtSync {
+    /// C: `p->numProcessedBlocks`.
+    num_processed_blocks: AtomicU32,
+    /// C: `p->needStart`.
+    need_start: AtomicBool,
+    /// C: `p->exit`.
+    exit: AtomicBool,
+    /// C: `p->stopWriting`.
+    stop_writing: AtomicBool,
+    /// C: `p->canStart`.
+    can_start: Event,
+    /// C: `p->wasStopped`.
+    was_stopped: Event,
+    /// C: `p->freeSemaphore`.
+    free: Semaphore,
+    /// C: `p->filledSemaphore`.
+    filled: Semaphore,
+    /// C: `p->cs`.
+    cs: CriticalSection,
+    /// C: `p->csWasEntered`.
+    cs_was_entered: AtomicBool,
+    /// C: `p->wasCreated`.
+    was_created: AtomicBool,
+}
+
+impl MtSync {
+    /// C: `MtSync_Construct`.
+    fn new() -> Self {
+        MtSync {
+            num_processed_blocks: AtomicU32::new(0),
+            need_start: AtomicBool::new(true),
+            exit: AtomicBool::new(true),
+            stop_writing: AtomicBool::new(false),
+            can_start: Event::new(),
+            was_stopped: Event::new(),
+            free: Semaphore::new(),
+            filled: Semaphore::new(),
+            cs: CriticalSection::new(),
+            cs_was_entered: AtomicBool::new(false),
+            was_created: AtomicBool::new(false),
+        }
+    }
+
+    fn get(f: &AtomicBool) -> bool {
+        f.load(Ordering::SeqCst)
+    }
+
+    fn set(f: &AtomicBool, v: bool) {
+        f.store(v, Ordering::SeqCst);
+    }
+
+    /// C: `LOCK_BUFFER`.
+    fn lock_buffer(&self) {
+        self.cs.enter();
+        Self::set(&self.cs_was_entered, true);
+    }
+
+    /// C: `UNLOCK_BUFFER`.
+    fn unlock_buffer(&self) {
+        self.cs.leave();
+        Self::set(&self.cs_was_entered, false);
+    }
+
+    /// C: `MtSync_Init`, "call it before each new file".
+    fn init(&self, num_blocks: u32) -> Result<(), Error> {
+        if !Self::get(&self.need_start) || Self::get(&self.cs_was_entered) {
+            return Err(Error::InternalFailure);
+        }
+        self.free.init(num_blocks);
+        self.filled.init(0);
+        Ok(())
+    }
+
+    /// C: `MtSync_GetNextBlock`. Returns the index of the block that is now
+    /// filled, and leaves the buffer *locked* for the caller - the next call
+    /// is what unlocks it.
+    fn get_next_block(&self) -> u32 {
+        let mut num_blocks = 0;
+        if Self::get(&self.need_start) {
+            self.num_processed_blocks.store(1, Ordering::SeqCst);
+            Self::set(&self.need_start, false);
+            Self::set(&self.stop_writing, false);
+            Self::set(&self.exit, false);
+            self.was_stopped.reset();
+            self.can_start.set();
+        } else {
+            self.unlock_buffer();
+            // C: "we free current block".
+            num_blocks = self.num_processed_blocks.fetch_add(1, Ordering::SeqCst);
+            self.free.release1();
+        }
+
+        self.filled.wait();
+        self.lock_buffer();
+        num_blocks
+    }
+
+    /// C: `MtSync_StopWriting`.
+    fn stop_writing(&self) {
+        if !Self::get(&self.was_created) || Self::get(&self.need_start) {
+            return;
+        }
+        if Self::get(&self.cs_was_entered) {
+            self.unlock_buffer();
+        }
+        // C: "We send (p->stopWriting) message and release freeSemaphore to
+        // free current block. So the thread will see (p->stopWriting) at some
+        // iteration after Wait(freeSemaphore)."
+        Self::set(&self.stop_writing, true);
+        self.free.release1();
+        self.was_stopped.wait();
+        // C 21.03: "we don't restore semaphore counters here. We will recreate
+        // and reinit semaphores in next start."
+        Self::set(&self.need_start, true);
+    }
+
+    /// C: the `p->exit = True; Event_Set(&p->canStart);` half of
+    /// `MtSync_Destruct`, which is how a stopped thread is told to return.
+    fn send_exit(&self) {
+        Self::set(&self.exit, true);
+        self.can_start.set();
+    }
+
+    fn exiting(&self) -> bool {
+        Self::get(&self.exit)
+    }
+
+    fn stopping(&self) -> bool {
+        Self::get(&self.stop_writing)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The hash thread's kernel
+// ---------------------------------------------------------------------------
+
+/// Which `GetHeads*` the hash thread runs.
+///
+/// C: the `p->GetHeadsFunc` assignment in `MatchFinderMt_CreateVTable`. The
+/// `b` variants are the `bigHash` ones, chosen when `hashMask >= 0xFFFFFF`;
+/// `C/LzFind.c` guarantees that bound (see its "GetHeads4b() needs
+/// (hs >= ((1 << 24) - 1))" comment) so the unmasked 24-bit value they mix in
+/// always fits the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heads {
+    H2,
+    H3,
+    H3b,
+    H4,
+    H4b,
+    H5,
+    H5b,
+}
+
+#[inline]
+fn ui16(p: &[u8], i: usize) -> u32 {
+    u32::from(p[i]) | (u32::from(p[i + 1]) << 8)
+}
+
+/// C: `GetUi24hi_from32(p)`, the top three bytes of a little-endian 32-bit
+/// load.
+#[inline]
+fn ui24hi(p: &[u8], i: usize) -> u32 {
+    u32::from(p[i + 1]) | (u32::from(p[i + 2]) << 8) | (u32::from(p[i + 3]) << 16)
+}
+
+/// C: the `GetHeads2` / `GetHeads3` / ... family over `GetHeads_LOOP`.
+///
+/// `heads[k]` becomes the distance from position `pos + k` back to the last
+/// position with the same hash, and the table is updated to point at `pos + k`
+/// — the same "insert and report the previous head" step the single-threaded
+/// finder does inline, lifted out so that it can run a block ahead.
+///
+/// The C's `USE_GetHeads_LOCAL_CRC` builds per-call copies of the byte table
+/// with `hashMask` already folded in. That is a strength reduction, not a
+/// different value: every term it leaves unmasked is at most 24 bits and
+/// `hashMask` always has its low 16 (`bigHash`: 24) bits set, so masking the
+/// terms and masking the sum agree. The masks are written where the C puts
+/// them so the two can be read against each other.
+fn get_heads(
+    kind: Heads,
+    p: &[u8],
+    mut pos: u32,
+    hash: &mut [u32],
+    mask: u32,
+    heads: &mut [u32],
+    crc: &[u32; 256],
+) {
+    for (i, head) in heads.iter_mut().enumerate() {
+        let value = match kind {
+            Heads::H2 => ui16(p, i),
+            Heads::H3 => (crc[usize::from(p[i])] ^ ui16(p, i + 1)) & mask,
+            Heads::H3b => ui16(p, i) ^ (u32::from(p[i + 2]) << 16),
+            Heads::H4 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H4b => (crc[usize::from(p[i])] & mask) ^ ui24hi(p, i),
+            Heads::H5 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_2) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H5b => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui24hi(p, i)
+            }
+        } as usize;
+        *head = pos.wrapping_sub(hash[value]);
+        hash[value] = pos;
+        pos = pos.wrapping_add(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The bt thread's kernel
+// ---------------------------------------------------------------------------
+
+/// C: `GetMatchesSpecN_2` in `C/LzFindOpt.c`.
+///
+/// The binary-tree walk, run over a whole run of positions instead of one.
+/// `heads` is the run of head *distances* the hash thread produced; for each
+/// one this descends the tree rooted at that distance, emits the match pairs
+/// it finds, and rebalances `son` - the same work `GetMatchesSpec1` does for a
+/// single position, with the hash lookup already done.
+///
+/// Returns the new cursor into `d` and the position reached (C: `*posRes`), or
+/// [`None`] where the C returns `NULL`: a `son` entry that points forward, or
+/// a head distance of zero, both of which mean the tables have been corrupted
+/// and the caller must fail rather than read out of bounds.
+///
+/// `USE_SON_PREFETCH` is a load hoist with no effect on the values and is left
+/// to the compiler. `USE_LONG_MATCH_OPT` is *not* - it changes what is emitted
+/// (a run of `2`-pair entries) - and is ported.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn get_matches_spec_n_2(
+    win: &[u8],
+    len_limit_0: usize,
+    mut pos: u32,
+    mut cur: usize,
+    son: &mut [u32],
+    cut_value: u32,
+    d: &mut [u32],
+    mut di: usize,
+    max_len_0: usize,
+    heads: &[u32],
+    mut hi: usize,
+    limit: usize,
+    hsize: usize,
+    mut cyclic_buffer_pos: u32,
+    cyclic_buffer_size: u32,
+) -> Option<(usize, u32)> {
+    let mut len_limit = len_limit_0;
+    loop {
+        if hi == hsize {
+            break;
+        }
+        let mut delta = heads[hi];
+        hi += 1;
+        if delta == 0 {
+            return None;
+        }
+        len_limit += 1;
+
+        let mut cbs = cyclic_buffer_size;
+        if pos < cbs {
+            if delta > pos {
+                return None;
+            }
+            cbs = pos;
+        }
+
+        if delta >= cbs {
+            let ptr1 = (cyclic_buffer_pos as usize) << 1;
+            d[di] = 0;
+            di += 1;
+            son[ptr1] = K_EMPTY_HASH_VALUE;
+            son[ptr1 + 1] = K_EMPTY_HASH_VALUE;
+        } else {
+            di += 1;
+            let distances = di;
+
+            let mut ptr0 = ((cyclic_buffer_pos as usize) << 1) + 1;
+            let mut ptr1 = (cyclic_buffer_pos as usize) << 1;
+
+            let mut cut_value = cut_value;
+            let (mut len0, mut len1) = (cur, cur);
+            let mut max_len = cur + max_len_0;
+
+            loop {
+                // C: the "SPEC code" wrap, `_cyclicBufferPos - delta
+                // (+ cbs if it went below zero)`.
+                let back = if cyclic_buffer_pos < delta {
+                    cyclic_buffer_pos + cbs - delta
+                } else {
+                    cyclic_buffer_pos - delta
+                };
+                let pair = (back as usize) << 1;
+
+                let diff = delta as usize;
+                let mut len = if len0 < len1 { len0 } else { len1 };
+
+                let pair0 = son[pair];
+
+                if win[len - diff] == win[len] {
+                    len += 1;
+                    if len != len_limit && win[len - diff] == win[len] {
+                        loop {
+                            len += 1;
+                            if len == len_limit || win[len - diff] != win[len] {
+                                break;
+                            }
+                        }
+                    }
+                    if max_len < len {
+                        max_len = len;
+                        d[di] = (len - cur) as u32;
+                        d[di + 1] = delta - 1;
+                        di += 2;
+
+                        if len == len_limit {
+                            let pair1 = son[pair + 1];
+                            son[ptr1] = pair0;
+                            son[ptr0] = pair1;
+                            d[distances - 1] = (di - distances) as u32;
+
+                            // C: `USE_LONG_MATCH_OPT`. While the next position
+                            // has the same head distance and the bytes at the
+                            // far end still agree, the match simply shifts by
+                            // one: emit it and copy the tree node instead of
+                            // walking again.
+                            if hi == hsize
+                                || heads[hi] != delta
+                                || win[len_limit - diff] != win[len_limit]
+                                || di >= limit
+                            {
+                                break;
+                            }
+                            loop {
+                                d[di] = 2;
+                                d[di + 1] = (len_limit - cur) as u32;
+                                d[di + 2] = delta - 1;
+                                di += 3;
+                                cur += 1;
+                                len_limit += 1;
+                                cyclic_buffer_pos += 1;
+                                {
+                                    let dest = (cyclic_buffer_pos as usize) << 1;
+                                    let back = if cyclic_buffer_pos < delta {
+                                        cyclic_buffer_pos + cbs - delta
+                                    } else {
+                                        cyclic_buffer_pos - delta
+                                    };
+                                    let src = (back as usize) << 1;
+                                    let p0 = son[src];
+                                    let p1 = son[src + 1];
+                                    son[dest] = p0;
+                                    son[dest + 1] = p1;
+                                }
+                                pos = pos.wrapping_add(1);
+                                hi += 1;
+                                if hi == hsize
+                                    || heads[hi] != delta
+                                    || win[len_limit - diff] != win[len_limit]
+                                    || di >= limit
+                                {
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                {
+                    let cur_match = pos.wrapping_sub(delta);
+                    if win[len - diff] < win[len] {
+                        delta = son[pair + 1];
+                        son[ptr1] = cur_match;
+                        ptr1 = pair + 1;
+                        len1 = len;
+                        if delta >= cur_match {
+                            return None;
+                        }
+                    } else {
+                        delta = son[pair];
+                        son[ptr0] = cur_match;
+                        ptr0 = pair;
+                        len0 = len;
+                        if delta >= cur_match {
+                            return None;
+                        }
+                    }
+                    delta = pos.wrapping_sub(delta);
+
+                    cut_value -= 1;
+                    if cut_value == 0 || delta >= cbs {
+                        son[ptr0] = K_EMPTY_HASH_VALUE;
+                        son[ptr1] = K_EMPTY_HASH_VALUE;
+                        d[distances - 1] = (di - distances) as u32;
+                        break;
+                    }
+                }
+            }
+        }
+        pos = pos.wrapping_add(1);
+        cyclic_buffer_pos += 1;
+        cur += 1;
+        if di >= limit {
+            break;
+        }
+    }
+    Some((di, pos))
+}
+
+// ---------------------------------------------------------------------------
+// The shared state
+// ---------------------------------------------------------------------------
+
+/// Which `MixMatches*` the lz thread runs, and therefore which `Skip`.
+///
+/// C: the `p->MixMatchesFunc` / `vTable->Skip` pair in
+/// `MatchFinderMt_CreateVTable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mix {
+    /// C: `numHashBytes == 2`: no low hash at all, `MatchFinderMt0_Skip` and
+    /// `MatchFinderMt2_GetMatches`.
+    None,
+    /// C: `MixMatches2` with `MatchFinderMt2_Skip`.
+    Two,
+    /// C: `MixMatches3` with `MatchFinderMt3_Skip`.
+    Three,
+    /// C: `MixMatches4` with `MatchFinderMt3_Skip`.
+    Four,
+}
+
+/// Everything fixed at create time, plus the three allocations.
+///
+/// C: the `CMatchFinderMt` fields that `MatchFinderMt_Init` copies out of the
+/// `CMatchFinder` once and no thread writes again, and the buffers themselves.
+struct Common {
+    /// C: `mf->bufBase`, the window.
+    win: *mut u8,
+    /// C: `mf->blockSize`.
+    win_len: usize,
+    /// C: `mf->hash`: the low hash, then the high hash, then `son`.
+    tab: *mut u32,
+    /// C: `p->hashBuf`, with `p->btBuf` following it in the same allocation
+    /// exactly as `MatchFinderMt_Create` lays it out, and two more words after
+    /// that for `p->failureBuf`.
+    bufs: *mut u32,
+
+    /// C: `mf->hashMask`.
+    hash_mask: u32,
+    /// C: `p->fixedHashSize`.
+    fixed_hash_size: usize,
+    /// Where `son` starts in `tab`.
+    son_base: usize,
+    /// C: the length of `son`, `cyclicBufferSize * 2` for a binary tree.
+    son_len: usize,
+    /// C: `p->historySize`.
+    history_size: u32,
+    /// C: `p->numHashBytes`.
+    num_hash_bytes: u32,
+    /// C: `p->matchMaxLen`.
+    match_max_len: u32,
+    /// C: `p->cutValue`.
+    cut_value: u32,
+    /// C: `p->cyclicBufferSize`.
+    cyclic_buffer_size: u32,
+    /// C: `mf->keepSizeBefore`.
+    keep_size_before: u32,
+    /// C: `mf->keepSizeAfter`.
+    keep_size_after: u32,
+    /// C: `p->crc`.
+    crc: [u32; 256],
+    /// C: `p->GetHeadsFunc`.
+    heads: Heads,
+    /// C: `p->MixMatchesFunc`.
+    mix: Mix,
+}
+
+impl Common {
+    /// The window.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be a thread the block protocol allows to read the
+    /// window: the bt and lz threads always may (they read strictly below
+    /// `stream_pos`, and the hash thread only appends above it or moves the
+    /// whole window with both critical sections held), and the hash thread may
+    /// when it is not itself writing.
+    unsafe fn win(&self) -> &[u8] {
+        // SAFETY: `win` points at `win_len` initialised bytes for as long as
+        // the owning `MtShared` lives, which outlives every thread that holds
+        // a clone of the `Arc`.
+        unsafe { core::slice::from_raw_parts(self.win, self.win_len) }
+    }
+
+    /// The low hash table, which only the lz thread touches.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the lz thread (C: `MixMatches*` and
+    /// `MatchFinderMt2/3_Skip`, all of which run there).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn low_hash(&self) -> &mut [u32] {
+        // SAFETY: `tab[..fixed_hash_size]` is the lz thread's exclusive range
+        // in the partition documented at the top of this module; no other
+        // thread forms a reference into it.
+        unsafe { core::slice::from_raw_parts_mut(self.tab, self.fixed_hash_size) }
+    }
+
+    /// The high hash table, which only the hash thread touches.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the hash thread (C: `MatchFinder_Init_HighHash` and
+    /// `GetHeadsFunc`, both called from `HashThreadFunc`).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn high_hash(&self) -> &mut [u32] {
+        // SAFETY: `tab[fixed_hash_size..son_base]` is the hash thread's
+        // exclusive range; the lz thread stays below `fixed_hash_size` and the
+        // bt thread stays at or above `son_base`.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.tab.add(self.fixed_hash_size),
+                self.son_base - self.fixed_hash_size,
+            )
+        }
+    }
+
+    /// The `son` table, which only the bt thread touches.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the bt thread (C: `GetMatchesSpecN_2` and
+    /// `MatchFinder_Normalize3` in `BtGetMatches`).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn son(&self) -> &mut [u32] {
+        // SAFETY: `tab[son_base..]` is the bt thread's exclusive range.
+        unsafe { core::slice::from_raw_parts_mut(self.tab.add(self.son_base), self.son_len) }
+    }
+
+    /// One block of `hash_buf`.
+    ///
+    /// # Safety
+    ///
+    /// Caller must hold that block: the hash thread after
+    /// `Semaphore_Wait(free)` and before `Semaphore_Release1(filled)`, or the
+    /// bt thread between the matching pair.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn hash_block(&self, offset: usize) -> &mut [u32] {
+        // SAFETY: the semaphore pair in `MtSync` lets exactly one thread be
+        // inside a given block at a time, and `offset` names a whole block.
+        unsafe { core::slice::from_raw_parts_mut(self.bufs.add(offset), HASH_BLOCK_SIZE as usize) }
+    }
+
+    /// The whole `bt_buf` allocation, including the two-word failure buffer
+    /// that follows it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Common::hash_block`], for the bt and lz threads.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn bt_all(&self) -> &mut [u32] {
+        // SAFETY: as `hash_block`; callers index a block they hold.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE), BT_BUFFER_SIZE + 2)
+        }
+    }
+}
+
+/// C: the `CMatchFinder` window fields the hash thread owns.
+struct HashState {
+    /// C: `mf->pos`.
+    pos: u32,
+    /// C: `mf->buffer`, as an index into the window.
+    buffer: usize,
+    /// C: `mf->streamPos`.
+    stream_pos: u32,
+    /// C: `mf->streamEndWasReached`.
+    stream_end_was_reached: bool,
+    /// C: `mf->result`.
+    result: Result<(), Error>,
+}
+
+impl HashState {
+    /// C: `GET_AVAIL_BYTES`.
+    #[inline]
+    fn avail(&self) -> u32 {
+        self.stream_pos.wrapping_sub(self.pos)
+    }
+}
+
+/// C: the `CMatchFinderMt` fields between `btSync` and `hashSync`, which the
+/// bt thread owns.
+struct BtState {
+    /// C: `p->hashBufPos`.
+    hash_buf_pos: u32,
+    /// C: `p->hashBufPosLimit`.
+    hash_buf_pos_limit: u32,
+    /// C: `p->hashNumAvail`.
+    hash_num_avail: u32,
+    /// C: `p->failure_BT`.
+    failure: bool,
+    /// C: `p->pos`.
+    pos: u32,
+    /// C: `p->buffer`, as an index into the window.
+    buffer: usize,
+    /// C: `p->cyclicBufferPos`.
+    cyclic_buffer_pos: u32,
+}
+
+/// C: the `CMatchFinderMt` fields above `btSync`, which the lz thread owns.
+struct LzState {
+    /// C: `p->pointerToCurPos`, as an index into the window.
+    pointer_to_cur_pos: usize,
+    /// C: `p->btBufPos`, as an index into `bt_all`.
+    bt_buf_pos: usize,
+    /// C: `p->btBufPosLimit`.
+    bt_buf_pos_limit: usize,
+    /// C: `p->lzPos`.
+    lz_pos: u32,
+    /// C: `p->btNumAvailBytes`.
+    bt_num_avail_bytes: u32,
+    /// C: `p->failure_LZ_BT`.
+    failure_lz_bt: bool,
+}
+
+/// The whole of `CMatchFinderMt`, as the three threads divide it.
+///
+/// Each `UnsafeCell` is entered by exactly one thread, except during
+/// `move_block`, which is the one operation that touches all three and takes
+/// both critical sections first.
+pub(crate) struct MtShared {
+    common: Common,
+    hash_state: UnsafeCell<HashState>,
+    bt_state: UnsafeCell<BtState>,
+    lz_state: UnsafeCell<LzState>,
+    /// C: `p->hashSync`.
+    hash_sync: MtSync,
+    /// C: `p->btSync`.
+    bt_sync: MtSync,
+    /// The allocations `Common`'s pointers address. Never referenced through
+    /// these fields; they are here so that the buffers outlive every thread.
+    _win: Vec<u8>,
+    _tab: Vec<u32>,
+    _bufs: Vec<u32>,
+}
+
+// SAFETY: `Common`'s three raw pointers address allocations owned by this same
+// struct, so they are valid for as long as any thread can reach them. Every
+// other field is either immutable after construction or an `UnsafeCell` whose
+// contents are partitioned between the threads by the block protocol described
+// at the top of this module; the partition, not a lock, is what makes the
+// concurrent access disjoint, which is exactly the argument `C/LzFindMt.c`
+// makes for the same struct.
+unsafe impl Send for MtShared {}
+// SAFETY: as above.
+unsafe impl Sync for MtShared {}
+
+impl MtShared {
+    /// C: `MatchFinder_NeedMove`.
+    fn need_move(&self, h: &HashState) -> bool {
+        if h.stream_end_was_reached || h.result.is_err() {
+            return false;
+        }
+        (self.common.win_len - h.buffer) <= self.common.keep_size_after as usize
+    }
+
+    /// C: `MatchFinder_MoveBlock`, with the two extra index fixups
+    /// `HashThreadFunc` does around it.
+    ///
+    /// The one operation that is not partitioned: it slides the whole window
+    /// down, so the bt and lz threads' indices into it move too. The caller
+    /// holds both critical sections, which is what stops them.
+    fn move_block(&self, h: &mut HashState) {
+        let c = &self.common;
+        let offset = h.buffer - c.keep_size_before as usize;
+        let keep_before = (offset & (K_BLOCK_MOVE_ALIGN - 1)) + c.keep_size_before as usize;
+        let from = offset & !(K_BLOCK_MOVE_ALIGN - 1);
+        let len = keep_before + h.avail() as usize;
+        // SAFETY: both critical sections are held, so neither the bt nor the
+        // lz thread is inside `Common::win`; `from + len` is within the window
+        // because `MatchFinder_Create` sized it that way. The copy overlaps,
+        // which is what `copy` (C: `memmove`) is for.
+        unsafe {
+            core::ptr::copy(c.win.add(from), c.win, len);
+        }
+        let shift = h.buffer - keep_before;
+        h.buffer = keep_before;
+        // C: `mt->pointerToCurPos -= offset; mt->buffer -= offset;`, where the
+        // C's `offset` is the distance the window actually moved.
+        // SAFETY: as above - both sections are held, so the owners of these
+        // two cells are parked and no reference to either exists.
+        unsafe {
+            (*self.lz_state.get()).pointer_to_cur_pos -= shift;
+            (*self.bt_state.get()).buffer -= shift;
+        }
+    }
+
+    /// C: `MatchFinder_ReadBlock`, against the window through its one raw
+    /// pointer rather than through a `&mut Vec`, so that the bt and lz
+    /// threads' reads below `streamPos` keep their provenance.
+    fn read_block(&self, h: &mut HashState, stream: &mut dyn SeqInStream) {
+        if h.stream_end_was_reached || h.result.is_err() {
+            return;
+        }
+        let c = &self.common;
+        loop {
+            let dest = h.buffer + h.avail() as usize;
+            let size = c.win_len - dest;
+            if size == 0 {
+                // C: "we call ReadBlock() after NeedMove() and MoveBlock(). So
+                // we don't execute this branch in normal code flow."
+                return;
+            }
+            // SAFETY: `dest` is at or above `streamPos`, which is where the bt
+            // and lz threads stop reading, so this range is disjoint from
+            // anything they hold. It is inside the window because
+            // `dest + size == win_len`.
+            let out = unsafe { core::slice::from_raw_parts_mut(c.win.add(dest), size) };
+            match stream.read(out) {
+                Err(e) => {
+                    h.result = Err(e);
+                    return;
+                }
+                Ok(0) => {
+                    h.stream_end_was_reached = true;
+                    return;
+                }
+                Ok(n) => {
+                    h.stream_pos = h.stream_pos.wrapping_add(n as u32);
+                    if h.avail() > c.keep_size_after {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// C: `MatchFinder_ReadIfRequired`.
+    fn read_if_required(&self, h: &mut HashState, stream: &mut dyn SeqInStream) {
+        if self.common.keep_size_after >= h.avail() {
+            self.read_block(h, stream);
+        }
+    }
+}
+
+impl Common {
+    /// The whole `hash_buf` allocation.
+    ///
+    /// # Safety
+    ///
+    /// As [`Common::hash_block`]: callers index a block they hold.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn hash_all(&self) -> &mut [u32] {
+        // SAFETY: as `hash_block`.
+        unsafe { core::slice::from_raw_parts_mut(self.bufs, HASH_BUFFER_SIZE) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HASH THREAD
+// ---------------------------------------------------------------------------
+
+/// C: `HashThreadFunc`, reached through `HashThreadFunc2`.
+fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
+    let p = &sh.hash_sync;
+    loop {
+        let mut block_index: u32 = 0;
+        p.can_start.wait();
+        if p.exiting() {
+            return;
+        }
+
+        // SAFETY: this is the hash thread, and `can_start` has just ordered it
+        // behind the lz thread's `MatchFinderMt_Init`, so nothing else holds
+        // either of these.
+        let h = unsafe { &mut *sh.hash_state.get() };
+        // C: `MatchFinder_Init_HighHash`.
+        // SAFETY: the high hash is the hash thread's exclusive range.
+        let high = unsafe { sh.common.high_hash() };
+        high[..=sh.common.hash_mask as usize].fill(K_EMPTY_HASH_VALUE);
+
+        loop {
+            if sh.need_move(h) {
+                // C: both sections, in this order, so that neither the bt nor
+                // the lz thread is looking at the window while it slides.
+                sh.bt_sync.cs.enter();
+                sh.hash_sync.cs.enter();
+                sh.move_block(h);
+                sh.hash_sync.cs.leave();
+                sh.bt_sync.cs.leave();
+                continue;
+            }
+
+            p.free.wait();
+
+            if p.exiting() {
+                // C: "exit is unexpected here. But we check it here for some
+                // failure case".
+                return;
+            }
+            // C: "for faster stop : we check (p->stopWriting) after
+            // Wait(freeSemaphore)".
+            if p.stopping() {
+                break;
+            }
+
+            sh.read_if_required(h, stream);
+            {
+                let c = &sh.common;
+                let offset = hash_block_offset(block_index);
+                block_index = block_index.wrapping_add(1);
+                let mut num = h.avail();
+
+                // C: "heads[1] contains the number of avail bytes: if (avail <
+                // mf->numHashBytes) it means that stream was finished [...]
+                // HASH_THREAD fills only the header (2 numbers) for all next
+                // blocks: {2, NumHashBytes - 1}, {2,0}, {2,0}, ..."
+                // SAFETY: the `free` semaphore was just taken, so this block is
+                // this thread's until `filled` is released below.
+                let heads = unsafe { c.hash_block(offset) };
+                heads[0] = 2;
+                heads[1] = num;
+
+                if num >= c.num_hash_bytes {
+                    num = num - c.num_hash_bytes + 1;
+                    if num > HASH_BLOCK_SIZE - 2 {
+                        num = HASH_BLOCK_SIZE - 2;
+                    }
+
+                    if h.pos > MT_MAX_VAL_FOR_NORMALIZE - num {
+                        let sub_value = h.pos - c.history_size - 1;
+                        // C: `MatchFinder_REDUCE_OFFSETS`.
+                        h.pos -= sub_value;
+                        h.stream_pos -= sub_value;
+                        // SAFETY: the high hash is this thread's range.
+                        let hash = unsafe { c.high_hash() };
+                        crate::enc::lz_find::normalize3(
+                            sub_value,
+                            &mut hash[..=c.hash_mask as usize],
+                        );
+                    }
+
+                    heads[0] = 2 + num;
+                    // SAFETY: the window below `stream_pos` is stable here:
+                    // this thread is the only writer and is not writing, and
+                    // `move_block` cannot run while this block is held.
+                    let win = unsafe { c.win() };
+                    // SAFETY: the high hash is this thread's range.
+                    let hash = unsafe { c.high_hash() };
+                    get_heads(
+                        c.heads,
+                        &win[h.buffer..],
+                        h.pos,
+                        hash,
+                        c.hash_mask,
+                        &mut heads[2..2 + num as usize],
+                        &c.crc,
+                    );
+                }
+
+                // C: "wrap over zero is allowed at the end of stream".
+                h.pos = h.pos.wrapping_add(num);
+                h.buffer += num as usize;
+            }
+
+            p.filled.release1();
+        }
+
+        p.was_stopped.set();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BT THREAD
+// ---------------------------------------------------------------------------
+
+/// C: `BtGetMatches`. Fills one `bt_buf` block from the head distances the
+/// hash thread produced, pulling more `hash_buf` blocks as it needs them.
+fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
+    let c = &sh.common;
+    let mut num_processed: u32 = 0;
+    let mut cur_pos: u32 = 2;
+
+    // C: "GetMatchesSpec() functions don't create (len = 1) in [len, dist]
+    // match pairs, if (p->numHashBytes >= 2)".
+    let limit = BT_BLOCK_SIZE - c.match_max_len * 2;
+
+    // SAFETY: this block of `bt_buf` is the bt thread's until it releases
+    // `filled`, and the `hash_buf` blocks it reads are held the same way.
+    let d = &mut unsafe { c.bt_all() }[block_offset..block_offset + BT_BLOCK_SIZE as usize];
+    d[1] = b.hash_num_avail;
+
+    if b.failure {
+        d[0] = 0;
+        return;
+    }
+
+    while cur_pos < limit {
+        if b.hash_buf_pos == b.hash_buf_pos_limit {
+            let avail;
+            {
+                let bi = sh.hash_sync.get_next_block();
+                let k = hash_block_offset(bi) as u32;
+                // SAFETY: `get_next_block` has just handed this block over.
+                let h = unsafe { c.hash_all() };
+                avail = h[k as usize + 1];
+                b.hash_buf_pos_limit = k + h[k as usize];
+                b.hash_num_avail = avail;
+                b.hash_buf_pos = k + 2;
+            }
+
+            // C: "we must prevent UInt32 overflow for avail total value".
+            let sum = num_processed.wrapping_add(avail);
+            d[1] = if sum < num_processed { u32::MAX } else { sum };
+
+            if avail >= c.num_hash_bytes {
+                continue;
+            }
+
+            // C: "(avail < p->numHashBytes) It means that stream was finished.
+            // [...] we fill (d) for (avail) bytes for LZ_THREAD (receiver)."
+            b.hash_num_avail = 0;
+            d[0] = cur_pos + avail;
+            let base = cur_pos as usize;
+            d[base..base + avail as usize].fill(0);
+            return;
+        }
+
+        let mut size = b.hash_buf_pos_limit - b.hash_buf_pos;
+        let mut pos = b.pos;
+        let mut cyclic_buffer_pos = b.cyclic_buffer_pos;
+        let mut len_limit = c.match_max_len;
+        if len_limit >= b.hash_num_avail {
+            len_limit = b.hash_num_avail;
+        }
+        {
+            let size2 = b.hash_num_avail - len_limit + 1;
+            if size2 < size {
+                size = size2;
+            }
+            let size2 = c.cyclic_buffer_size - cyclic_buffer_pos;
+            if size2 < size {
+                size = size2;
+            }
+        }
+
+        if pos > MT_MAX_VAL_FOR_NORMALIZE - size {
+            let sub_value = pos - c.cyclic_buffer_size;
+            pos -= sub_value;
+            b.pos = pos;
+            // SAFETY: `son` is the bt thread's exclusive range.
+            let son = unsafe { c.son() };
+            crate::enc::lz_find::normalize3(sub_value, son);
+        }
+
+        let pos_res;
+        let d_end;
+        {
+            // SAFETY: the window below `stream_pos` is stable while this
+            // thread holds a `hash_buf` block: `move_block` waits on
+            // `hash_sync.cs`, which `get_next_block` left locked.
+            let win = unsafe { c.win() };
+            // SAFETY: `son` is the bt thread's exclusive range.
+            let son = unsafe { c.son() };
+            // SAFETY: the `hash_buf` block this reads is held, as above.
+            let heads = unsafe { c.hash_all() };
+            match get_matches_spec_n_2(
+                win,
+                b.buffer + len_limit as usize - 1,
+                pos,
+                b.buffer,
+                son,
+                c.cut_value,
+                d,
+                cur_pos as usize,
+                c.num_hash_bytes as usize - 1,
+                heads,
+                b.hash_buf_pos as usize,
+                limit as usize,
+                (b.hash_buf_pos + size) as usize,
+                cyclic_buffer_pos,
+                c.cyclic_buffer_size,
+            ) {
+                Some((di, pr)) => {
+                    d_end = di;
+                    pos_res = pr;
+                }
+                None => {
+                    // C: "internal data failure".
+                    b.failure = true;
+                    d[0] = 0;
+                    return;
+                }
+            }
+        }
+
+        cur_pos = d_end as u32;
+        {
+            let processed = pos_res - pos;
+            pos = pos_res;
+            b.hash_buf_pos += processed;
+            cyclic_buffer_pos += processed;
+            b.buffer += processed as usize;
+        }
+
+        {
+            let processed = pos - b.pos;
+            num_processed += processed;
+            b.hash_num_avail -= processed;
+            b.pos = pos;
+        }
+        if cyclic_buffer_pos == c.cyclic_buffer_size {
+            cyclic_buffer_pos = 0;
+        }
+        b.cyclic_buffer_pos = cyclic_buffer_pos;
+    }
+
+    d[0] = cur_pos;
+}
+
+/// C: `BtFillBlock`.
+fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
+    let sync = &sh.hash_sync;
+    if !MtSync::get(&sync.need_start) {
+        sync.lock_buffer();
+    }
+    bt_get_matches(sh, b, bt_block_offset(global_block_index));
+    // C: "We suppose that we have called GetNextBlock() from start. So buffer
+    // is LOCKED".
+    sync.unlock_buffer();
+}
+
+/// C: `BtThreadFunc`, reached through `BtThreadFunc2`.
+fn bt_thread_func(sh: &MtShared) {
+    let p = &sh.bt_sync;
+    loop {
+        let mut block_index: u32 = 0;
+        p.can_start.wait();
+
+        // SAFETY: this is the bt thread; `can_start` orders it behind the lz
+        // thread's `MatchFinderMt_Init`, and nothing else enters this cell.
+        let b = unsafe { &mut *sh.bt_state.get() };
+
+        loop {
+            // C: "(p->exit == true) is possible after (p->canStart) at first
+            // loop iteration".
+            if p.exiting() {
+                return;
+            }
+            p.free.wait();
+            if p.stopping() {
+                break;
+            }
+            bt_fill_block(sh, b, block_index);
+            block_index = block_index.wrapping_add(1);
+            p.filled.release1();
+        }
+
+        // C: "we stop HASH_THREAD here".
+        sh.hash_sync.stop_writing();
+        p.was_stopped.set();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LZ THREAD - the public face
+// ---------------------------------------------------------------------------
+
+/// The threaded match finder.
+///
+/// C: `CMatchFinderMt` plus the `IMatchFinder2` vtable
+/// `MatchFinderMt_CreateVTable` fills in. Everything here runs on the lz
+/// thread - the one that called the encoder.
+pub(crate) struct MatchFinderMt {
+    /// C: `MFB`, the `CMatchFinder` `LzmaEnc` configures and
+    /// `MatchFinderMt_Create` hands to `MatchFinder_Create`. It keeps the
+    /// settings between calls; its allocations move into `sh` on `create`.
+    pub(crate) mfb: MatchFinder,
+    sh: Option<Arc<MtShared>>,
+}
+
+impl MatchFinderMt {
+    /// C: `MatchFinderMt_Construct`.
+    pub(crate) fn new() -> Self {
+        MatchFinderMt {
+            mfb: MatchFinder::new(),
+            sh: None,
+        }
+    }
+
+    fn shared(&self) -> &MtShared {
+        self.sh.as_deref().expect("match finder was not created")
+    }
+
+    /// C: `MatchFinderMt_Create`.
+    pub(crate) fn create(
+        &mut self,
+        history_size: u32,
+        keep_add_buffer_before: u32,
+        match_max_len: u32,
+        keep_add_buffer_after: u32,
+    ) -> Result<(), Error> {
+        if BT_BLOCK_SIZE <= match_max_len * 4 {
+            return Err(Error::Param);
+        }
+
+        let mut bufs: Vec<u32> = Vec::new();
+        bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
+            .map_err(|_| Error::Alloc)?;
+        bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+
+        let before = keep_add_buffer_before
+            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .ok_or(Error::Param)?;
+        let after = keep_add_buffer_after
+            .checked_add(HASH_BLOCK_SIZE)
+            .ok_or(Error::Param)?;
+        self.mfb
+            .create(history_size, before, match_max_len, after)?;
+
+        // C: `MFB.bigHash = (MFB.hashMask >= 0xFFFFFF)`, set after
+        // `MatchFinderMt_Create` and read by `MatchFinderMt_CreateVTable`.
+        // `C/LzFind.c` sizes the table so that the `b` variants' unmasked
+        // 24-bit term always fits once this is true.
+        self.mfb.big_hash = self.mfb.hash_mask >= 0xFF_FFFF;
+
+        let heads = match (self.mfb.num_hash_bytes, self.mfb.big_hash) {
+            (2, _) => Heads::H2,
+            (3, false) => Heads::H3,
+            (3, true) => Heads::H3b,
+            (4, false) => Heads::H4,
+            (4, true) => Heads::H4b,
+            (_, false) => Heads::H5,
+            (_, true) => Heads::H5b,
+        };
+        let mix = match self.mfb.num_hash_bytes {
+            2 => Mix::None,
+            3 => Mix::Two,
+            4 => Mix::Three,
+            _ => Mix::Four,
+        };
+
+        let mut win = core::mem::take(&mut self.mfb.buf_base);
+        let mut tab = core::mem::take(&mut self.mfb.hash);
+        let son_base = self.mfb.son_base;
+        let common = Common {
+            win: win.as_mut_ptr(),
+            win_len: win.len(),
+            tab: tab.as_mut_ptr(),
+            bufs: bufs.as_mut_ptr(),
+            hash_mask: self.mfb.hash_mask,
+            fixed_hash_size: self.mfb.fixed_hash_size as usize,
+            son_base,
+            son_len: tab.len() - son_base,
+            history_size,
+            num_hash_bytes: self.mfb.num_hash_bytes,
+            match_max_len: self.mfb.match_max_len,
+            cut_value: self.mfb.cut_value,
+            cyclic_buffer_size: self.mfb.cyclic_buffer_size,
+            keep_size_before: self.mfb.keep_size_before,
+            keep_size_after: self.mfb.keep_size_after,
+            crc: self.mfb.crc,
+            heads,
+            mix,
+        };
+
+        self.sh = Some(Arc::new(MtShared {
+            common,
+            hash_state: UnsafeCell::new(HashState {
+                pos: 0,
+                buffer: 0,
+                stream_pos: 0,
+                stream_end_was_reached: false,
+                result: Ok(()),
+            }),
+            bt_state: UnsafeCell::new(BtState {
+                hash_buf_pos: 0,
+                hash_buf_pos_limit: 0,
+                hash_num_avail: 0,
+                failure: false,
+                pos: 0,
+                buffer: 0,
+                cyclic_buffer_pos: 0,
+            }),
+            lz_state: UnsafeCell::new(LzState {
+                pointer_to_cur_pos: 0,
+                bt_buf_pos: 0,
+                bt_buf_pos_limit: 0,
+                lz_pos: 0,
+                bt_num_avail_bytes: 0,
+                failure_lz_bt: false,
+            }),
+            hash_sync: MtSync::new(),
+            bt_sync: MtSync::new(),
+            _win: win,
+            _tab: tab,
+            _bufs: bufs,
+        }));
+        Ok(())
+    }
+
+    /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
+    pub(crate) fn init_mt(&self) -> Result<(), Error> {
+        let sh = self.shared();
+        sh.hash_sync.init(HASH_NUM_BLOCKS)?;
+        sh.bt_sync.init(BT_NUM_BLOCKS)
+    }
+
+    /// C: `MatchFinderMt_Init`. Deliberately reads nothing: "Init without data
+    /// reading. We don't want to read data in this thread."
+    pub(crate) fn init(&mut self) {
+        let sh = self.shared();
+        let c = &sh.common;
+        // SAFETY: the lz thread owns `lz_state`; the other two cells are only
+        // reachable here because both producer threads are stopped - `init` is
+        // called between `init_mt` and the first `get_next_block`, and neither
+        // thread has been let past `can_start` yet.
+        unsafe {
+            let h = &mut *sh.hash_state.get();
+            // C: `MatchFinder_Init_4`.
+            h.buffer = 0;
+            h.pos = 1;
+            h.stream_pos = 1;
+            h.result = Ok(());
+            h.stream_end_was_reached = false;
+
+            // C: `MatchFinder_Init_LowHash`.
+            c.low_hash().fill(K_EMPTY_HASH_VALUE);
+
+            let b = &mut *sh.bt_state.get();
+            b.hash_buf_pos = 0;
+            b.hash_buf_pos_limit = 0;
+            b.hash_num_avail = 0;
+            b.failure = false;
+            // C: "we must init (p->pos = mf->pos) for BT, because BT code
+            // needs (p->pos == delta_value_for_empty_hash_record == mf->pos)".
+            b.pos = h.pos;
+            // C: `CYC_TO_POS_OFFSET` is 0.
+            b.cyclic_buffer_pos = b.pos;
+            b.buffer = h.buffer;
+
+            let l = &mut *sh.lz_state.get();
+            l.bt_buf_pos = 0;
+            l.bt_buf_pos_limit = 0;
+            l.pointer_to_cur_pos = h.buffer;
+            l.bt_num_avail_bytes = 0;
+            l.failure_lz_bt = false;
+            // C: "1; // optimal smallest value".
+            l.lz_pos = 1;
+        }
+    }
+
+    /// The handle [`with_threads`] needs to start the two producer threads.
+    pub(crate) fn shared_handle(&self) -> Option<&Arc<MtShared>> {
+        self.sh.as_ref()
+    }
+
+    /// C: `MatchFinder_GetPointerToCurrentPos`, as an index into
+    /// [`MatchFinderMt::window`].
+    #[inline]
+    pub(crate) fn cur(&self) -> usize {
+        // SAFETY: the lz thread owns `lz_state`.
+        unsafe { (*self.shared().lz_state.get()).pointer_to_cur_pos }
+    }
+
+    /// The window the encoder reads literals and match bytes out of.
+    ///
+    /// C: the bytes `p->pointerToCurPos` points into.
+    #[inline]
+    pub(crate) fn window(&self) -> &[u8] {
+        // SAFETY: the lz thread may always read the window; see
+        // `Common::win`.
+        unsafe { self.shared().common.win() }
+    }
+
+    /// C: `mf->result`, which the bt and lz threads only ever read after the
+    /// hash thread has stopped.
+    pub(crate) fn result(&self) -> Result<(), Error> {
+        // SAFETY: reading one scalar the hash thread owns. This is called from
+        // `CheckErrors`, after `release_stream` has joined that thread - see
+        // `Finder::result` for where the encoder does it.
+        unsafe { (*self.shared().hash_state.get()).result }
+    }
+
+    /// C: `MatchFinderMt_GetNextBlock_Bt`.
+    fn get_next_block_bt(&mut self) -> u32 {
+        let sh = self.shared();
+        let c = &sh.common;
+        // SAFETY: the lz thread owns `lz_state`.
+        let l = unsafe { &mut *sh.lz_state.get() };
+        if l.failure_lz_bt {
+            l.bt_buf_pos = BT_BUFFER_SIZE;
+        } else {
+            let bi = sh.bt_sync.get_next_block();
+            let base = bt_block_offset(bi);
+            // SAFETY: `get_next_block` has just handed this block over, and
+            // the lz thread holds it until the next call.
+            let bt = unsafe { c.bt_all() };
+            let num_items = bt[base];
+            l.bt_buf_pos_limit = base + num_items as usize;
+            l.bt_num_avail_bytes = bt[base + 1];
+            l.bt_buf_pos = base + 2;
+            if !(2..=BT_BLOCK_SIZE).contains(&num_items) {
+                bt[BT_BUFFER_SIZE] = 0;
+                l.bt_buf_pos = BT_BUFFER_SIZE;
+                l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
+                l.failure_lz_bt = true;
+                // C: "we don't want to decrease AvailBytes, that was load
+                // before".
+            }
+
+            if l.lz_pos >= MT_MAX_VAL_FOR_NORMALIZE - BT_BLOCK_SIZE {
+                // C: "(fixedHashSize) is small, so normalization is fast".
+                let sub_value = l.lz_pos - c.history_size - 1;
+                l.lz_pos -= sub_value;
+                // SAFETY: the low hash is the lz thread's exclusive range.
+                crate::enc::lz_find::normalize3(sub_value, unsafe { c.low_hash() });
+            }
+        }
+        l.bt_num_avail_bytes
+    }
+
+    /// C: `GET_NEXT_BLOCK_IF_REQUIRED`.
+    #[inline]
+    fn next_block_if_required(&mut self) {
+        // SAFETY: the lz thread owns `lz_state`.
+        let l = unsafe { &*self.shared().lz_state.get() };
+        if l.bt_buf_pos == l.bt_buf_pos_limit {
+            self.get_next_block_bt();
+        }
+    }
+
+    /// C: `MatchFinderMt_GetNumAvailableBytes`.
+    pub(crate) fn get_num_available_bytes(&mut self) -> u32 {
+        // SAFETY: the lz thread owns `lz_state`.
+        let l = unsafe { &*self.shared().lz_state.get() };
+        if l.bt_buf_pos != l.bt_buf_pos_limit {
+            return l.bt_num_avail_bytes;
+        }
+        self.get_next_block_bt()
+    }
+}
+
+impl MatchFinderMt {
+    /// C: `MixMatches2` / `MixMatches3` / `MixMatches4`.
+    ///
+    /// The bt thread only tracks matches of at least `numHashBytes` bytes, so
+    /// the short ones are found here, from the low hash table, and spliced in
+    /// front of the pairs it produced. `match_min_pos` is where the bt
+    /// thread's nearest match already is: anything further back is redundant.
+    fn mix_matches(&self, match_min_pos: u32, d: &mut [u32], mut di: usize) -> usize {
+        let sh = self.shared();
+        let c = &sh.common;
+        // SAFETY: the lz thread owns `lz_state` and the low hash, and may read
+        // the window.
+        let (l, hash, win) = unsafe { (&*sh.lz_state.get(), c.low_hash(), c.win()) };
+        let cur = l.pointer_to_cur_pos;
+        let m = l.lz_pos;
+
+        // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
+        let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
+        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+        let c2 = hash[h2];
+        hash[h2] = m;
+
+        if c.mix == Mix::Two {
+            if c2 >= match_min_pos && win[cur - (m - c2) as usize] == win[cur] {
+                d[di] = 2;
+                d[di + 1] = m - c2 - 1;
+                di += 2;
+            }
+            return di;
+        }
+
+        let h3 = ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+        let c3 = hash[K_FIX3_HASH_SIZE + h3];
+        hash[K_FIX3_HASH_SIZE + h3] = m;
+
+        if c.mix == Mix::Three {
+            if c2 >= match_min_pos {
+                let back = (m - c2) as usize;
+                if win[cur - back] == win[cur] {
+                    d[di + 1] = m - c2 - 1;
+                    if win[cur - back + 2] == win[cur + 2] {
+                        d[di] = 3;
+                        return di + 2;
+                    }
+                    d[di] = 2;
+                    di += 2;
+                }
+            }
+            if c3 >= match_min_pos {
+                let back = (m - c3) as usize;
+                if win[cur - back] == win[cur] {
+                    d[di] = 3;
+                    d[di + 1] = m - c3 - 1;
+                    di += 2;
+                }
+            }
+            return di;
+        }
+
+        // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
+        // is no fourth hash here.
+        if c2 >= match_min_pos {
+            let back = (m - c2) as usize;
+            if win[cur - back] == win[cur] {
+                d[di + 1] = m - c2 - 1;
+                if win[cur - back + 2] == win[cur + 2] {
+                    if win[cur - back + 3] == win[cur + 3] {
+                        d[di] = 4;
+                        return di + 2;
+                    }
+                    d[di] = 3;
+                    return di + 2;
+                }
+                d[di] = 2;
+                di += 2;
+            }
+        }
+        if c3 >= match_min_pos {
+            let back = (m - c3) as usize;
+            if win[cur - back] == win[cur] {
+                d[di + 1] = m - c3 - 1;
+                if win[cur - back + 3] == win[cur + 3] {
+                    d[di] = 4;
+                    return di + 2;
+                }
+                d[di] = 3;
+                di += 2;
+            }
+        }
+        di
+    }
+
+    /// C: `INCREASE_LZ_POS`.
+    #[inline]
+    fn increase_lz_pos(&self) {
+        // SAFETY: the lz thread owns `lz_state`.
+        let l = unsafe { &mut *self.shared().lz_state.get() };
+        l.lz_pos += 1;
+        l.pointer_to_cur_pos += 1;
+    }
+
+    /// C: `MatchFinderMt_GetMatches`, or `MatchFinderMt2_GetMatches` when
+    /// there is no low hash to mix in.
+    pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
+        let sh = self.shared();
+        let c = &sh.common;
+        // SAFETY: the lz thread owns `lz_state` and holds the current `bt_buf`
+        // block until its next `get_next_block`.
+        let (l, bt) = unsafe { (&mut *sh.lz_state.get(), c.bt_all()) };
+
+        let mut bt_pos = l.bt_buf_pos;
+        let len = bt[bt_pos];
+        bt_pos += 1;
+
+        if c.mix == Mix::None {
+            let bt_lim = bt_pos + len as usize;
+            l.bt_buf_pos = bt_lim;
+            l.bt_num_avail_bytes -= 1;
+            self.increase_lz_pos();
+            let mut di = 0;
+            while bt_pos != bt_lim {
+                d[di] = bt[bt_pos];
+                d[di + 1] = bt[bt_pos + 1];
+                bt_pos += 2;
+                di += 2;
+            }
+            return di;
+        }
+
+        let avail = l.bt_num_avail_bytes - 1;
+        l.bt_num_avail_bytes = avail;
+        l.bt_buf_pos = bt_pos + len as usize;
+
+        let mut di = 0;
+        if len == 0 {
+            if avail >= (BT_HASH_BYTES_MAX - 1) - 1 {
+                let mut m = l.lz_pos;
+                if m > c.history_size {
+                    m -= c.history_size;
+                } else {
+                    m = 1;
+                }
+                di = self.mix_matches(m, d, di);
+            }
+        } else {
+            // C: "first match pair from BinTree: (match_len, match_dist)
+            // [...] MixMatchesFunc() inserts only hash matches that are nearer
+            // than (match_dist)".
+            let min_pos = l.lz_pos - bt[bt_pos + 1];
+            di = self.mix_matches(min_pos, d, di);
+            let mut left = len;
+            loop {
+                d[di] = bt[bt_pos];
+                d[di + 1] = bt[bt_pos + 1];
+                bt_pos += 2;
+                di += 2;
+                left -= 2;
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+        self.increase_lz_pos();
+        di
+    }
+
+    /// C: `MatchFinderMt0_Skip` / `MatchFinderMt2_Skip` / `MatchFinderMt3_Skip`
+    /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair.
+    pub(crate) fn skip(&mut self, mut num: u32) {
+        let min_len = match self.shared().common.mix {
+            Mix::None => 0,
+            Mix::Two => 2,
+            // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
+            // "the difference is that MatchFinderMt3_Skip() updates hash for
+            // last 3 bytes of stream".
+            Mix::Three | Mix::Four => 3,
+        };
+        loop {
+            self.next_block_if_required();
+            let sh = self.shared();
+            let c = &sh.common;
+            // SAFETY: the lz thread owns `lz_state` and the low hash, and may
+            // read the window and the block it holds.
+            let (l, hash, win, bt) =
+                unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win(), c.bt_all()) };
+            let avail = l.bt_num_avail_bytes;
+            l.bt_num_avail_bytes = avail.wrapping_sub(1);
+            if min_len != 0 && avail >= min_len {
+                let cur = l.pointer_to_cur_pos;
+                let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
+                let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                hash[h2] = l.lz_pos;
+                if min_len == 3 {
+                    let h3 =
+                        ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                    hash[K_FIX3_HASH_SIZE + h3] = l.lz_pos;
+                }
+            }
+            l.lz_pos += 1;
+            l.pointer_to_cur_pos += 1;
+            l.bt_buf_pos += bt[l.bt_buf_pos] as usize + 1;
+            num -= 1;
+            if num == 0 {
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running the threads
+// ---------------------------------------------------------------------------
+
+/// The two producer threads, for as long as one stream lasts.
+///
+/// C: the pair `MatchFinderMt_Create` spawns and `MatchFinderMt_Destruct`
+/// stops. They are scoped threads here, so the hash thread can hold the
+/// caller's `&mut dyn SeqInStream` directly instead of the C's stored
+/// `mf->stream` pointer; [`MtRun`]'s `Drop` is what guarantees they are
+/// stopped and joined before that borrow ends.
+struct MtRun<'s> {
+    sh: Arc<MtShared>,
+    hash: Option<std::thread::ScopedJoinHandle<'s, ()>>,
+    bt: Option<std::thread::ScopedJoinHandle<'s, ()>>,
+}
+
+impl Drop for MtRun<'_> {
+    fn drop(&mut self) {
+        // C: `MatchFinderMt_Destruct`. "we want thread to be in Stopped state
+        // before sending EXIT command. note: stop(btSync) will stop (htSync)
+        // also."
+        self.sh.bt_sync.stop_writing();
+        self.sh.bt_sync.send_exit();
+        if let Some(h) = self.bt.take() {
+            let _ = h.join();
+        }
+        self.sh.hash_sync.stop_writing();
+        self.sh.hash_sync.send_exit();
+        if let Some(h) = self.hash.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Runs `body` with the hash and bt threads live.
+///
+/// C: the window between `MatchFinderMt_Create` and
+/// `MatchFinderMt_ReleaseStream` - one stream's worth of encoding. The threads
+/// are spawned here rather than once per encoder because that is what lets the
+/// hash thread borrow `stream`; one pair of spawns per LZMA2 block, which is
+/// at least a megabyte of input, is not measurable.
+///
+/// # Errors
+///
+/// Propagates whatever `body` returns.
+pub(crate) fn with_threads<T>(
+    sh: &Arc<MtShared>,
+    stream: &mut (dyn SeqInStream + Send),
+    body: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    std::thread::scope(|scope| {
+        let run = {
+            let hash_sh = Arc::clone(sh);
+            let bt_sh = Arc::clone(sh);
+            // Set before the spawns: the bt thread calls
+            // `hash_sync.stop_writing()`, which does nothing unless the flag is
+            // already up.
+            MtSync::set(&sh.hash_sync.was_created, true);
+            MtSync::set(&sh.bt_sync.was_created, true);
+            let hash = scope.spawn(move || hash_thread_func(&hash_sh, stream));
+            let bt = scope.spawn(move || bt_thread_func(&bt_sh));
+            MtRun {
+                sh: Arc::clone(sh),
+                hash: Some(hash),
+                bt: Some(bt),
+            }
+        };
+        let r = body();
+        // C: `MatchFinderMt_ReleaseStream`, before the threads are torn down.
+        run.sh.bt_sync.stop_writing();
+        drop(run);
+        r
+    })
+}
