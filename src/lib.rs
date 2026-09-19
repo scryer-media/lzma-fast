@@ -46,6 +46,8 @@ extern crate std;
 #[cfg(feature = "enc")]
 mod enc;
 mod error;
+#[cfg(feature = "kernel-ab")]
+mod kernel_ab;
 mod lzma;
 mod lzma2;
 mod lzma_alone;

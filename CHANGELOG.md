@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.1 - 2026-09-18
+
+- The match finders extend a match eight bytes at a time. `UPDATE_maxLen`,
+  `GetMatchesSpec1`, `SkipMatchesSpec` and `Hc_GetMatchesSpec` in `LzFind.c`,
+  and `GetMatchesSpecN_2` in `LzFindOpt.c`, all ask the same question with
+  different index arithmetic - how far do the bytes here and the bytes
+  `distance` behind them agree, up to a limit - and all five asked it a byte at
+  a time. `enc::match_run` asks it a word at a time: the first differing byte in
+  a 64-bit XOR is the one `trailing_zeros` names, once both words are read
+  little-endian, so the answer is the same byte index on every host.
+- It is the same answer, so it is the same stream. The encoder stays bit-exact
+  with the SDK at every setting the parity tests cover, the threaded finder
+  included, and `enc::match_run`'s own tests hold it against the byte loop for
+  every `(distance, start, limit)` over windows whose first difference lands on
+  every offset in a word and on both sides of every word boundary.
+- On an i5-1240P, encoding a 39.7 MiB tree of source and executables, medians
+  of seven interleaved rounds: 8.276s to 7.178s at preset 6 (+13.3%), 10.764s
+  to 9.291s at preset 9 (+13.7%), and 4.937s to 4.165s at preset 6 with two
+  match-finder threads (+15.6%). On input with no long matches in it the scan
+  has nothing to skip and the figure is +1.7%, never negative. The extension
+  loops were 21% of the profile before and the tree walk's own cache misses are
+  what is left.
+- `kernel-ab` is a new non-default feature that puts a cached toggle in front
+  of the scan, so the measurement above is one binary with the arm chosen at
+  run time rather than two builds. It is for benchmarking and nothing else.
+
 ## 0.5.0 - 2026-09-18
 
 - The threaded match finder. `C/LzFindMt.c` and `C/LzFindOpt.c` are ported:

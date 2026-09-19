@@ -63,6 +63,7 @@ use std::sync::Arc;
 
 use crate::enc::consts::*;
 use crate::enc::lz_find::MatchFinder;
+use crate::enc::match_run::match_run;
 use crate::enc::stream::SeqInStream;
 use crate::error::Error;
 use crate::mt::event::Event;
@@ -421,16 +422,12 @@ fn get_matches_spec_n_2(
 
                 let pair0 = son[pair];
 
-                if win[len - diff] == win[len] {
-                    len += 1;
-                    if len != len_limit && win[len - diff] == win[len] {
-                        loop {
-                            len += 1;
-                            if len == len_limit || win[len - diff] != win[len] {
-                                break;
-                            }
-                        }
-                    }
+                // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
+                // absolute window indices: it returns `len` unchanged exactly
+                // when the byte at `len` already differs.
+                let run = match_run(win, diff, len, len_limit);
+                if run != len {
+                    len = run;
                     if max_len < len {
                         max_len = len;
                         d[di] = (len - cur) as u32;

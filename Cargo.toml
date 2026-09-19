@@ -2,7 +2,7 @@
 name = "lzma-turbo"
 description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
 readme = "README.md"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
@@ -60,6 +60,15 @@ crc-host = ["crc"]
 # crate always has an in-process backend, and `std`, because the hook registry
 # is a `std::sync::RwLock`.
 crypto-host = ["std", "native-crypto"]
+# Measurement only, never default. It puts a cached toggle in front of each
+# kernel that replaced a loop from the C, so that the A/B behind the change is
+# one binary with one branch - in the position a target-feature probe's cached
+# bool would sit - rather than two builds whose inlining and layout differ at
+# the couple of percent the comparison is written in. `LZMA_TURBO_MATCH_RUN`
+# takes `scalar` for the byte loop the scan replaced. Without the feature the
+# shipped build has neither the branch nor the environment lookup. See
+# `src/kernel_ab.rs`.
+kernel-ab = ["std", "enc"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
