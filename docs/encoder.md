@@ -287,8 +287,12 @@ byte what the one-shot calls do.
 
 **External decode, `tests/xz_encoder.rs`.** `xz -t` and `xz -dc` over this
 crate's `.xz` output, and `xz -dc --format=lzma` over its `.lzma` output,
-compared with the original bytes. `7zz t` too where it is installed. Both skip
-with a message when the tool is not on `PATH`.
+compared with the original bytes; `7zz t` over the same streams. Both tools
+are installed, pinned and digest-checked, on all four CI platforms —
+`.github/scripts/install-xz.sh` for `xz`, `cargo xtask sevenzip` for `7zz` —
+and `LZMA_TURBO_XZ_REQUIRE` and `LZMA_TURBO_7ZZ_REQUIRE` make a missing tool a
+failure rather than a skip, as CI sets them. `LZMA_TURBO_XZ` and
+`LZMA_TURBO_7ZZ` name a binary that is not on `PATH`.
 
 **Filter parity, `tests/filter_parity.rs`.** `cargo xtask lzma-util` also
 builds `filter-oracle` from the SDK's own `Bra.c`, `Bra86.c`, `BraIA64.c` and
@@ -307,6 +311,35 @@ delta-then-BCJ chain, at two block sizes, back through all three readers; and
 — LZMA2 as a non-last filter, a misaligned BCJ start offset, four non-last
 filters — are checked to be refused.
 
+**The same bytes on every platform, `tests/golden.rs`.** Parity is per
+platform: each runner compares this crate against an SDK *it just built*, so
+both could drift together — this file lists two places the C's own output
+depends on `sizeof(size_t)`, and nothing else would notice a third. So five
+inputs at six fixed settings — LZMA1, raw LZMA2 and its property byte, a
+block-parallel LZMA2 at a fixed block size checked identical at one, two and
+four block threads, the threaded match finder, and a delta-then-x86 `.xz`
+chain — have their SHA-256 committed in `tests/golden.manifest`, hashed with
+this crate's own `crypto::Sha256`. Every platform's `test` job runs
+`cargo xtask golden --check`; `--write` regenerates the manifest.
+
+**Memory safety, CI's `memory-safety` job.** The encoder's tests — the
+threaded match finder, LZMA1 parity, threaded LZMA2 parity and the `enc` unit
+tests — run under Valgrind's memcheck on Linux, with `LZMA_TURBO_CORPUS_MAX`
+capping the corpus so that instrumenting every instruction stays inside the
+job's time. Beside that, `tests/guard_pages.rs` puts the input at the end of a
+guard page and the output buffer against one, from both ends, for
+`LzmaEncoder`, `Lzma2Encoder` and the threaded match finder at several
+dictionaries, levels, match finders, block sizes and thread counts: a read or
+write one byte outside any of them faults rather than landing in allocator
+slack.
+
+**Data races, CI's `thread-sanitizer` job.** `tests/mt_match_finder.rs`,
+`tests/lzma2_mt_parity.rs` and the threaded decoder's tests under
+ThreadSanitizer on x86-64 Linux, on a pinned nightly with `-Zbuild-std` so the
+standard library is instrumented too. The lane was checked to fail: an
+unsynchronised counter written from `hash_thread_func` and `bt_thread_func`
+was reported as a data race, and removed again.
+
 **Fuzzing, `fuzz/fuzz_targets/encode_round_trip.rs`.** Arbitrary bytes at
 settings taken from the input: `.lzma` back through `LzmaReader`, raw LZMA2
 back through `Lzma2Decoder`, and `.xz` back through `XzReader` — then the same
@@ -315,3 +348,15 @@ the adaptive one fed in chunks the input sizes. The same input is also encoded
 at a block size and thread count the input picks, both as raw LZMA2 and as
 filtered `.xz`, and asserted to be byte for byte what one thread produces at
 that block size.
+
+**Differential fuzzing, `fuzz/fuzz_targets/encode_differential.rs`.** The
+parity tests fix the corpus and the settings; this fixes neither. Six bytes of
+the input choose the level, match finder, `lc`/`lp`/`pb`, fast bytes,
+dictionary class, match-finder threads, container, block size and block
+threads, and the rest is the data; the LZMA-Alone stream, the raw LZMA2 stream
+and its property byte, the delta filter and the x86 branch converter must be
+the SDK's bytes exactly. The reference is `tools/sdk-encoder`, which links
+`LzmaEnc.c`, `Lzma2Enc.c`, `LzFindMt.c`, `MtCoder.c`, `Bra*.c` and `Delta.c`
+from the pinned checkout — each file checked against its SHA-256, and built
+without `Z7_ST` so the threaded paths are in — into the fuzz binary, rather
+than spawning the command-line oracles once per case.

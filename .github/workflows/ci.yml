@@ -503,7 +503,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
-        run: cargo test --locked --release -p lzma-turbo --lib -- enc::
+        run: "cargo test --locked --release -p lzma-turbo --lib -- enc::"
 
   # The data races a guard page cannot see. `LzFindMt.c` is three threads over
   # one window and one pair of ring buffers, partitioned by nothing but the

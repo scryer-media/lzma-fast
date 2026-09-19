@@ -270,12 +270,46 @@ through its prebuilt objects; the test suite is run there in the assembly
 build and in the portable (`--no-default-features --features std,crc`) build,
 and `docs/perf-log.md` carries its `.xz` numbers.
 
+## How it is tested
+
+Every change runs the whole of this, on macOS aarch64, Linux x86-64, Linux
+aarch64 and windows-msvc x86-64 unless a stage says otherwise:
+
+- **Parity with the reference.** The decoders against the SDK's C and assembly
+  loops, and the encoders, the threaded match finder, the block coder and the
+  BCJ/delta filters against binaries `cargo xtask lzma-util` builds from the
+  pinned SDK sources — byte for byte, on all four platforms.
+- **The same bytes everywhere.** `cargo xtask golden --check` compares a
+  handful of inputs at fixed settings against SHA-256 digests committed in
+  `tests/golden.manifest`, so a platform cannot drift on its own even if it
+  drifts together with the C it is compared against on that machine.
+- **External decoders, required.** A pinned `xz` and a pinned `7zz` are
+  installed on all four platforms and must read what this crate writes;
+  `LZMA_TURBO_XZ_REQUIRE` and `LZMA_TURBO_7ZZ_REQUIRE` turn a missing tool
+  from a skip into a failure.
+- **Memory safety.** The decoder and encoder test suites under Valgrind's
+  memcheck on Linux, and guard-page tests — every buffer placed against an
+  unmapped page, from both ends — so a one-byte overrun faults instead of
+  landing in slack.
+- **Data races.** The threaded match finder, the block coder and the threaded
+  decoder under ThreadSanitizer on x86-64 Linux, with the standard library
+  rebuilt instrumented.
+- **Fuzzing.** `differential` (both decode loops against the SDK's, call for
+  call), `encode_round_trip` (whatever the encoder writes, the decoders
+  return) and `encode_differential` (this encoder's bytes against the SDK
+  encoder's, at settings the fuzzer picks) — briefly on every change, half an
+  hour a night, with every target built on every change so none can rot.
+- **The feature graph.** `no_std`, the wasm lanes with and without the host
+  hash hooks, the MSRV, the published package, and the assembly's provenance
+  against the SDK's own sources.
+
 ## Repository layout
 
 | Path | What |
 | --- | --- |
 | [`src`](src), [`tests`](tests), [`fuzz`](fuzz) | The library crate (published to crates.io), its tests and its fuzz targets. |
 | [`tools/lzma-bench`](tools/lzma-bench) | Decode- and encode-throughput harness used for the acceptance gate. Not published. |
+| [`tools/sdk-oracle`](tools/sdk-oracle), [`tools/sdk-encoder`](tools/sdk-encoder) | The pinned SDK's decoder and encoder, linked into the differential tests and fuzz targets. Not published. |
 | [`docs/porting.md`](docs/porting.md) | Port rules, C-to-Rust file map, acceptance gate. |
 | [`docs/encoder.md`](docs/encoder.md) | The encoder port: C-to-Rust file map, what was left out, how parity is proved. |
 | [`docs/benchmarking.md`](docs/benchmarking.md) | Fixtures, oracles and how to reproduce a measurement. |

@@ -55,6 +55,44 @@
   for raw LZMA2 and for filtered `.xz`.
 - `tools/lzma-bench --encode` takes `--threads`, splitting at the block size
   `xz -T` would use and timing against `xz -T<n>` at the same preset.
+- The trust stages the encoder was missing, all of them required in CI. No
+  library code changed for any of it; every finding it would have caught is a
+  finding it can catch now.
+  - **Memory safety.** The `memory-safety` job now also runs the encoder's
+    tests under Valgrind's memcheck, with `LZMA_TURBO_CORPUS_MAX` capping the
+    generated corpus so instrumenting every instruction fits the job rather
+    than widening its timeout. `tests/guard_pages.rs` gained encoder cases:
+    the input ending exactly at a guard page and the output buffer against
+    one, from both ends, for `LzmaEncoder`, `Lzma2Encoder` and the threaded
+    match finder.
+  - **Data races.** A new `thread-sanitizer` job runs the threaded match
+    finder, the block coder and the threaded decoder under ThreadSanitizer on
+    x86-64 Linux, on a pinned nightly with `-Zbuild-std`. It was checked to
+    fail on a race before being trusted to pass.
+  - **Fuzzing.** `cargo xtask fuzz` splits its budget across every target, so
+    the workflow's timeout keeps its meaning as targets are added, and a new
+    `fuzz-check` job builds every target on every change - `fuzz/` is its own
+    workspace, so nothing else does.
+  - **Differential fuzzing against the SDK's encoder.**
+    `fuzz/fuzz_targets/encode_differential.rs` picks the input *and* the
+    settings and demands byte identity with the C, single- and
+    multi-threaded, for `.lzma`, raw LZMA2, the delta filter and the x86
+    branch converter. `tools/sdk-encoder` links `LzmaEnc.c`, `Lzma2Enc.c`,
+    `LzFindMt.c`, `MtCoder.c`, `Bra*.c` and `Delta.c` from the pinned,
+    digest-checked checkout into the fuzz binary.
+  - **External decoders everywhere.** A pinned `xz` and a pinned `7zz`
+    (`cargo xtask sevenzip`, a digest-checked download like `cargo xtask sdk`)
+    are installed on all four `encoder-parity` platforms, and
+    `LZMA_TURBO_XZ_REQUIRE` / `LZMA_TURBO_7ZZ_REQUIRE` turn a missing tool
+    from a skip into a failure.
+  - **Cross-platform byte identity.** `tests/golden.manifest` records the
+    SHA-256 - taken with this crate's own `crypto::Sha256` - of a handful of
+    inputs at fixed settings, and every platform's `test` job checks its bytes
+    against it with `cargo xtask golden --check`. Parity alone is per
+    platform, and would not notice the C and this port drifting together.
+  - **`enc` in the feature lanes.** The wasm job checks `enc` with the
+    in-guest checks and with the host hash hooks, and the `test` job builds
+    and tests the `enc` feature on its own.
 
 ## 0.4.0 - 2026-09-18
 
