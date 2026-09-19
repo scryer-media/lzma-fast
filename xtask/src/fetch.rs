@@ -466,8 +466,13 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     };
 
     let core = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| c.join(n)).collect() };
+    // MinGW's gcc appends `.exe` to an output name that has no extension, so
+    // the name the tests look for has to carry it too; on every other host
+    // the suffix is empty.
+    let binary =
+        |dest: &Path, name: &str| dest.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
 
-    let util = dest.join("lzma");
+    let util = binary(dest, "lzma");
     let mut util_srcs = core(&[
         "Util/Lzma/LzmaUtil.c",
         "Alloc.c",
@@ -481,7 +486,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     util_srcs.sort();
     build(&util, &util_srcs)?;
 
-    let oracle = dest.join("lzma-oracle");
+    let oracle = binary(dest, "lzma-oracle");
     let mut oracle_srcs = vec![oracle_src];
     oracle_srcs.extend(core(&["Alloc.c", "CpuArch.c", "LzFind.c", "LzmaEnc.c"]));
     build(&oracle, &oracle_srcs)?;
@@ -489,7 +494,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     // The LZMA1 oracle again, built *without* `Z7_ST`, which is the only way
     // to reach `LzFindMt.c`. It takes `numThreads`, so the threaded match
     // finder can be compared against the C that actually threads.
-    let oracle_mt = dest.join("lzma-oracle-mt");
+    let oracle_mt = binary(dest, "lzma-oracle-mt");
     let mut oracle_mt_srcs = vec![oracle_mt_src];
     oracle_mt_srcs.extend(core(&[
         "Alloc.c",
@@ -506,7 +511,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     }
     build_with(&oracle_mt, &oracle_mt_srcs, &mt_flags)?;
 
-    let oracle2 = dest.join("lzma2-oracle");
+    let oracle2 = binary(dest, "lzma2-oracle");
     let mut oracle2_srcs = vec![oracle2_src];
     oracle2_srcs.extend(core(&[
         "Alloc.c",
@@ -521,7 +526,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     // reach `MtCoder.c` and `LzFindMt.c`. It takes a block size, a block
     // thread count and a match-finder thread count, so the threaded ports can
     // be compared against the C that actually threads.
-    let oracle2_mt = dest.join("lzma2-oracle-mt");
+    let oracle2_mt = binary(dest, "lzma2-oracle-mt");
     let mut oracle2_mt_srcs = vec![oracle2mt_src];
     oracle2_mt_srcs.extend(core(&[
         "Alloc.c",
@@ -538,7 +543,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     ]));
     build_with(&oracle2_mt, &oracle2_mt_srcs, &mt_flags)?;
 
-    let filters = dest.join("filter-oracle");
+    let filters = binary(dest, "filter-oracle");
     let mut filter_srcs = vec![filter_src];
     filter_srcs.extend(core(&[
         "CpuArch.c",

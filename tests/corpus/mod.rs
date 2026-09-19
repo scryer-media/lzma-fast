@@ -151,7 +151,7 @@ fn tools_dir() -> PathBuf {
 /// `LZMA_TURBO_LZMA_UTIL_REQUIRE` is set, as CI sets it, and then a missing
 /// binary is a failure.
 pub fn tool(name: &str) -> Option<PathBuf> {
-    let path = tools_dir().join(name);
+    let path = tools_dir().join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if path.is_file() {
         return Some(path);
     }
