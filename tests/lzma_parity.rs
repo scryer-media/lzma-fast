@@ -53,6 +53,13 @@ impl Setting {
         .collect()
     }
 
+    /// The same, for `lzma-oracle-mt`, which takes `numThreads` as well.
+    fn oracle_mt_args(&self, threads: u32) -> Vec<String> {
+        let mut args = self.oracle_args();
+        args.push(threads.to_string());
+        args
+    }
+
     fn props(&self) -> LzmaEncProps {
         LzmaEncProps::new()
             .with_level(self.level)
@@ -132,6 +139,21 @@ fn settings() -> Vec<Setting> {
             });
         }
     }
+    // A dictionary big enough that `hashMask >= 0xFFFFFF`, which is what sets
+    // `MFB.bigHash` and swaps `GetHeads4`/`GetHeads5` for `GetHeads4b`/`5b` in
+    // the threaded finder. Nothing here tells the encoder the input size, so
+    // the hash is not reduced back down.
+    for kind in [MatchFinderKind::Bt4, MatchFinderKind::Bt5] {
+        out.push(Setting {
+            level: 9,
+            kind,
+            lc: 3,
+            lp: 0,
+            pb: 2,
+            fb: 32,
+            dict_size: 1 << 26,
+        });
+    }
     out
 }
 
@@ -148,6 +170,20 @@ fn our_alone(src: &[u8], setting: &Setting) -> Vec<u8> {
     out.extend_from_slice(&(src.len() as u64).to_le_bytes());
     let mut input = SliceStream::new(src);
     enc.encode(&mut input, &mut out).expect("encode");
+    out
+}
+
+/// The same encoding, with `numThreads = 2`, which turns on the threaded match
+/// finder wherever `mtMode` allows it: `btMode && !fastMode`. C:
+/// `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`.
+fn our_alone_mt(src: &[u8], setting: &Setting) -> Vec<u8> {
+    let props = setting.props().with_num_threads(2);
+    let mut enc = LzmaEncoder::new(&props).expect("encoder");
+    let mut out = Vec::new();
+    out.extend_from_slice(&enc.properties());
+    out.extend_from_slice(&(src.len() as u64).to_le_bytes());
+    let mut input = SliceStream::new(src);
+    enc.encode_send(&mut input, &mut out).expect("encode");
     out
 }
 
@@ -190,6 +226,56 @@ fn matches_the_reference_encoder_at_every_setting() {
     }
     assert!(compared > 0);
     eprintln!("compared {compared} encodings against the reference");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The threaded match finder, against the same SDK built without `Z7_ST`.
+///
+/// The SDK's own `LzFindMt.c` does not produce the same stream as `LzFind.c`:
+/// `Bt5_MatchFinder_GetMatches` extends its hash match past `numHashBytes`
+/// with `UPDATE_maxLen` and hands that length to the binary tree, while
+/// `MixMatches4` stops at 4 and the bt thread's `GetMatchesSpecN_2` always
+/// starts from `numHashBytes - 1`. So the reference for this lane is the C
+/// with the threaded finder compiled in, not the single-threaded oracle.
+#[test]
+fn matches_the_threaded_reference_at_every_setting() {
+    let Some(oracle) = tool("lzma-oracle-mt") else {
+        return;
+    };
+    let dir = tempdir("lzma-parity-mt");
+    let src_path = dir.join("in.bin");
+    let ref_path = dir.join("ref.lzma");
+
+    let settings = settings();
+    let mut compared = 0usize;
+    for (name, src) in corpus() {
+        std::fs::write(&src_path, &src).unwrap();
+        for setting in &settings {
+            let status = Command::new(&oracle)
+                .args(setting.oracle_mt_args(2))
+                .arg(&src_path)
+                .arg(&ref_path)
+                .status()
+                .expect("run the threaded reference encoder");
+            assert!(
+                status.success(),
+                "reference failed on {name} [{}]",
+                setting.name()
+            );
+            let expected = std::fs::read(&ref_path).unwrap();
+            let got = our_alone_mt(&src, setting);
+            assert!(
+                expected == got,
+                "not bit-exact on {name} [{}]: reference {} bytes, ours {} bytes",
+                setting.name(),
+                expected.len(),
+                got.len()
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 0);
+    eprintln!("compared {compared} threaded encodings against the reference");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

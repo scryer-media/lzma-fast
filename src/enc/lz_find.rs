@@ -9,10 +9,13 @@
 //! table in one allocation exactly as `MatchFinder_Create` does, with `son`
 //! starting at `son_base`.
 //!
-//! Not ported: `LzFindMt.c` (the threaded match finder),
-//! `Bt3Zip_*`/`Hc3Zip_*` (the Deflate-shaped finders, which `LzmaEnc` never
-//! selects), and the SSE4.1/AVX2/NEON variants of `LzFind_SaturSub`, which are
-//! codegen for one loop the portable `LzFind_SaturSub_32` already defines.
+//! `LzFindMt.c`, which drives these same tables from two more threads, is in
+//! `super::lz_find_mt`.
+//!
+//! Not ported: `Bt3Zip_*`/`Hc3Zip_*` (the Deflate-shaped finders, which
+//! `LzmaEnc` never selects), and the SSE4.1/AVX2/NEON variants of
+//! `LzFind_SaturSub`, which are codegen for one loop the portable
+//! `LzFind_SaturSub_32` already defines.
 
 use alloc::vec::Vec;
 
@@ -1432,7 +1435,7 @@ impl MatchFinder {
 /// C: `MatchFinder_Normalize3` with `LzFind_SaturSub_32`, the portable
 /// default. The 128- and 256-bit variants are the same loop vectorized and
 /// are not ported.
-fn normalize3(sub_value: u32, items: &mut [u32]) {
+pub(crate) fn normalize3(sub_value: u32, items: &mut [u32]) {
     for v in items {
         // C: `SASUB_32`. "kEmptyHashValue must be zero".
         if *v < sub_value {

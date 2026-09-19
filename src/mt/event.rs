@@ -30,6 +30,16 @@ impl Event {
         self.cv.notify_one();
     }
 
+    /// C: `Event_Reset`.
+    ///
+    /// `MtSync_GetNextBlock` resets `wasStopped` before it sets `canStart`, so
+    /// that a `MtSync_StopWriting` arriving later cannot be satisfied by a
+    /// signal left over from the previous stop.
+    pub(crate) fn reset(&self) {
+        let mut g = self.signalled.lock().unwrap_or_else(|e| e.into_inner());
+        *g = false;
+    }
+
     /// C: `Event_Wait`. Consumes the signal, which is what makes it
     /// auto-reset.
     pub(crate) fn wait(&self) {

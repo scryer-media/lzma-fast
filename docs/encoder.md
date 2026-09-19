@@ -73,17 +73,6 @@ chunk by chunk.
 
 ## What was left out
 
-**`C/LzFindMt.c` and `C/LzFindOpt.c`.** The *threaded match finder* is still
-not ported — `MatchFinderMt_*`, the hash thread / bt thread pipeline with its
-two ring buffers, and `GetMatchesSpecN_2`. Every match finder here is the one
-`LzFind.c` runs on the calling thread, which is what the SDK uses when
-`lzmaProps.numThreads` is 1. This costs nothing in output: the SDK's `btMode`
-MT finder is built to produce the same matches as the ST one, so the bytes are
-the same either way; it costs the second and third core that the C can put
-behind a *single* block. The parallelism that is here is block-parallelism,
-described below, which is the parallelism `xz -T` and 7-Zip's `mt` actually
-ship with.
-
 **`directInput` mode.** `CMatchFinder` can be pointed at a caller's whole
 buffer instead of copying into its own window; only the windowed path is here,
 fed by the `SeqInStream` trait. The two modes differ in how much input is
@@ -146,6 +135,69 @@ alone, and the only thing the thread count touches is which core ran it.
 `Lzma2Enc_Encode2` is the same. It is checked three ways — a unit test, a
 property in the fuzz target, and `tests/lzma2_mt_parity.rs` against the C.
 
+### The threaded match finder
+
+`C/LzFindMt.c` and `C/LzFindOpt.c` are the *other* parallelism: not another
+block, but two more threads behind a single one. `LzmaEncProps::with_num_threads(2)`
+turns it on, which is the SDK's `lzmaProps.numThreads`, and
+`LzmaEnc.c`'s own condition decides whether it takes effect:
+`p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`. A fast
+mode level or a hash-chain match finder stays on `LzFind.c`.
+
+Three threads share one window and one set of tables:
+
+| thread | writes | reads |
+| --- | --- | --- |
+| HASH | the window below `streamPos`, the high hash, `hashBuf` block *i* | the window |
+| BT | `son`, `btBuf` block *i* | the window, `hashBuf` block *i* |
+| LZ (the caller) | the low hash (`hash2`/`hash3`) | the window, `btBuf` block *i* |
+
+Nothing partitions those ranges but the SDK's own handshake, so the port keeps
+it literally. `CMtSync` is a type of its own (`MtSync` in
+`src/enc/lz_find_mt.rs`): two auto-reset events, two semaphores, and a critical
+section the *consumer* holds across `MtSync_GetNextBlock`, because the C's
+`LOCK_BUFFER` / `UNLOCK_BUFFER` pair spans a return and so cannot be an RAII
+guard. The shared allocations are held as raw pointers in one `Send + Sync`
+wrapper with one provenance each, and every accessor carries a SAFETY comment
+naming the protocol step that makes it disjoint — `MtSync_GetNextBlock`,
+`HashThreadFunc`, `BtThreadFunc`. No `&mut` is ever formed over a region
+another thread can see.
+
+| C | Rust |
+| --- | --- |
+| `CMtSync`, `MtSync_GetNextBlock`, `MtSync_StopWriting` | `MtSync`, `MtSync::get_next_block`, `::stop_writing` |
+| `HashThreadFunc`, `BtThreadFunc`, `BtFillBlock`, `BtGetMatches` | `hash_thread_func`, `bt_thread_func`, `bt_fill_block`, `bt_get_matches` |
+| `GetHeads2` … `GetHeads5b`, `USE_GetHeads_LOCAL_CRC` | `get_heads` over the `Heads` enum |
+| `GetMatchesSpecN_2` (`C/LzFindOpt.c`) | `get_matches_spec_n_2` |
+| `MixMatches2/3/4`, `MatchFinderMt0/2/3_Skip` | `MatchFinderMt::mix_matches`, `::skip` |
+| `CMatchFinderMt`, `MatchFinderMt_Create`, `_Init`, `_GetMatches` | `MatchFinderMt`, `::create`, `::init`, `::get_matches` |
+| `IMatchFinder2`, the vtable `LzmaEnc` calls through | the `Finder` enum in `src/enc/finder.rs` |
+| `numTotalThreads`, the `t1`/`t2`/`t3` split in `Lzma2EncProps_Normalize` | `Lzma2Encoder::set_total_threads`, `::split_threads` |
+
+Two things differ from the C, both forced by ownership rather than by choice:
+
+- **The threads live for one encode call**, in a `std::thread::scope` opened by
+  the entry point that owns the input, the same shape `MtCoder` uses here. That
+  is what lets the hash thread hold the caller's stream directly instead of the
+  C's stored `mf->stream` pointer, so there is no set/release pair to get
+  wrong. `MtRun`'s `Drop` is `MatchFinderMt_ReleaseStream` plus
+  `MtSync_Destruct`: stop the bt thread, stop the hash thread, join both.
+- **Streaming input must be `Send`.** The hash thread reads it, so
+  `LzmaEncoder::encode_send` / `encode_sized_send` and
+  `Lzma2Encoder::encode_send` are the streaming entry points that can thread.
+  Every memory entry point already routes through them. The existing
+  `encode` / `encode_sized` take a plain `&mut dyn SeqInStream` and so always
+  run the single-threaded finder; that is the one case where `numThreads` is
+  silently ignored.
+
+**Unlike the block thread count, this setting changes the bytes** — and that is
+the C's behaviour, not this port's. `Bt5_MatchFinder_GetMatches` extends its
+hash match past `numHashBytes` with `UPDATE_maxLen` and passes that length into
+the binary tree, while `MixMatches4` stops at 4 and the bt thread's
+`GetMatchesSpecN_2` always starts from `numHashBytes - 1`, so the two builds
+of the SDK can pick different matches. `tests/lzma_parity.rs` pins this port to
+the threaded C, not to the single-threaded one.
+
 ### What is deliberately different
 
 - **Threads live for one call.** The C parks its worker threads on a
@@ -185,7 +237,7 @@ is what `encode_to_vec` does.
 ## How the port is proved
 
 **Bit-exact parity, `tests/lzma_parity.rs` and `tests/lzma2_encoder.rs`.**
-`cargo xtask lzma-util` builds three binaries from the pinned SDK sources into
+`cargo xtask lzma-util` builds the reference binaries from the pinned SDK sources into
 `target/lzma-util/`: `lzma`, which is `C/Util/Lzma/LzmaUtil.c` as it ships, and
 `lzma-oracle` and `lzma2-oracle`, two small props-driven harnesses the xtask
 writes out — `LzmaUtil` only ever encodes at `LzmaEncProps_Init` defaults and
@@ -198,6 +250,17 @@ limits — across the match finders and several levels. They skip with a message
 when the binaries are absent, and fail instead when
 `LZMA_TURBO_LZMA_UTIL_REQUIRE` is set, as CI sets it.
 
+**Threaded match finder parity, `tests/lzma_parity.rs`.** `cargo xtask
+lzma-util` also builds `lzma-oracle-mt`: the LZMA1 harness compiled *without*
+`-DZ7_ST`, so `LzFindMt.c` and `LzFindOpt.c` are in it, taking `numThreads` on
+the command line. Every setting the single-threaded sweep covers is run again
+through `MatchFinderMt` against that binary, including two dictionaries past
+`0xFFFFFF`, which is what sets `MFB.bigHash` and swaps `GetHeads4`/`GetHeads5`
+for `GetHeads4b`/`GetHeads5b`. `tests/mt_match_finder.rs` carries what the
+corpus is too small for: three-megabyte inputs at dictionaries that force
+`MatchFinder_MoveBlock` and `MatchFinder_Normalize3` to run while the threads
+are live.
+
 **Threaded parity, `tests/lzma2_mt_parity.rs`.** `cargo xtask lzma-util` also
 builds `lzma2-oracle-mt`: the same props-driven LZMA2 harness compiled
 *without* `-DZ7_ST`, so `MtCoder.c`, `LzFindMt.c`, `LzFindOpt.c` and `Threads.c`
@@ -205,9 +268,11 @@ are in it and `Lzma2Enc_Encode2` takes its `MtCoder` path. It takes a block
 size, a block thread count and a match-finder thread count on the command line.
 The test compares this crate against it over the whole corpus at four block
 sizes — 16 KiB, 64 KiB, 100000 and 1 MiB, either side of the corpus's own sizes
-— and at one, two and four block threads; then checks that the bytes are the
-same at one, two, three, eight and seventeen threads; then decodes them back
-through `Lzma2Reader`. CI runs it in the `encoder-parity` job on all four
+— and at one, two and four block threads; then again with `mfThreads = 2`, so
+the threaded match finder is checked under the block coder as well; then checks
+that the bytes are the same at one, two, three, eight and seventeen threads,
+and that a `numTotalThreads` budget splits the way the C splits it; then
+decodes them back through `Lzma2Reader`. CI runs it in the `encoder-parity` job on all four
 platforms.
 
 Parity is what proves the compressed data. The `.xz` frame around it has no

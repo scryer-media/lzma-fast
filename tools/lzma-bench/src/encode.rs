@@ -67,8 +67,8 @@ fn props_for(preset: u32) -> LzmaEncProps {
 /// block threads existed. Above one it splits at the block size `xz -T` would
 /// use, which is what makes the two comparable: the ratio cost of splitting is
 /// the same on both sides.
-fn time_ours(preset: u32, threads: usize, data: &[u8]) -> (Duration, u64) {
-    let props = props_for(preset);
+fn time_ours(preset: u32, threads: usize, mf_threads: u32, data: &[u8]) -> (Duration, u64) {
+    let props = props_for(preset).with_num_threads(mf_threads);
     let t0 = Instant::now();
     let out = if threads <= 1 {
         encode_xz(data, &props, CheckType::Crc64, 0).expect("encode")
@@ -80,7 +80,14 @@ fn time_ours(preset: u32, threads: usize, data: &[u8]) -> (Duration, u64) {
 }
 
 /// Runs the lane over one input at each preset in `presets`.
-pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32], threads: &[usize]) {
+pub fn bench(
+    path: &Path,
+    runs: usize,
+    oracles: bool,
+    presets: &[u32],
+    threads: &[usize],
+    mf_threads: u32,
+) {
     let threads: Vec<usize> = if threads.is_empty() {
         vec![1]
     } else {
@@ -117,7 +124,7 @@ pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32], threads: 
             let mut xz_gone = !oracles;
 
             for _ in 0..runs {
-                let (dt, n) = time_ours(preset, t, &data);
+                let (dt, n) = time_ours(preset, t, mf_threads, &data);
                 ours.push(dt);
                 ours_size = n;
                 if !xz_gone {
@@ -131,8 +138,13 @@ pub fn bench(path: &Path, runs: usize, oracles: bool, presets: &[u32], threads: 
                 }
             }
 
+            let mf = if mf_threads > 1 {
+                format!(" mf{mf_threads}")
+            } else {
+                String::new()
+            };
             let mut rows = vec![Row {
-                label: format!("lzma-turbo -{preset} -T{t}"),
+                label: format!("lzma-turbo -{preset} -T{t}{mf}"),
                 time: median(ours),
                 out: ours_size,
             }];

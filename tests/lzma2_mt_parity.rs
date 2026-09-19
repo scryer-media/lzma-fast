@@ -78,7 +78,19 @@ const BLOCK_SIZES: [u64; 4] = [1 << 14, 1 << 16, 100_000, 1 << 20];
 
 /// What this crate produces for one `(props, block size, threads)`.
 fn ours(props: &LzmaEncProps, src: &[u8], block_size: u64, threads: usize) -> (u8, Vec<u8>) {
-    let mut enc = Lzma2Encoder::new(props).expect("encoder");
+    ours_mf(props, src, block_size, threads, 1)
+}
+
+/// The same, with the match finder's own thread count, which is what turns on
+/// the threaded match finder. C: `lzmaProps.numThreads`.
+fn ours_mf(
+    props: &LzmaEncProps,
+    src: &[u8],
+    block_size: u64,
+    threads: usize,
+    mf_threads: u32,
+) -> (u8, Vec<u8>) {
+    let mut enc = Lzma2Encoder::new(&props.with_num_threads(mf_threads)).expect("encoder");
     enc.set_block_size(block_size);
     enc.set_threads(threads);
     let out = enc.encode_to_vec(src).expect("encode");
@@ -129,6 +141,75 @@ fn block_parallel_lzma2_matches_the_multi_threaded_reference() {
     assert!(compared > 0);
     eprintln!("compared {compared} threaded LZMA2 streams against the reference");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same, with the match finder threaded as well: C `numTotalThreads` is
+/// `numBlockThreads_Max * lzmaProps.numThreads`, and the two are independent.
+#[test]
+fn the_threaded_match_finder_matches_the_multi_threaded_reference() {
+    let Some(oracle) = tool("lzma2-oracle-mt") else {
+        return;
+    };
+    let dir = tempdir("lzma2-mtmf-parity");
+    let src_path = dir.join("in.bin");
+    let ref_path = dir.join("ref.lzma2");
+
+    let settings = settings();
+    let mut compared = 0usize;
+    for (name, src) in corpus() {
+        std::fs::write(&src_path, &src).unwrap();
+        for props in &settings {
+            for &block_size in &[1u64 << 16, 1 << 20] {
+                for threads in [1usize, 4] {
+                    let status = Command::new(&oracle)
+                        .args(oracle_args(props, block_size, threads, 2))
+                        .arg(&src_path)
+                        .arg(&ref_path)
+                        .status()
+                        .expect("run the multi-threaded reference LZMA2 encoder");
+                    assert!(status.success(), "reference failed on {name}");
+
+                    let (prop, out) = ours_mf(props, &src, block_size, threads, 2);
+                    let mut got = vec![prop];
+                    got.extend_from_slice(&out);
+
+                    let expected = std::fs::read(&ref_path).unwrap();
+                    assert!(
+                        expected == got,
+                        "not bit-exact on {name}, block {block_size}, {threads} block threads, \
+                         2 match finder threads: reference {} bytes, ours {} bytes",
+                        expected.len(),
+                        got.len()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert!(compared > 0);
+    eprintln!("compared {compared} threaded-match-finder LZMA2 streams against the reference");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C: `Lzma2EncProps_Normalize` divides `numTotalThreads` by the match
+/// finder's thread count to get the block thread count, so the same total
+/// spent either way gives the same bytes.
+#[test]
+fn the_total_thread_budget_splits_the_way_the_c_splits_it() {
+    let props = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+    for (name, src) in corpus() {
+        let want = ours(&props, &src, 1 << 16, 1);
+        for total in [1usize, 2, 4, 8] {
+            let mut enc = Lzma2Encoder::new(&props.with_num_threads(2)).expect("encoder");
+            enc.set_block_size(1 << 16);
+            enc.set_total_threads(total);
+            let out = enc.encode_to_vec(&src).expect("encode");
+            assert!(
+                (enc.properties(), out) == want,
+                "{name}: a total budget of {total} changed the bytes"
+            );
+        }
+    }
 }
 
 #[test]

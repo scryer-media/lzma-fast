@@ -69,6 +69,10 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
                  the preset is run at each thread count, splitting into blocks
                  at the size `xz -T` would use so the two are comparable; at
                  one thread both sides write one solid block.
+  --mf-threads N with `--encode`, the match finder's own thread count: 2 runs
+                 the encoder's threaded match finder (C: `LzFindMt.c`), which
+                 is a second thread per block coder and is independent of
+                 `--threads`. The default, 1, is the single-threaded finder.
   --checksum K   have the decoder's own workers checksum their output:
                  none (default), crc32, crc64 or sha256. The CRCs are cut into
                  segments every 16 MiB, so the row also shows what splitting
@@ -86,6 +90,7 @@ fn main() {
     let mut adaptive = false;
     let mut checksum = Checksum::None;
     let mut presets: Vec<u32> = Vec::new();
+    let mut mf_threads = 1u32;
     let mut files: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -103,6 +108,12 @@ fn main() {
             "--encode" => {
                 let v = args.next().unwrap_or_else(|| fail("--encode needs a list"));
                 presets = encode::parse_presets(&v);
+            }
+            "--mf-threads" => {
+                mf_threads = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| fail("--mf-threads needs a number"));
             }
             "--portable" => portable = true,
             "--index" => index = true,
@@ -150,7 +161,7 @@ fn main() {
 
     for file in &files {
         if !presets.is_empty() {
-            encode::bench(file, runs, oracles, &presets, &threads);
+            encode::bench(file, runs, oracles, &presets, &threads, mf_threads);
         } else if index {
             run_index(file);
         } else if adaptive {

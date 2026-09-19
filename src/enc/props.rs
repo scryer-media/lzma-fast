@@ -17,8 +17,9 @@ use crate::enc::consts::*;
 use crate::enc::lz_find::MatchFinderKind;
 use crate::error::Error;
 
-/// C: `CLzmaEncProps`. The multi-threading fields (`numThreads`, `affinity*`)
-/// are not carried: this encoder is single-threaded.
+/// C: `CLzmaEncProps`. The affinity fields are not carried - nothing in this
+/// port pins a thread - but `numThreads` is: it is what turns on the threaded
+/// match finder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LzmaEncProps {
     pub(crate) level: i32,
@@ -34,6 +35,7 @@ pub struct LzmaEncProps {
     pub(crate) mc: u32,
     pub(crate) write_end_mark: bool,
     pub(crate) reduce_size: u64,
+    pub(crate) num_threads: i32,
 }
 
 impl Default for LzmaEncProps {
@@ -60,7 +62,22 @@ impl LzmaEncProps {
             mc: 0,
             write_end_mark: false,
             reduce_size: u64::MAX,
+            num_threads: -1,
         }
+    }
+
+    /// How many threads one LZMA coder may use, which is 1 or 2: the second
+    /// one is the threaded match finder, and it only applies in binary-tree
+    /// mode outside fast mode. C: `props.numThreads`.
+    ///
+    /// The SDK, built without `Z7_ST`, defaults this to 2 whenever the match
+    /// finder is a binary tree. This port defaults it to 1 - the `Z7_ST`
+    /// value - so that output does not change under callers who never asked
+    /// for a thread. See `docs/encoder.md`.
+    #[must_use]
+    pub const fn with_num_threads(mut self, threads: u32) -> Self {
+        self.num_threads = threads as i32;
+        self
     }
 
     /// Compression level, 0 to 9. C: `props.level`.
@@ -190,6 +207,12 @@ impl LzmaEncProps {
         if self.mc == 0 {
             self.mc = (16 + (self.fb as u32 >> 1)) >> u32::from(self.bt_mode == 0);
         }
+        if self.num_threads < 0 {
+            // C: `((p->btMode && p->algo) ? 2 : 1)` in a threaded build. This
+            // port keeps the `Z7_ST` answer as its default; see
+            // `LzmaEncProps::with_num_threads`.
+            self.num_threads = 1;
+        }
     }
 
     /// This setting with every `-1` resolved, as `LzmaEncProps_Normalize`
@@ -209,6 +232,7 @@ impl LzmaEncProps {
             bt_mode: p.bt_mode as u32,
             num_hash_bytes: p.num_hash_bytes as u32,
             mc: p.mc,
+            num_threads: p.num_threads as u32,
         }
     }
 
@@ -262,6 +286,8 @@ pub struct NormalizedProps {
     pub num_hash_bytes: u32,
     /// C: `mc`, the match finder's cut value.
     pub mc: u32,
+    /// C: `numThreads`.
+    pub num_threads: u32,
 }
 
 /// C: `LzmaEnc_WriteProperties`.

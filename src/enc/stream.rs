@@ -68,16 +68,21 @@ impl SeqInStream for SliceStream<'_> {
 
 /// C: `CLimitedSeqInStream` in `C/Lzma2Enc.c`, which caps one LZMA2 block's
 /// worth of input and records whether the real stream ended inside it.
-pub(crate) struct LimitedSeqInStream<'s> {
-    pub(crate) real_stream: &'s mut dyn SeqInStream,
+///
+/// Generic over the inner stream so that a `Send` one stays `Send`: the
+/// threaded match finder's hash thread takes the *limited* stream, not the
+/// caller's, and can only do so when it can be sent. The C has no analogue -
+/// `mf->stream` is a pointer either way.
+pub(crate) struct LimitedSeqInStream<'s, S: SeqInStream + ?Sized = dyn SeqInStream> {
+    pub(crate) real_stream: &'s mut S,
     pub(crate) limit: u64,
     pub(crate) processed: u64,
     pub(crate) finished: bool,
 }
 
-impl<'s> LimitedSeqInStream<'s> {
+impl<'s, S: SeqInStream + ?Sized> LimitedSeqInStream<'s, S> {
     /// C: `LimitedSeqInStream_Init`, plus the assignment of `realStream`.
-    pub(crate) fn new(real_stream: &'s mut dyn SeqInStream) -> Self {
+    pub(crate) fn new(real_stream: &'s mut S) -> Self {
         LimitedSeqInStream {
             real_stream,
             limit: u64::MAX,
@@ -95,7 +100,7 @@ impl<'s> LimitedSeqInStream<'s> {
     }
 }
 
-impl SeqInStream for LimitedSeqInStream<'_> {
+impl<S: SeqInStream + ?Sized> SeqInStream for LimitedSeqInStream<'_, S> {
     /// C: `LimitedSeqInStream_Read`.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let mut size2 = buf.len();
@@ -111,6 +116,23 @@ impl SeqInStream for LimitedSeqInStream<'_> {
             self.processed += size2 as u64;
         }
         Ok(size2)
+    }
+}
+
+/// A stream that is never read.
+///
+/// The threaded match finder takes the real input over for the length of a
+/// block - its hash thread is the only reader - so the encoder's own
+/// `code_one_block` argument has nothing left to read. Reaching it would mean
+/// the match finder asked the lz thread for bytes, which it never does; the
+/// end-of-stream answer is the safe one if it ever did.
+#[cfg(feature = "std")]
+pub(crate) struct NoStream;
+
+#[cfg(feature = "std")]
+impl SeqInStream for NoStream {
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Error> {
+        Ok(0)
     }
 }
 
