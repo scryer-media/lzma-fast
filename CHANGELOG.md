@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.6 - 2026-09-18
+
+- The bulk checksums can be handed to the embedding host on wasm. Two new
+  features, `crc-host` and `crypto-host`, route CRC-32, CRC-64/XZ and SHA-256
+  through plain `fn` pointers the embedder installs at start-up
+  (`lzma_turbo::hooks::install_host_hash_hooks`) instead of computing them in
+  the guest. Both libraries those checks normally use are there for
+  instructions wasm does not have - `crc-fast` for the carry-less multiply
+  units, `sha2` for the SHA extensions - so a host that has them can checksum
+  an `.xz` stream far faster than the guest can, and the guest hands it nothing
+  but a byte range it already owns.
+
+  The public API is unchanged: `crc::Crc32`, `crc::Crc64Xz`, `crc::crc32`,
+  `crc::crc64_xz` and `crypto::Sha256` keep their types and their methods, so
+  the readers, the block checks and the multi-threaded checksum planner pick
+  the delegation up with no change of their own. The features engage on
+  `wasm32` only - on a native target they are accepted and inert, so feature
+  unification in a mixed workspace cannot turn a native build into a
+  delegating one - and they add no dependency. Checksum *folding*
+  (`crc32_combine`, `crc64_xz_combine`) is never delegated: it is arithmetic
+  on two integers, not a pass over data.
+
+  The CRC hooks are seeded resumes in the finalized domain and must chain,
+  `crc32(crc32(0, a), b) == crc32(0, a ++ b)`, which is what lets the streaming
+  digests carry a plain integer instead of a host object. SHA-256, which has no
+  seeded-resume form, is delegated as a streaming state behind an opaque handle
+  - init, clone, update, finalize, drop - so a multi-gigabyte block is hashed
+  as it decodes and never buffered; this crate closes every handle it opens
+  exactly once. A missing or contract-violating hook panics rather than falling
+  back in-guest, which would return correct bytes at exactly the speed the
+  embedding exists to avoid. `src/hooks.rs` documents all of it.
+
+  `examples/wasm_xz_conformance.rs` is a complete reference embedding for a
+  core wasm module, and `tests/wasm_host_conformance.rs` is the reference host
+  for its ABI: it decodes an `.xz` of each check type in a `wasm32-wasip1`
+  guest under `wasmtime` and requires the report - decoded bytes, their
+  digests, and the verdict on a stream whose stored check was corrupted - to
+  equal the native decoder's byte for byte, then proves a guest with no hooks
+  installed panics with the documented message. `wasmtime` is a
+  dev-dependency, target-gated off wasm, and never enters the crate's graph.
+
 ## 0.3.5 - 2026-09-18
 
 - `XzParallelReader` now accepts a stream with no blocks. An empty input is a

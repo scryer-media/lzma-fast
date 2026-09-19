@@ -171,6 +171,17 @@ jobs:
           # because the default `crypto` feature builds AWS-LC's C.
           - lane: std-crc-crypto-xz
             features: "std,asm,crc,native-crypto,xz"
+          # The same set with both bulk primitives delegated to the embedding
+          # host (see src/hooks.rs): a wasm guest has no carry-less multiply
+          # and no SHA extension, so this is the build an embedder ships.
+          - lane: std-host-hooks-xz
+            features: "std,asm,crc-host,crypto-host,xz"
+          # Each host feature alone, because they are independent: a
+          # `crc-host` build must never need the SHA-256 hooks, or the reverse.
+          - lane: crc-host-only
+            features: "std,crc-host"
+          - lane: crypto-host-only
+            features: "std,crypto-host"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,6 +200,38 @@ jobs:
             cargo check --locked -p lzma-turbo --target wasm32-unknown-unknown \
               --no-default-features
           fi
+
+  # A `cargo check` proves the delegating build compiles; this job proves it
+  # DECODES. It builds the reference embedding in examples/ for
+  # `wasm32-wasip1`, runs it under a native `wasmtime` that supplies the host
+  # CRC-32, CRC-64/XZ and streaming SHA-256, and requires its report to equal
+  # the native decoder's byte for byte - plus the companion case, where a guest
+  # with no hooks installed must panic with the documented message rather than
+  # quietly checksumming in-guest. Ubuntu's runner image ships rustup, so the
+  # wasip1 std is one `target add` away; without it the tests self-skip, which
+  # is why the target is installed explicitly rather than left to chance.
+  wasm-conformance:
+    name: wasm-conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+      - name: The wasip1 std must really be present, not merely nameable
+        run: |
+          set -eu
+          rustup target add wasm32-wasip1
+          libdir="$(rustc --print target-libdir --target wasm32-wasip1)"
+          test -d "$libdir" || { echo "no wasm32-wasip1 std at $libdir" >&2; exit 1; }
+      - name: Decode an .xz of each check type through host hooks
+        run: |
+          cargo test --locked -p lzma-turbo --features crc-host,crypto-host \
+            --test wasm_host_conformance
 
   msrv:
     name: msrv
@@ -452,7 +495,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, fuzz-differential]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, vectors, xz-utils-suite, fuzz-differential]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

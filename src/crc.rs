@@ -7,24 +7,100 @@
 //! Both are carry-less-multiply implementations from [`crc_fast`], which is
 //! the one library dependency this crate takes for them. Requires the `crc`
 //! feature.
+//!
+//! # Delegating the bulk checksum on wasm
+//!
+//! With the `crc-host` feature on a `wasm32` target, [`Crc32`], [`Crc64Xz`]
+//! and the one-shot [`crc32`] / [`crc64_xz`] compute nothing themselves: each
+//! carries a running checksum in a plain integer and folds bytes into it
+//! through the embedder's `crc32` / `crc64_xz` hooks (see [`crate::hooks`]).
+//! wasm has no carry-less multiply instruction, so `crc-fast`'s whole reason
+//! for existing is absent there, while a host that has one can checksum an xz
+//! block far faster than the guest can.
+//!
+//! Nothing about the API changes: the types, their methods and the free
+//! functions are the same on every target, so every caller - the xz readers,
+//! `crate::xz::check`, the multi-threaded checksum planner - picks the
+//! delegation up without a line of change. The hooks' seeded-resume contract,
+//! `C(C(0, a), b) == C(0, a ++ b)`, is exactly what makes a running integer a
+//! faithful stand-in for a streaming digest; [`crate::hooks`] states it in
+//! full and the tests at the bottom of this module prove it holds through the
+//! real registry.
+//!
+//! [`crc32_combine`] and [`crc64_xz_combine`] are not delegated on any target.
+//! Folding is arithmetic on two checksums and a length, never a pass over
+//! data, so crossing a boundary for it would be pure overhead.
+//!
+//! On a native target `crc-host` is accepted and inert: the `crc-fast`
+//! implementations stay active and no hook is ever called.
 
-use crc_fast::{CrcAlgorithm, Digest};
+use crc_fast::CrcAlgorithm;
+#[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+use crc_fast::Digest;
 
-/// CRC-32 (IEEE, reflected), the checksum in `.7z` headers and streams.
+/// Fold `data` into a running CRC-32 through the embedder-installed hook.
 ///
-/// C: `CrcCalc` in `C/7zCrc.c`.
-#[derive(Debug)]
-pub struct Crc32(Digest);
+/// Dead on a native target outside `#[cfg(test)]`: only a wasm build has a
+/// host to delegate to. The tests still drive it directly, so the hook path is
+/// proven without a wasm runtime.
+#[cfg(feature = "crc-host")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[inline]
+fn crc32_host(seed: u32, data: &[u8]) -> u32 {
+    (crate::hooks::hooks().crc32)(seed, data)
+}
 
-/// CRC-64/XZ (ECMA-182, reflected, with the xz initial and final xor), the
-/// checksum an `.xz` block or index carries.
-///
-/// C: `Crc64Calc` in `C/XzCrc64.c`.
-#[derive(Debug)]
-pub struct Crc64Xz(Digest);
+/// Fold `data` into a running CRC-64/XZ through the embedder-installed hook.
+#[cfg(feature = "crc-host")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[inline]
+fn crc64_xz_host(seed: u64, data: &[u8]) -> u64 {
+    (crate::hooks::hooks().crc64_xz)(seed, data)
+}
 
+/// Emits one checksum width twice over: the host-delegated running-integer
+/// form for a wasm build with `crc-host`, and the `crc_fast::Digest` wrapper
+/// for every other build. Exactly one of the two compiles, and the two present
+/// the same API down to the `Default` impl and the one-shot free function.
 macro_rules! digest {
-    ($name:ident, $algo:expr, $out:ty, $one:ident, $doc:literal) => {
+    ($name:ident, $algo:expr, $out:ty, $one:ident, $hook:ident, $ty_doc:literal, $doc:literal) => {
+        #[doc = $ty_doc]
+        ///
+        /// This build delegates: the value is a running checksum in the
+        /// finalized domain, seeded at 0 and advanced by the embedder's hook.
+        #[cfg(all(target_arch = "wasm32", feature = "crc-host"))]
+        #[derive(Debug)]
+        pub struct $name($out);
+
+        #[cfg(all(target_arch = "wasm32", feature = "crc-host"))]
+        impl $name {
+            /// A digest over no bytes yet.
+            #[must_use]
+            pub fn new() -> Self {
+                Self(0)
+            }
+
+            /// Feeds the next bytes of the stream.
+            pub fn update(&mut self, data: &[u8]) {
+                if data.is_empty() {
+                    return;
+                }
+                self.0 = $hook(self.0, data);
+            }
+
+            /// Consumes the digest and returns the checksum.
+            #[must_use]
+            pub fn finalize(self) -> $out {
+                self.0
+            }
+        }
+
+        #[doc = $ty_doc]
+        #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+        #[derive(Debug)]
+        pub struct $name(Digest);
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
         impl $name {
             /// A digest over no bytes yet.
             #[must_use]
@@ -51,6 +127,17 @@ macro_rules! digest {
         }
 
         #[doc = $doc]
+        ///
+        /// Delegated to the embedder's hook on a wasm build with `crc-host`,
+        /// as a single seeded-from-zero call.
+        #[cfg(all(target_arch = "wasm32", feature = "crc-host"))]
+        #[must_use]
+        pub fn $one(data: &[u8]) -> $out {
+            $hook(0, data)
+        }
+
+        #[doc = $doc]
+        #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
         #[must_use]
         pub fn $one(data: &[u8]) -> $out {
             crc_fast::checksum($algo, data) as $out
@@ -63,6 +150,8 @@ digest!(
     CrcAlgorithm::Crc32IsoHdlc,
     u32,
     crc32,
+    crc32_host,
+    "CRC-32 (IEEE, reflected), the checksum in `.7z` headers and streams.\n\nC: `CrcCalc` in `C/7zCrc.c`.",
     "CRC-32 of one contiguous buffer."
 );
 digest!(
@@ -70,6 +159,8 @@ digest!(
     CrcAlgorithm::Crc64Xz,
     u64,
     crc64_xz,
+    crc64_xz_host,
+    "CRC-64/XZ (ECMA-182, reflected, with the xz initial and final xor), the checksum an `.xz` block or index carries.\n\nC: `Crc64Calc` in `C/XzCrc64.c`.",
     "CRC-64/XZ of one contiguous buffer."
 );
 
@@ -340,6 +431,82 @@ mod tests {
         assert_eq!(holed.range(0, 600), None);
         assert_eq!(holed.range(0, 100), Some(crc32(&data[..100])));
         assert_eq!(holed.pieces(), 2);
+    }
+
+    /// The delegating seam this module compiles on wasm, driven natively.
+    ///
+    /// `crc32_host` / `crc64_xz_host` are the two functions a `crc-host` wasm
+    /// build folds every byte through, and they resolve to the embedder's real
+    /// hooks on any target - `fn` pointers link everywhere - so installing the
+    /// reference hook set lets the whole delegation path be proven here, with
+    /// no wasm runtime in sight: registry lookup, seeded resume, and the chunk
+    /// chaining the running-integer `Crc32` / `Crc64Xz` depend on.
+    ///
+    /// Chunking is exhaustive-ish rather than illustrative: every length gets
+    /// the all-1-byte split (the most boundaries a stream can have), a
+    /// pseudo-random split, and the whole buffer in one call.
+    #[cfg(all(
+        feature = "crc-host",
+        any(feature = "crypto", feature = "native-crypto")
+    ))]
+    #[test]
+    fn host_seam_chunk_chaining_matches_one_shot() {
+        crate::hooks::install_reference_hooks_for_test();
+
+        // A deterministic xorshift64* split generator - reproducible, and no
+        // dependency. It picks split sizes only; the data is the same
+        // arithmetic fill the tests above use.
+        let mut state: u64 = 0x5EED_C0DE_1234_9001;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        for &len in &[0usize, 1, 2, 17, 64, 255, 256, 4096, 4097, 65_537] {
+            let data: alloc::vec::Vec<u8> =
+                (0..len).map(|i| (i.wrapping_mul(37) + 11) as u8).collect();
+
+            let mut splits = alloc::vec::Vec::new();
+            let mut remaining = len;
+            while remaining > 0 {
+                let take = 1 + (next() as usize) % remaining.min(4096);
+                splits.push(take);
+                remaining -= take;
+            }
+            let all_1: alloc::vec::Vec<usize> = alloc::vec![1usize; len];
+            let whole = if len == 0 {
+                alloc::vec::Vec::new()
+            } else {
+                alloc::vec![len]
+            };
+
+            for (label, sizes) in [("all-1", &all_1), ("random", &splits), ("whole", &whole)] {
+                let (mut c32, mut c64) = (0u32, 0u64);
+                let (mut s32, mut s64) = (Crc32::new(), Crc64Xz::new());
+                let mut offset = 0;
+                for &size in sizes {
+                    let part = &data[offset..offset + size];
+                    c32 = crc32_host(c32, part);
+                    c64 = crc64_xz_host(c64, part);
+                    s32.update(part);
+                    s64.update(part);
+                    offset += size;
+                }
+                assert_eq!(offset, len, "splits must cover the buffer");
+                assert_eq!(c32, crc32(&data), "crc32 hook chain, len {len}, {label}");
+                assert_eq!(c64, crc64_xz(&data), "crc64 hook chain, len {len}, {label}");
+                // The public seam must agree with the one-shot too, whichever
+                // backend this build compiled it as.
+                assert_eq!(s32.finalize(), crc32(&data), "Crc32, len {len}, {label}");
+                assert_eq!(
+                    s64.finalize(),
+                    crc64_xz(&data),
+                    "Crc64Xz, len {len}, {label}"
+                );
+            }
+        }
     }
 
     /// An empty range needs nothing pushed at all.
