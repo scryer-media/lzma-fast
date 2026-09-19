@@ -38,6 +38,46 @@ const XZ_SHA256: &str = "3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d
 /// task is pointed at, something is very wrong.
 const BACKDOOR_FILES: &[&str] = &["bad-3-corrupt_lzma2.xz", "good-large_compressed.lzma"];
 
+/// 7-Zip's own console binary, the second external reader `tests/xz_encoder.rs`
+/// puts this crate's `.xz` output through. 26.03 is the release whose `C/`
+/// tree is the pinned SDK commit the whole port is made from, so the checker
+/// and the reference encoder are the same code.
+///
+/// Every asset is fetched from the release by name and checked against its
+/// SHA-256 below, the way [`download`] checks the XZ Utils tarball. Unix gets
+/// the `7zz` the project ships; Windows has no `7zz`, so it gets `7za.exe`
+/// out of the "extra" package, extracted with `7zr.exe` - which is a plain
+/// executable and needs nothing to unpack it, which is the whole reason that
+/// is the shape of this.
+const SEVENZIP_VERSION: &str = "26.03";
+const SEVENZIP_ASSETS: &[(&str, &str, &str)] = &[
+    (
+        "linux-x86_64",
+        "7z2603-linux-x64.tar.xz",
+        "dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695",
+    ),
+    (
+        "linux-aarch64",
+        "7z2603-linux-arm64.tar.xz",
+        "2389ba20e4d8295e8709c20b6263b69bd1ec4972fe38a04ad7a1badbf595b996",
+    ),
+    (
+        "macos",
+        "7z2603-mac.tar.xz",
+        "5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480",
+    ),
+    (
+        "windows-unpacker",
+        "7zr.exe",
+        "ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d",
+    ),
+    (
+        "windows",
+        "7z2603-extra.7z",
+        "191894e6acb3647ffb69ce630479ff318523b2e2b9890aa7f05c1127c2e59b8f",
+    ),
+];
+
 pub fn sdk(mut args: impl Iterator<Item = String>) -> ExitCode {
     let Some(dest) = args.next() else {
         eprintln!("usage: cargo xtask sdk <destination>");
@@ -158,6 +198,105 @@ fn xz_tests_into(root: &Path, dest: &Path) -> Result<(), String> {
         dest.display()
     );
     Ok(())
+}
+
+/// Installs 7-Zip's console binary under the given directory (default
+/// `target/sevenzip`) and prints its path, for CI to put in
+/// `LZMA_TURBO_7ZZ`.
+pub fn sevenzip(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let root = repo_root();
+    let dest = args
+        .next()
+        .map_or_else(|| root.join("target").join("sevenzip"), PathBuf::from);
+    result(sevenzip_into(&dest).map(|binary| println!("{}", binary.display())))
+}
+
+fn sevenzip_asset(key: &str) -> Result<(&'static str, &'static str), String> {
+    SEVENZIP_ASSETS
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, name, digest)| (*name, *digest))
+        .ok_or_else(|| format!("no pinned 7-Zip asset for {key}"))
+}
+
+fn sevenzip_url(name: &str) -> String {
+    format!("https://github.com/ip7z/7zip/releases/download/{SEVENZIP_VERSION}/{name}")
+}
+
+fn sevenzip_into(dest: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let key = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_arch = "aarch64") {
+        "linux-aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "linux-x86_64"
+    } else {
+        return Err("no pinned 7-Zip build for this platform".into());
+    };
+    let (name, digest) = sevenzip_asset(key)?;
+    let archive = dest.join(name);
+    download(&sevenzip_url(name), &archive, digest)?;
+
+    let binary = if cfg!(windows) {
+        // `7zr.exe` is a whole program in one file, so unpacking the "extra"
+        // package needs nothing that is not pinned here.
+        let (unpacker_name, unpacker_digest) = sevenzip_asset("windows-unpacker")?;
+        let unpacker = dest.join(unpacker_name);
+        download(&sevenzip_url(unpacker_name), &unpacker, unpacker_digest)?;
+        let status = Command::new(&unpacker)
+            .arg("x")
+            .arg("-y")
+            .arg(format!("-o{}", dest.display()))
+            .arg(&archive)
+            .arg("x64/7za.exe")
+            .arg("x64/7za.dll")
+            .status()
+            .map_err(|e| format!("run {}: {e}", unpacker.display()))?;
+        if !status.success() {
+            return Err(format!("{unpacker_name} could not unpack {name}"));
+        }
+        dest.join("x64").join("7za.exe")
+    } else {
+        // `tar` reads `.tar.xz` on every runner this is meant for: bsdtar on
+        // macOS decompresses it itself, GNU tar on Linux hands it to the `xz`
+        // that `install-xz.sh` has already put on PATH.
+        let status = Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("7zz")
+            .current_dir(dest)
+            .status()
+            .map_err(|e| format!("run tar: {e}"))?;
+        if !status.success() {
+            return Err(format!("tar could not take 7zz out of {name}"));
+        }
+        dest.join("7zz")
+    };
+    if !binary.is_file() {
+        return Err(format!("{} is not there after unpacking", binary.display()));
+    }
+    // The tar carries its own mode, but the Windows path and a umask that
+    // strips execute would both leave it unrunnable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&binary)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        fs::set_permissions(&binary, perms).map_err(|e| e.to_string())?;
+    }
+    let out = Command::new(&binary)
+        .arg("i")
+        .output()
+        .map_err(|e| format!("run {}: {e}", binary.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} does not run", binary.display()));
+    }
+    Ok(binary)
 }
 
 /// File name to SHA-256, from `tests/xz-utils.manifest`.

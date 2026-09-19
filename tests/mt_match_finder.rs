@@ -15,9 +15,19 @@ use std::io::Read as _;
 
 use lzma_turbo::{Lzma2Encoder, Lzma2Reader, LzmaEncProps, MatchFinderKind, SliceStream};
 
+#[path = "corpus/mod.rs"]
+mod shared;
+
 /// Runs and short repeated phrases, which give the binary tree long chains to
 /// walk and so keep the bt thread behind the hash thread.
+///
+/// `LZMA_TURBO_CORPUS_MAX` caps the length; see [`shared::max_len`]. Under
+/// that cap this file's big inputs no longer reach `MatchFinder_MoveBlock` at
+/// every dictionary, which is the trade memcheck asks for: that lane is there
+/// to watch the three threads touch memory, and the uncapped run everywhere
+/// else is what covers the sliding window.
 fn corpus(len: usize) -> Vec<u8> {
+    let len = len.min(shared::max_len());
     let mut v = Vec::with_capacity(len);
     let mut x = 0x1234_5678u32;
     while v.len() < len {

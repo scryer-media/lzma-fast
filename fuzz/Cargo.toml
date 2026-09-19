@@ -14,6 +14,10 @@ lzma-turbo = { path = "..", default-features = false }
 # build has `LZMA_SDK` set, and the target compares the crate's two loops
 # alone without it.
 sdk-oracle = { path = "../tools/sdk-oracle" }
+# The SDK's own encoder, for `encode_differential`, on the same terms: it is
+# only there when the fuzz build has `LZMA_SDK` set, and the target does
+# nothing without it.
+sdk-encoder = { path = "../tools/sdk-encoder" }
 
 # The fuzz targets run against both decode loops: the default carries the
 # crate's own defaults (assembly where there is one), and `--no-default-
@@ -53,6 +57,13 @@ bench = false
 [[bin]]
 name = "encode_round_trip"
 path = "fuzz_targets/encode_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_differential"
+path = "fuzz_targets/encode_differential.rs"
 test = false
 doc = false
 bench = false

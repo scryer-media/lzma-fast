@@ -95,7 +95,13 @@ required-features = ["crc-host", "crypto-host"]
 # depends on `lzma-rust2` and `liblzma` to time this crate against them, and
 # those must not appear in this crate's own graph at all.
 [workspace]
-members = ["tools/asm-provenance", "tools/lzma-bench", "tools/sdk-oracle", "xtask"]
+members = [
+    "tools/asm-provenance",
+    "tools/lzma-bench",
+    "tools/sdk-encoder",
+    "tools/sdk-oracle",
+    "xtask",
+]
 resolver = "2"
 
 [profile.release]

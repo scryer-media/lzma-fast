@@ -7,3 +7,7 @@
 # with the decoder.
 tests/data/** binary
 fuzz/corpus/**/*.seed binary
+
+# The encoder digests are a committed vector like any other: bytes, so that
+# a Windows checkout cannot rewrite them.
+tests/golden.manifest binary

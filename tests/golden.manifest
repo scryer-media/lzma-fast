@@ -1,0 +1,34 @@
+# The SHA-256 of one stream per (input, setting), the same on every
+# platform. `cargo xtask golden --write` writes this file;
+# `cargo xtask golden --check` and CI's `test` job compare against it.
+# Marked binary in .gitattributes, as every committed vector is.
+2b6997a8b56fea165ce9d03ae8b40da1d5fca42dccddaf3aa09dd78eca583626  lzma1-l6-bt4/random-tiny
+98a11f406159d04742d7988f28eb858899403bc8301e23b3dbfc51b0dcd4902a  lzma1-l6-bt4/repeats-small
+ecf7e9b508c2ae57893243657cc5219a6fc142c8f5af5565ef5605143c92294c  lzma1-l6-bt4/text-big
+05fd0a6b55bb8e4b45df268932a62070a9a11f95a133480ba2cc54ee10ce0583  lzma1-l6-bt4/text-chunk-under
+b2133f8076421c5c925d8defc3365edf1f2e7396acfa391bff90c402afa83604  lzma1-l6-bt4/zeros-65536
+beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a  lzma2-l1-hc4-prop/random-tiny
+beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a  lzma2-l1-hc4-prop/repeats-small
+beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a  lzma2-l1-hc4-prop/text-big
+beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a  lzma2-l1-hc4-prop/text-chunk-under
+beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a  lzma2-l1-hc4-prop/zeros-65536
+88c1f506f9207059c806ca392c5a43ce3ab17f667463fa2514872386bbcf97d0  lzma2-l1-hc4/random-tiny
+e719cd42f9ac995de32952de86684d72b4c379ff6e1ec1a91681342bf6ed0278  lzma2-l1-hc4/repeats-small
+817093777f25cfabbdc8e66b0e0aa90dfd137b1962d14795bf614e0e3f1b23c1  lzma2-l1-hc4/text-big
+b4cb25a1046419f7a0b2f14755a50af88b839cfa499bc04537c964f2cd8c3d80  lzma2-l1-hc4/text-chunk-under
+68bab669326ef6ca5d7b2293c4cf736d4315488ea57f499d4b30c0337577afdf  lzma2-l1-hc4/zeros-65536
+88c1f506f9207059c806ca392c5a43ce3ab17f667463fa2514872386bbcf97d0  lzma2-l5-block64k/random-tiny
+e719cd42f9ac995de32952de86684d72b4c379ff6e1ec1a91681342bf6ed0278  lzma2-l5-block64k/repeats-small
+015102c4161caa9f63e2ed163ebcdafae4a1f1df76d342bd5c3de5fbef0a55a5  lzma2-l5-block64k/text-big
+a0b55fda58e8c18b0096b89a2cf373bfb606754c82c070ee983b734ccb0edc2c  lzma2-l5-block64k/text-chunk-under
+68bab669326ef6ca5d7b2293c4cf736d4315488ea57f499d4b30c0337577afdf  lzma2-l5-block64k/zeros-65536
+88c1f506f9207059c806ca392c5a43ce3ab17f667463fa2514872386bbcf97d0  lzma2-l9-mf2/random-tiny
+e719cd42f9ac995de32952de86684d72b4c379ff6e1ec1a91681342bf6ed0278  lzma2-l9-mf2/repeats-small
+d2d7d3331ff3bb19a696a8041d49167cfe637a2f3d878a305d593af05a156065  lzma2-l9-mf2/text-big
+bb4ba3bdbc7e8bc324384d932c7970812e347bb65bca23a849c57c3781e60e35  lzma2-l9-mf2/text-chunk-under
+68bab669326ef6ca5d7b2293c4cf736d4315488ea57f499d4b30c0337577afdf  lzma2-l9-mf2/zeros-65536
+de5c3930b41c95317cdf69fd5318ca9759ebc377495573293db3dea142c9f9ba  xz-delta4-x86-l5-block64k/random-tiny
+16bb7725b26882b2acb6dd66924ed01df4cf50d5740396794c20308cc6f01f42  xz-delta4-x86-l5-block64k/repeats-small
+2cfe7280b266e2d9a1d06ba247685490403218aeea5744ad62cfcb60f04862e3  xz-delta4-x86-l5-block64k/text-big
+bf6abbf30768a4acb771891b1d7362d04187bad4c74698fda0a620596738050d  xz-delta4-x86-l5-block64k/text-chunk-under
+fbcb0a7d274beb040a80f69d5a9d9fce3cbfb9a1c8b7f5b805a48b4f15565013  xz-delta4-x86-l5-block64k/zeros-65536
