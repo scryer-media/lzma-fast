@@ -2,7 +2,7 @@
 name = "lzma-turbo"
 description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
 readme = "README.md"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
@@ -41,13 +41,49 @@ crypto = ["std", "dep:aws-lc-rs"]
 # `--no-default-features --features std,native-crypto` is the pure-Rust
 # choice, and a build with both compiles both and checks they agree.
 native-crypto = ["dep:sha2"]
+# Hand the bulk CRC-32 and CRC-64/XZ to an embedder-installed hook (see the
+# `hooks` module) instead of computing them here. Engaged on `wasm32` ONLY: on
+# a native target the feature is accepted but inert, so feature unification in
+# a mixed workspace cannot silently turn a native build into a delegating one.
+# It adds no dependency - `crc-fast` stays, because the checksum *combine* is
+# arithmetic rather than a pass over data and is never delegated - and it
+# implies `crc`, whose API it reimplements rather than replaces.
+crc-host = ["crc"]
+# The same for SHA-256, the xz check type 10 hash, delegated as a streaming
+# handle. It implies `native-crypto`, so a native build of a `crypto-host`
+# crate always has an in-process backend, and `std`, because the hook registry
+# is a `std::sync::RwLock`.
+crypto-host = ["std", "native-crypto"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 crc-fast = { version = "1.10.0", default-features = false, optional = true }
 sha2 = { version = "0.11.0", default-features = false, optional = true }
 
-[dev-dependencies]
+# The wasm conformance harness drives the guest examples below through a
+# native `wasmtime` that supplies the reference host functions they import.
+# Those are native-only tooling for that one test: they never reach the crate's
+# own graph, and they must stay off the wasm example build (wasmtime does not
+# build for wasm), hence the target gate.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+wasmtime = "48"
+wasmtime-wasi = "48"
+# The host side of the reference embedding checksums with the same libraries
+# the native build of this crate does: no hand-written CRC or SHA on either
+# side of the boundary.
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.0" }
+
+# The two wasm guest examples are reference embeddings of the `hooks` seam:
+# each declares raw imports in a `host` namespace and installs hooks that
+# forward to them. They only mean anything with the delegating features on.
+[[example]]
+name = "wasm_xz_conformance"
+required-features = ["crc-host", "crypto-host", "xz"]
+
+[[example]]
+name = "wasm_missing_hooks"
+required-features = ["crc-host", "crypto-host"]
 
 # `tools/lzma-bench` is a workspace member rather than an example because it
 # depends on `lzma-rust2` and `liblzma` to time this crate against them, and

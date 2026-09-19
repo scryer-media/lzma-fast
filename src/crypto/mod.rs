@@ -4,26 +4,64 @@
 //! decoder; it is what a container reader needs to verify an xz stream whose
 //! check type is SHA-256.
 //!
-//! There are two backends behind one API:
+//! There are three backends behind one API:
 //!
 //! - `awslc`, from `aws-lc-rs`, behind the default `crypto` feature;
 //! - `rustcrypto`, from the `sha2` crate, behind `native-crypto`, for a
-//!   build that wants no C toolchain.
+//!   build that wants no C toolchain;
+//! - `host`, behind `crypto-host`, which hands the hashing to the embedding
+//!   program through [`crate::hooks`] - for a wasm guest, where there are no
+//!   SHA instructions to reach and the host has them.
 //!
-//! The features are additive, and `native-crypto` wins: with both on, both
-//! backends are compiled, the public type is the RustCrypto one, and a test
-//! checks the two agree. That is deliberate - the opt-out has to be an
-//! opt-out even when something else in the dependency graph turns `crypto`
-//! back on.
+//! The features are additive, and the selection is by precedence:
+//!
+//! 1. **`host`**, on `wasm32` with `crypto-host`. Only there: on a native
+//!    target `crypto-host` is accepted and inert, so feature unification in a
+//!    mixed workspace cannot silently turn a native build into a delegating
+//!    one.
+//! 2. **`rustcrypto`**, with `native-crypto`. It wins over `crypto`
+//!    deliberately - the opt-out has to be an opt-out even when something else
+//!    in the dependency graph turns `crypto` back on. `crypto-host` implies
+//!    it, so a `crypto-host` build always has an in-process backend off wasm.
+//! 3. **`awslc`**, with `crypto`.
+//!
+//! Every enabled backend is still *compiled*, whether or not it is selected:
+//! with `crypto` and `native-crypto` both on, a test requires the two to agree
+//! digest for digest, and the `host` module carries a native test of its
+//! handle lifetime against the reference hooks.
 
 #[cfg(feature = "crypto")]
 pub mod awslc;
+// Compiled on native targets as well as wasm, where it is not the active
+// backend and its seam is therefore dead code - which is what lets its handle
+// lifetime be tested without a wasm runtime.
+#[cfg(feature = "crypto-host")]
+#[cfg_attr(
+    not(all(target_arch = "wasm32", feature = "crypto-host")),
+    allow(dead_code)
+)]
+pub mod host;
 #[cfg(feature = "native-crypto")]
 pub mod rustcrypto;
 
-#[cfg(all(feature = "crypto", not(feature = "native-crypto")))]
+/// Whether [`Sha256`] hashes in this process or hands every chunk to the
+/// embedding program (see [`crate::hooks`]). Only a `wasm32` build with
+/// `crypto-host` delegates.
+pub const SHA256_IS_HOST_DELEGATED: bool =
+    cfg!(all(target_arch = "wasm32", feature = "crypto-host"));
+
+#[cfg(all(
+    feature = "crypto",
+    not(feature = "native-crypto"),
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 pub use awslc::Sha256;
-#[cfg(feature = "native-crypto")]
+#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+pub use host::Sha256;
+#[cfg(all(
+    feature = "native-crypto",
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 pub use rustcrypto::Sha256;
 
 /// What can go wrong in this module. Nothing here is a decode error, so it

@@ -81,6 +81,8 @@ pub use xz::{XzAdaptiveDecoder, XzError, XzErrorKind, XzOptions, XzParallelReade
 pub mod crc;
 #[cfg(any(feature = "crypto", feature = "native-crypto"))]
 pub mod crypto;
+#[cfg(any(feature = "crc-host", feature = "crypto-host"))]
+pub mod hooks;
 
 /// Whether this build decodes with the assembly loop ported from the LZMA
 /// SDK's `Asm/` tree rather than with the portable Rust port of the C loop.

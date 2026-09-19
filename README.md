@@ -131,6 +131,8 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
 | `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the filters, the checks and the index; implies `std` and `crc` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
+| `crc-host` | no | on `wasm32`, the same CRC API delegated to embedder-installed hooks; implies `crc`. Inert on native targets - see [wasm](#wasm) |
+| `crypto-host` | no | on `wasm32`, the same SHA-256 API delegated to embedder-installed hooks; implies `native-crypto` and `std`. Inert on native targets |
 
 This crate is LZMA, LZMA2 and the xz container, and nothing else: 7z archives
 are handled by a fork of `sevenz-rust2` that depends on it.
@@ -163,6 +165,76 @@ filters and the checks; `asm` is accepted and inert there (wasm gets the
 portable loop), and SHA-256 has to come from `native-crypto`, because the
 default `crypto` feature builds AWS-LC's C, which wasm has no toolchain for.
 The threaded decoders need real threads and are not part of that set.
+
+### Letting the host do the checksums
+
+That build computes its checks in the guest, and both libraries it uses for
+them are there for instructions wasm does not have: `crc-fast` exists for the
+carry-less multiply units, and `sha2` has no `sha256rnds2` or `sha256h` to
+reach for either. The host almost certainly does have them.
+
+Two features hand those primitives back to the embedding program:
+
+| Feature | What leaves the guest |
+| --- | --- |
+| `crc-host` | CRC-32 and CRC-64/XZ - every check the `.xz` container carries, header CRCs included |
+| `crypto-host` | SHA-256, the check type 10 hash |
+
+```toml
+lzma-turbo = { version = "0.3", default-features = false, features = [
+    "std", "asm", "crc-host", "crypto-host", "xz",
+] }
+```
+
+The public API does not change: `crc::Crc32`, `crc::Crc64Xz`, `crc::crc32`,
+`crc::crc64_xz` and `crypto::Sha256` keep their types and their methods, so
+every caller - the readers, the block checks, the multi-threaded checksum
+planner - picks the delegation up with no change of its own. The features
+engage on `wasm32` only: on a native target they are accepted and inert, so
+feature unification in a mixed workspace cannot silently turn a native build
+into a delegating one.
+
+The embedder installs a set of plain `fn` pointers at start-up:
+
+```rust,ignore
+use lzma_turbo::hooks::{HostHashHooks, install_host_hash_hooks};
+
+install_host_hash_hooks(HostHashHooks::new(
+    crc32, crc64_xz,
+    sha256_init, sha256_clone, sha256_update, sha256_finalize, sha256_drop,
+));
+```
+
+What sits behind them - a raw wasm import, a component import, a host SDK call
+- is the embedder's business; this crate depends on no runtime, SDK or
+interface definition and never learns which it is. The contract, in short:
+
+- **The CRCs are seeded resumes in the finalized domain.** `crc32(0, d)` is the
+  ordinary checksum of `d`, `crc32(s, &[]) == s`, and
+  `crc32(crc32(0, a), b) == crc32(0, a ++ b)`. Same for `crc64_xz`. That last
+  property is what lets the streaming digests carry a plain integer. A host
+  whose CRC library exposes only the running register seeds it with `!seed`.
+  Checksum *folding* (`crc32_combine`) is never delegated: it is arithmetic on
+  two integers, not a pass over data.
+- **SHA-256 is a streaming state behind an opaque handle.** `sha256_init`
+  opens one, `sha256_update` appends, `sha256_clone` duplicates it,
+  `sha256_finalize` returns the digest and closes it, `sha256_drop` closes one
+  that never gets a digest. Each handle this crate opens is closed exactly
+  once, so a multi-gigabyte block is hashed as it decodes and is never
+  buffered, and a host may treat a stale handle as a bug.
+- **A missing or contract-violating hook panics**, naming the call the embedder
+  skipped. There is no in-guest fallback: it would return correct bytes at
+  exactly the speed the embedding exists to avoid.
+
+`src/hooks.rs` states the contract in full.
+[`examples/wasm_xz_conformance.rs`](examples/wasm_xz_conformance.rs) is a
+complete reference embedding - a `wasm32-wasip1` guest declaring raw imports in
+a `host` namespace - and
+[`tests/wasm_host_conformance.rs`](tests/wasm_host_conformance.rs) is the
+reference host for that ABI, built on `crc-fast` and `sha2`. CI runs it: an
+`.xz` of each check type is decoded in the guest and the report has to equal
+the native decoder's byte for byte, down to the failure text of a stream whose
+stored check was corrupted.
 
 ## Platforms
 
