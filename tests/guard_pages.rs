@@ -399,9 +399,12 @@ mod encoder {
 
     impl ExactSink {
         fn new(len: usize) -> Self {
-            let mut buf = Vec::with_capacity(len);
-            buf.resize(len, 0);
-            ExactSink { buf, at: 0 }
+            // Exactly `len` bytes, so the last one is the last byte before
+            // the guard.
+            ExactSink {
+                buf: vec![0; len],
+                at: 0,
+            }
         }
     }
 

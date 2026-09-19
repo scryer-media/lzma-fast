@@ -54,7 +54,7 @@ jobs:
           # decoder against bytes no encoder ever produced. `.gitattributes`
           # marks the whole directory binary; this proves it still covers
           # every file in it.
-          text="$(git ls-files --eol -- tests/data fuzz/corpus \
+          text="$(git ls-files --eol -- tests/data fuzz/corpus tests/golden.manifest \
             | grep -v '\.gitignore$' | awk '$3 != "attr/-text"')"
           if [ -n "$text" ]; then
             echo "these vectors are not marked binary in .gitattributes:" >&2
@@ -170,6 +170,12 @@ jobs:
         run: cargo check --locked -p lzma-turbo --no-default-features --features enc,xz --all-targets
       - name: Test the encoder with the .xz writer
         run: cargo test --locked -p lzma-turbo --no-default-features --features enc,xz,native-crypto --no-fail-fast
+      # The one check that is not per platform: the parity tests compare this
+      # crate with an SDK built on the same runner, and would go on passing if
+      # both drifted together. These digests are written down once and compared
+      # on all four.
+      - name: The encoder's bytes are the committed digests
+        run: cargo xtask golden --check
 
   wasm:
     name: wasm-${{ matrix.lane }}
