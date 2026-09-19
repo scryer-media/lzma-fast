@@ -63,9 +63,12 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
                  `xz -dc -T<n>`, `7zz t` and the liblzma crate
   --encode LIST  encode instead of decode: compress each input (raw bytes) to
                  `.xz` at each preset in the list, or \"sweep\" for 1,3,5,6,9,
-                 and time it against `xz -T1 -N` on the same data. Both the
+                 and time it against `xz -T<n> -N` on the same data. Both the
                  time and the output size are reported, because one without
-                 the other says nothing about a compressor.
+                 the other says nothing about a compressor. With `--threads`
+                 the preset is run at each thread count, splitting into blocks
+                 at the size `xz -T` would use so the two are comparable; at
+                 one thread both sides write one solid block.
   --checksum K   have the decoder's own workers checksum their output:
                  none (default), crc32, crc64 or sha256. The CRCs are cut into
                  segments every 16 MiB, so the row also shows what splitting
@@ -147,7 +150,7 @@ fn main() {
 
     for file in &files {
         if !presets.is_empty() {
-            encode::bench(file, runs, oracles, &presets);
+            encode::bench(file, runs, oracles, &presets, &threads);
         } else if index {
             run_index(file);
         } else if adaptive {

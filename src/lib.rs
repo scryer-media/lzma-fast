@@ -58,14 +58,17 @@ mod reader;
 #[cfg(feature = "xz")]
 pub mod xz;
 
-/// The `.xz` writer, behind the `xz` feature.
-#[cfg(all(feature = "enc", feature = "xz"))]
-pub use enc::{DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz, encode_xz_with_filters};
 #[cfg(feature = "enc")]
 pub use enc::{
-    LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder, Lzma2Writer, LzmaEncProps, LzmaEncoder,
-    LzmaWriter, MatchFinderKind, NormalizedProps, SeqInStream, SeqOutStream, SliceStream,
-    encode_lzma_alone, encode_lzma2,
+    BLOCK_SIZE_AUTO, BLOCK_SIZE_SOLID, LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder,
+    Lzma2Writer, LzmaEncProps, LzmaEncoder, LzmaWriter, MatchFinderKind, NormalizedProps,
+    SeqInStream, SeqOutStream, SliceStream, auto_block_size, encode_lzma_alone, encode_lzma2,
+    encode_lzma2_mt,
+};
+/// The `.xz` writer, behind the `xz` feature.
+#[cfg(all(feature = "enc", feature = "xz"))]
+pub use enc::{
+    DEFAULT_BLOCK_SIZE, XzEncoder, XzWriter, encode_xz, encode_xz_mt, encode_xz_with_filters,
 };
 pub use error::{Error, FinishMode, Progress, Status};
 pub use lzma::consts::{LZMA_PROPS_SIZE, LZMA_REQUIRED_INPUT_MAX};

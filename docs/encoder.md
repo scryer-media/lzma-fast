@@ -11,7 +11,9 @@ domain (`C/` in the LZMA SDK).
 | `C/LzFind.h` / `C/LzFind.c` | the window and the six match finders: `MatchFinder_Create`, `MatchFinder_Init`, `MatchFinder_CheckLimits`, `MatchFinder_SetLimits`, `MatchFinder_Normalize3`, `GetMatchesSpec1`, `SkipMatchesSpec`, `Hc_GetMatchesSpec`, and the `Bt2/Bt3/Bt4/Bt5/Hc4/Hc5` entry points | `src/enc/lz_find.rs` |
 | `C/LzHash.h` | `HASH2_CALC`…`HASH5_CALC` and the `kLzHash_CrcShift_*` constants | `src/enc/consts.rs`, used in `src/enc/lz_find.rs` |
 | `C/LzmaEnc.h` / `C/LzmaEnc.c` | `CLzmaEncProps` and `LzmaEncProps_Normalize`; the range encoder (`CRangeEnc`, `RangeEnc_ShiftLow`, `RC_BIT`, `RC_NORM`); the price tables (`ProbPrices`, `GET_PRICE*`, `LenPriceEnc_UpdateTables`, `FillDistancesPrices`, `FillAlignPrices`); the parser (`GetOptimum`, `GetOptimumFast`, `Backward`, `COptimal`); `LzmaEnc_CodeOneBlock`, `LzmaEnc_Encode`, `LzmaEnc_WriteProperties` | `src/enc/props.rs`, `src/enc/range_enc.rs`, `src/enc/price.rs`, `src/enc/lzma_enc.rs`, `src/enc/consts.rs` |
-| `C/Lzma2Enc.h` / `C/Lzma2Enc.c` | the chunk layer: `Lzma2EncInt_InitBlock`, `Lzma2EncInt_EncodeSubblock` with its copy-chunk fallback, `CLimitedSeqInStream`, `Lzma2Enc_WriteProperties`, `LZMA2_DIC_SIZE_FROM_PROP` | `src/enc/lzma2_enc.rs`, `src/enc/stream.rs` |
+| `C/Lzma2Enc.h` / `C/Lzma2Enc.c` | the chunk layer: `Lzma2EncInt_InitBlock`, `Lzma2EncInt_EncodeSubblock` with its copy-chunk fallback, `CLimitedSeqInStream`, `Lzma2Enc_WriteProperties`, `LZMA2_DIC_SIZE_FROM_PROP`; and the block layer: `CLzma2EncInt` per block, `Lzma2Enc_EncodeMt1` in both its stream and its memory form, `Lzma2EncProps_Normalize`'s block-size and thread arithmetic, `Lzma2Enc_MtCallback_Code` / `_Write` | `src/enc/lzma2_enc.rs`, `src/enc/stream.rs` |
+| `C/MtCoder.h` / `C/MtCoder.c` | `MtCoder_Code` and `ThreadFunc2`: the read token, the block semaphore, the free-block list and the in-order write turn | `src/enc/mt_coder.rs` |
+| `C/Threads.h` / `C/Threads.c` | `CSemaphore` (`Semaphore_OptCreateInit`, `_Wait`, `_Release1`), beside the `CAutoResetEvent` the decoder already had | `src/mt/sync.rs`, `src/mt/event.rs` |
 | `C/Bra.c` / `C/Bra86.c` / `C/BraIA64.c` | the branch converters in the encode direction: `z7_BranchConvSt_X86_Enc` and `z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64,RISCV}_Enc` | `src/xz/bcj.rs`, beside the decode direction |
 | `C/Delta.c` | `Delta_Encode` | `src/xz/delta.rs`, beside `Delta_Decode` |
 | — | the `.xz` frame, from the format specification rather than from `C/XzEnc.c` | `src/enc/xz_enc.rs` |
@@ -71,14 +73,16 @@ chunk by chunk.
 
 ## What was left out
 
-**`C/LzFindMt.c`.** The multi-threaded match finder is not ported. The port is
-the shape the SDK takes when it is built with `-DZ7_ST`: `LzFind.c` alone,
-driven from one thread.
-
-**Multi-threaded `Lzma2Enc`.** `Lzma2Enc_Encode2`'s `MtCoder` path, which
-splits the input into blocks and compresses them in parallel, is not ported.
-`Lzma2Encoder` is the `Lzma2Enc_EncodeMt1` path with a solid block: one LZMA2
-stream for whatever it is given.
+**`C/LzFindMt.c` and `C/LzFindOpt.c`.** The *threaded match finder* is still
+not ported — `MatchFinderMt_*`, the hash thread / bt thread pipeline with its
+two ring buffers, and `GetMatchesSpecN_2`. Every match finder here is the one
+`LzFind.c` runs on the calling thread, which is what the SDK uses when
+`lzmaProps.numThreads` is 1. This costs nothing in output: the SDK's `btMode`
+MT finder is built to produce the same matches as the ST one, so the bytes are
+the same either way; it costs the second and third core that the C can put
+behind a *single* block. The parallelism that is here is block-parallelism,
+described below, which is the parallelism `xz -T` and 7-Zip's `mt` actually
+ship with.
 
 **`directInput` mode.** `CMatchFinder` can be pointed at a caller's whole
 buffer instead of copying into its own window; only the windowed path is here,
@@ -104,6 +108,80 @@ of the host's pointers is not one anybody wants.
 **The progress callback.** `ICompressProgress` is not carried; there is no
 caller of it in this crate.
 
+## The multi-threaded encoder
+
+LZMA2 has exactly one seam a stream can be cut along: a *block*, a run of
+chunks that opens by resetting the dictionary and therefore decodes without
+reference to anything before it. `C/Lzma2Enc.c` splits the input at that seam
+and hands the pieces to `C/MtCoder.c`; that is what is ported here.
+
+| C | Rust |
+| --- | --- |
+| `CMtCoder`, `MtCoder_Code` | `MtCoder::code` in `src/enc/mt_coder.rs` |
+| `ThreadFunc2`, the `readEvent` token passed thread to thread | `Run::thread_func2`, `Run::read_event` |
+| `blocksSemaphore`, `freeBlockList`, `ReadyBlocks[]`, `writeIndex` | `Run::blocks_semaphore`, `Shared::free_block_list`, `Shared::ready_blocks`, `Shared::write_index` |
+| `MTCODER_GET_NUM_BLOCKS_FROM_THREADS`, `MTCODER_BLOCKS_MAX`, the `+1` per block-size band | `num_blocks_from_threads`, `BLOCKS_MAX`, `Run::num_blocks_max` |
+| `MtProgress_GetError` / `_SetError` | `Run::get_error` / `Run::set_error` |
+| `SeqInStream_ReadMax` | `read_max` |
+| `IMtCoderCallback2` (`Code`, `Write`) | the `MtCoderCallback` trait |
+| `CLzma2EncInt`, `Lzma2EncInt_InitBlock` | `Lzma2EncInt`, `Lzma2EncInt::init_block` |
+| `Lzma2Enc_EncodeMt1`, `inStream` form | `Lzma2EncInt::encode_mt1_stream` |
+| `Lzma2Enc_EncodeMt1`, `inData` form | `Lzma2EncInt::encode_mt1_mem` |
+| `Lzma2Enc_MtCallback_Code` / `_Write`, `me->coders[]`, `me->outBufs[]` | `Lzma2MtCallback` |
+| `Lzma2EncProps_Normalize`: `blockSize` AUTO/SOLID, the `reduceSize` override, `numBlockThreads_Reduced` | `auto_block_size`, `Lzma2Encoder::block_size`, `::effective_props`, `::threads_reduced` |
+| the `memUsage` reduction 7-Zip applies outside `C/` | `Lzma2Encoder::set_mem_limit`, `::mem_usage_per_thread` |
+| `MatchFinder_Create`'s sizing, split out so it can be costed without allocating | `MatchFinder::plan`, `MatchFinder::mem_usage`, `LzmaEnc::mem_usage` |
+
+`XzEncoder` needs none of `MtCoder`: `.xz` blocks are independent by
+construction and the writer already queues one at a time, so
+`XzEncoder::set_threads` compresses the queued blocks in a `std::thread::scope`
+and appends them in order. Filter chains come along unchanged — the format
+resets filter state at every block boundary, so each block builds its own
+converters exactly as the single-threaded path does.
+
+**The bytes do not depend on the thread count.** For one `(props, block size,
+data size)` this encoder produces one stream, at one thread and at sixteen.
+That is not an accident of scheduling: a block is encoded from its own bytes
+alone, and the only thing the thread count touches is which core ran it.
+`Lzma2Enc_Encode2` is the same. It is checked three ways — a unit test, a
+property in the fuzz target, and `tests/lzma2_mt_parity.rs` against the C.
+
+### What is deliberately different
+
+- **Threads live for one call.** The C parks its worker threads on a
+  `startEvent` and reuses them across files; `MtCoder::code` runs its workers
+  inside a `std::thread::scope`, which is what lets them borrow the caller's
+  input and callback instead of taking ownership. The thread count, the block
+  scheduling and the output are the same; only the pool's lifetime differs.
+- **`MTCODER_USE_WRITE_THREAD` is not carried.** The C `#undef`s it too, so
+  this is the path the C actually takes.
+- **`ICompressProgress` is not carried**, as elsewhere in this port.
+- **`numThreadsMax` is the reduced count.** The C switches to the `MtCoder`
+  path on `numBlockThreads_Reduced` but passes `numBlockThreads_Max` to
+  `MtCoder`; this port passes the reduced count to both, because the reduced
+  count is the one the memory budget and the block count allow. The output does
+  not depend on it.
+- **Output buffers grow.** The C sizes each block's output buffer at
+  `blockSize + (blockSize >> 10) + 16` and fails with `SZ_ERROR_OUTPUT_EOF` if
+  a block does not fit; here they are `Vec`s, so the copy-chunk fallback's
+  worst case cannot overflow one.
+- **The memory estimate is this port's own.** 7-Zip computes `GetMemUsage`
+  outside `C/`, in LGPL C++ that must not be copied into this crate, so
+  `mem_usage_per_thread` adds up this port's own allocation sites instead: the
+  match finder's window and reference tables from `MatchFinder::plan`, the
+  literal probability arrays, and the block's buffers.
+
+### The threaded stream path
+
+`Lzma2Encoder::encode_mt` runs `MtCoder` over a `SeqInStream` rather than a
+slice, as `Lzma2Enc_Encode2` does when it is given one. It does not in general
+produce what the single-threaded `encode` produces for the same input, and the
+C has the same gap: a block read into memory is encoded knowing its own length,
+whereas the single-threaded loop tells the encoder the block size until the
+stream runs out, and `expectedDataSize` sizes the match finder's hash table.
+Tell the encoder the real length with `set_data_size` and the two agree, which
+is what `encode_to_vec` does.
+
 ## How the port is proved
 
 **Bit-exact parity, `tests/lzma_parity.rs` and `tests/lzma2_encoder.rs`.**
@@ -119,6 +197,18 @@ repeats, and inputs either side of the dictionary size and of the LZMA2 chunk
 limits — across the match finders and several levels. They skip with a message
 when the binaries are absent, and fail instead when
 `LZMA_TURBO_LZMA_UTIL_REQUIRE` is set, as CI sets it.
+
+**Threaded parity, `tests/lzma2_mt_parity.rs`.** `cargo xtask lzma-util` also
+builds `lzma2-oracle-mt`: the same props-driven LZMA2 harness compiled
+*without* `-DZ7_ST`, so `MtCoder.c`, `LzFindMt.c`, `LzFindOpt.c` and `Threads.c`
+are in it and `Lzma2Enc_Encode2` takes its `MtCoder` path. It takes a block
+size, a block thread count and a match-finder thread count on the command line.
+The test compares this crate against it over the whole corpus at four block
+sizes — 16 KiB, 64 KiB, 100000 and 1 MiB, either side of the corpus's own sizes
+— and at one, two and four block threads; then checks that the bytes are the
+same at one, two, three, eight and seventeen threads; then decodes them back
+through `Lzma2Reader`. CI runs it in the `encoder-parity` job on all four
+platforms.
 
 Parity is what proves the compressed data. The `.xz` frame around it has no
 such oracle, because the SDK's `XzEnc.c` is not what was ported, so it is
@@ -156,4 +246,7 @@ filters — are checked to be refused.
 settings taken from the input: `.lzma` back through `LzmaReader`, raw LZMA2
 back through `Lzma2Decoder`, and `.xz` back through `XzReader` — then the same
 `.xz` through a filter chain the input picks, back through all three readers,
-the adaptive one fed in chunks the input sizes.
+the adaptive one fed in chunks the input sizes. The same input is also encoded
+at a block size and thread count the input picks, both as raw LZMA2 and as
+filtered `.xz`, and asserted to be byte for byte what one thread produces at
+that block size.

@@ -298,6 +298,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     };
     let oracle_src = write_src("lzma-oracle.c", ORACLE_C)?;
     let oracle2_src = write_src("lzma2-oracle.c", ORACLE2_C)?;
+    let oracle2mt_src = write_src("lzma2-oracle-mt.c", ORACLE2_MT_C)?;
     let filter_src = write_src("filter-oracle.c", ORACLE_FILTER_C)?;
 
     // C: the `Z7_ST` build. `-D_7ZIP_ST` is the older spelling the SDK still
@@ -305,9 +306,9 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     let common: &[&str] = &["-O2", "-DZ7_ST", "-D_7ZIP_ST"];
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
 
-    let build = |out: &Path, sources: &[PathBuf]| -> Result<(), String> {
+    let build_with = |out: &Path, sources: &[PathBuf], flags: &[&str]| -> Result<(), String> {
         let mut cmd = Command::new(&cc);
-        cmd.args(common).arg("-I").arg(&c).arg("-o").arg(out);
+        cmd.args(flags).arg("-I").arg(&c).arg("-o").arg(out);
         cmd.args(sources);
         let st = cmd
             .status()
@@ -316,6 +317,9 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
             return Err(format!("{cc} failed building {}", out.display()));
         }
         Ok(())
+    };
+    let build = |out: &Path, sources: &[PathBuf]| -> Result<(), String> {
+        build_with(out, sources, common)
     };
 
     let core = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| c.join(n)).collect() };
@@ -350,6 +354,31 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     ]));
     build(&oracle2, &oracle2_srcs)?;
 
+    // The same LZMA2 oracle built *without* `Z7_ST`, which is the only way to
+    // reach `MtCoder.c` and `LzFindMt.c`. It takes a block size, a block
+    // thread count and a match-finder thread count, so the threaded ports can
+    // be compared against the C that actually threads.
+    let oracle2_mt = dest.join("lzma2-oracle-mt");
+    let mut oracle2_mt_srcs = vec![oracle2mt_src];
+    oracle2_mt_srcs.extend(core(&[
+        "Alloc.c",
+        "CpuArch.c",
+        "LzFind.c",
+        "LzFindMt.c",
+        "LzFindOpt.c",
+        "LzmaEnc.c",
+        "Lzma2Enc.c",
+        "MtCoder.c",
+        "MtDec.c",
+        "Threads.c",
+        "7zStream.c",
+    ]));
+    let mut mt_flags: Vec<&str> = vec!["-O2"];
+    if !cfg!(windows) {
+        mt_flags.push("-pthread");
+    }
+    build_with(&oracle2_mt, &oracle2_mt_srcs, &mt_flags)?;
+
     let filters = dest.join("filter-oracle");
     let mut filter_srcs = vec![filter_src];
     filter_srcs.extend(core(&[
@@ -361,7 +390,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     ]));
     build(&filters, &filter_srcs)?;
 
-    Ok(vec![util, oracle, oracle2, filters])
+    Ok(vec![util, oracle, oracle2, oracle2_mt, filters])
 }
 
 /// The SDK's own branch converters and delta filter, driven from the command
@@ -543,6 +572,70 @@ int main(int argc, char **argv) {
   MemIn in; in.vt.Read = MemIn_Read; in.p = src; in.rem = (size_t)n;
   FileOut out; out.vt.Write = FileOut_Write; out.f = fo;
   SRes res = Lzma2Enc_Encode2(enc, &out.vt, NULL, NULL, &in.vt, NULL, 0, NULL);
+  Lzma2Enc_Destroy(enc);
+  fclose(fo);
+  if (res != SZ_OK) { fprintf(stderr, "encode res=%d\n", res); return 7; }
+  return 0;
+}
+"#;
+
+/// The LZMA2 oracle again, built without `Z7_ST` so that `MtCoder.c` and
+/// `LzFindMt.c` are compiled in, and driven at a given block size, block
+/// thread count and match-finder thread count.
+const ORACLE2_MT_C: &str = r#"/* Props-driven multi-threaded LZMA2 encoder over the pinned SDK, for parity
+   testing. It writes the single LZMA2 property byte, then the raw LZMA2
+   stream. A blockSize of 0 means SOLID.
+   Usage: lzma2-oracle-mt <level> <btMode> <numHashBytes> <lc> <lp> <pb> <fb>
+                          <dictSize> <blockSize> <blockThreads> <mfThreads>
+                          <in> <out> */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Lzma2Enc.h"
+#include "Alloc.h"
+
+typedef struct { ISeqOutStream vt; FILE *f; } FileOut;
+static size_t FileOut_Write(ISeqOutStreamPtr pp, const void *buf, size_t size) {
+  FileOut *s = Z7_CONTAINER_FROM_VTBL(pp, FileOut, vt);
+  return fwrite(buf, 1, size, s->f);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 14) { fprintf(stderr, "bad args\n"); return 2; }
+  CLzma2EncProps props; Lzma2EncProps_Init(&props);
+  props.lzmaProps.level = atoi(argv[1]);
+  props.lzmaProps.btMode = atoi(argv[2]);
+  props.lzmaProps.numHashBytes = atoi(argv[3]);
+  props.lzmaProps.lc = atoi(argv[4]);
+  props.lzmaProps.lp = atoi(argv[5]);
+  props.lzmaProps.pb = atoi(argv[6]);
+  props.lzmaProps.fb = atoi(argv[7]);
+  props.lzmaProps.dictSize = (UInt32)strtoul(argv[8], NULL, 10);
+  {
+    UInt64 blockSize = (UInt64)strtoull(argv[9], NULL, 10);
+    props.blockSize = blockSize ? blockSize : LZMA2_ENC_PROPS_BLOCK_SIZE_SOLID;
+  }
+  props.numBlockThreads_Max = atoi(argv[10]);
+  props.numBlockThreads_Reduced = props.numBlockThreads_Max;
+  props.lzmaProps.numThreads = atoi(argv[11]);
+  props.numTotalThreads = props.numBlockThreads_Max * props.lzmaProps.numThreads;
+
+  FILE *fi = fopen(argv[12], "rb"); if (!fi) return 3;
+  fseek(fi, 0, SEEK_END); long n = ftell(fi); fseek(fi, 0, SEEK_SET);
+  Byte *src = (Byte *)malloc((size_t)n + 1);
+  if (n && fread(src, 1, (size_t)n, fi) != (size_t)n) return 3;
+  fclose(fi);
+
+  FILE *fo = fopen(argv[13], "wb"); if (!fo) return 3;
+  CLzma2EncHandle enc = Lzma2Enc_Create(&g_Alloc, &g_Alloc);
+  if (!enc) return 4;
+  if (Lzma2Enc_SetProps(enc, &props) != SZ_OK) { fprintf(stderr, "setprops\n"); return 5; }
+  Lzma2Enc_SetDataSize(enc, (UInt64)n);
+  Byte prop = Lzma2Enc_WriteProperties(enc);
+  fwrite(&prop, 1, 1, fo);
+
+  FileOut out; out.vt.Write = FileOut_Write; out.f = fo;
+  SRes res = Lzma2Enc_Encode2(enc, &out.vt, NULL, NULL, NULL, src, (size_t)n, NULL);
   Lzma2Enc_Destroy(enc);
   fclose(fo);
   if (res != SZ_OK) { fprintf(stderr, "encode res=%d\n", res); return 7; }

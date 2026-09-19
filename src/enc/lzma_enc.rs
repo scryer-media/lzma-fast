@@ -1771,6 +1771,39 @@ impl LzmaEnc {
         )
     }
 
+    /// What one encoder of this configuration is estimated to need, in bytes:
+    /// the match finder's window and reference tables plus the literal
+    /// probability arrays. Nothing is allocated.
+    ///
+    /// C: 7-Zip computes the same quantity outside `C/` to reduce the block
+    /// thread count to a memory budget; the arithmetic here is this port's own
+    /// allocation sites, not a formula copied from there.
+    pub(crate) fn mem_usage(&mut self) -> u64 {
+        self.mf.big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
+        let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;
+
+        let mut before_size = K_NUM_OPTS as u32;
+        let mut dict_size = self.dict_size;
+        if dict_size == (2u32 << 30) || dict_size == (3u32 << 30) {
+            dict_size -= 1;
+        }
+        // C: `LZMA2_KEEP_WINDOW_SIZE`, what `Lzma2Enc` prepares with.
+        let keep_window_size: u32 = 1 << 21;
+        if before_size + dict_size < keep_window_size {
+            before_size = keep_window_size - dict_size;
+        }
+        let mf = self
+            .mf
+            .mem_usage(
+                dict_size,
+                before_size,
+                self.num_fast_bytes,
+                LZMA_MATCH_LEN_MAX + 1,
+            )
+            .unwrap_or(0);
+        mf.saturating_add(lit_probs)
+    }
+
     /// C: `LzmaEnc_Init`.
     fn init_state(&mut self) {
         self.state = 0;

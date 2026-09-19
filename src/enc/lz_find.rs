@@ -161,6 +161,17 @@ fn cyclic_back(cyclic_buffer_pos: usize, delta: usize, cyclic_buffer_size: u32) 
     }
 }
 
+/// The sizes `MatchFinder_Create` works out before it allocates anything.
+///
+/// C: the first two thirds of `MatchFinder_Create`, split out so that the
+/// encoder can cost a configuration without paying for it — the memory
+/// accounting behind `crate::enc::lzma2_enc::Lzma2Encoder::set_mem_limit`.
+pub(crate) struct Plan {
+    pub(crate) block_size: u32,
+    pub(crate) hash_size_sum: usize,
+    pub(crate) num_refs: usize,
+}
+
 impl MatchFinder {
     /// C: `MatchFinder_Construct` plus `MatchFinder_SetDefaultSettings`.
     pub(crate) fn new() -> Self {
@@ -342,14 +353,15 @@ impl MatchFinder {
         hs
     }
 
-    /// C: `MatchFinder_Create`.
-    pub(crate) fn create(
+    /// C: `MatchFinder_Create` up to but not including its allocations. Every
+    /// field it sets is a scalar the next `create` recomputes.
+    pub(crate) fn plan(
         &mut self,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         mut keep_add_buffer_after: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<Plan, Error> {
         // C: "we need one additional byte in (p->keepSizeBefore), since we use
         // MoveBlock() after (p->pos++) and before dictionary using"
         self.keep_size_before = history_size
@@ -367,15 +379,6 @@ impl MatchFinder {
         let block_size = self.get_block_size(history_size);
         if block_size == 0 {
             return Err(Error::Param);
-        }
-        if self.buf_base.is_empty() || self.block_size != block_size {
-            // C: `LzInWindow_Create2`.
-            self.block_size = block_size;
-            self.buf_base = Vec::new();
-            self.buf_base
-                .try_reserve_exact(block_size as usize)
-                .map_err(|_| Error::Alloc)?;
-            self.buf_base.resize(block_size as usize, 0);
         }
 
         let hs;
@@ -454,19 +457,69 @@ impl MatchFinder {
         // C: "aligned size is not required here, but it can be better for some loops"
         new_size = (new_size + NUM_REFS_ALIGN_MASK) & !NUM_REFS_ALIGN_MASK;
 
+        Ok(Plan {
+            block_size,
+            hash_size_sum,
+            num_refs: new_size,
+        })
+    }
+
+    /// What [`MatchFinder::create`] would allocate for this configuration, in
+    /// bytes: the window plus the hash and son tables.
+    pub(crate) fn mem_usage(
+        &mut self,
+        history_size: u32,
+        keep_add_buffer_before: u32,
+        match_max_len: u32,
+        keep_add_buffer_after: u32,
+    ) -> Result<u64, Error> {
+        let plan = self.plan(
+            history_size,
+            keep_add_buffer_before,
+            match_max_len,
+            keep_add_buffer_after,
+        )?;
+        Ok(u64::from(plan.block_size) + (plan.num_refs as u64) * 4)
+    }
+
+    /// C: `MatchFinder_Create`.
+    pub(crate) fn create(
+        &mut self,
+        history_size: u32,
+        keep_add_buffer_before: u32,
+        match_max_len: u32,
+        keep_add_buffer_after: u32,
+    ) -> Result<(), Error> {
+        let plan = self.plan(
+            history_size,
+            keep_add_buffer_before,
+            match_max_len,
+            keep_add_buffer_after,
+        )?;
+
+        if self.buf_base.is_empty() || self.block_size != plan.block_size {
+            // C: `LzInWindow_Create2`.
+            self.block_size = plan.block_size;
+            self.buf_base = Vec::new();
+            self.buf_base
+                .try_reserve_exact(plan.block_size as usize)
+                .map_err(|_| Error::Alloc)?;
+            self.buf_base.resize(plan.block_size as usize, 0);
+        }
+
         // C 22.02: "we don't reallocate buffer, if old size is enough"
-        if !self.hash.is_empty() && self.num_refs >= new_size {
-            self.son_base = hash_size_sum;
+        if !self.hash.is_empty() && self.num_refs >= plan.num_refs {
+            self.son_base = plan.hash_size_sum;
             return Ok(());
         }
 
         self.hash = Vec::new();
-        self.num_refs = new_size;
+        self.num_refs = plan.num_refs;
         self.hash
-            .try_reserve_exact(new_size)
+            .try_reserve_exact(plan.num_refs)
             .map_err(|_| Error::Alloc)?;
-        self.hash.resize(new_size, 0);
-        self.son_base = hash_size_sum;
+        self.hash.resize(plan.num_refs, 0);
+        self.son_base = plan.hash_size_sum;
         Ok(())
     }
 

@@ -1,14 +1,22 @@
 //! The LZMA2 encoder.
 //!
-//! C: `CLzma2Enc` in `C/Lzma2Enc.c`, in its single-threaded, solid-block form:
-//! `Lzma2EncInt_EncodeSubblock`, `Lzma2Enc_EncodeMt1`'s `outStream` path, and
-//! `Lzma2Enc_WriteProperties`.
+//! C: `CLzma2Enc` in `C/Lzma2Enc.c` — `Lzma2EncInt_EncodeSubblock`,
+//! `Lzma2Enc_EncodeMt1`, `Lzma2EncProps_Normalize`, `Lzma2Enc_WriteProperties`
+//! and, behind [`Lzma2Encoder::set_threads`], `Lzma2Enc_Encode2`'s `MtCoder`
+//! path over [`crate::enc::mt_coder`].
 //!
-//! What is not ported: `MtCoder.h` and everything `Z7_ST` guards, and with it
-//! `blockSize` other than solid. `Lzma2EncProps_Normalize`'s block-size
-//! arithmetic exists only to divide the input between block threads, so a
-//! single-threaded encoder that always encodes one solid block needs none of
-//! it. `docs/encoder.md` says what adding threads would take.
+//! An LZMA2 stream is a series of *blocks*, each a run of chunks that opens by
+//! resetting the dictionary and so decodes without reference to anything
+//! before it. `blockSize` is how much input one block may cover, and its two
+//! sentinels are the C's: [`BLOCK_SIZE_SOLID`] for one block over everything —
+//! the default, and what this encoder did before threads existed — and
+//! [`BLOCK_SIZE_AUTO`] for the size `Lzma2EncProps_Normalize` derives from the
+//! dictionary.
+//!
+//! Blocks are the only parallelism the format has, and the output does not
+//! depend on how many threads produced them: for one `(props, blockSize)` the
+//! bytes are the same at one thread and at sixteen. `docs/encoder.md` says how
+//! that is proved.
 
 use alloc::vec::Vec;
 
@@ -16,6 +24,11 @@ use crate::enc::lzma_enc::LzmaEnc;
 use crate::enc::props::LzmaEncProps;
 use crate::enc::stream::{LimitedSeqInStream, SeqInStream, SeqOutStream, SliceStream};
 use crate::error::Error;
+
+#[cfg(feature = "std")]
+use crate::enc::mt_coder::{BLOCKS_MAX, MtCoder, MtCoderCallback, MtInput, THREADS_MAX};
+#[cfg(feature = "std")]
+use std::sync::Mutex;
 
 /// C: `LZMA2_CONTROL_LZMA`.
 const CONTROL_LZMA: u8 = 1 << 7;
@@ -33,18 +46,53 @@ const UNPACK_SIZE_MAX: u32 = 1 << 21;
 /// C: `LZMA2_CHUNK_SIZE_COMPRESSED_MAX`.
 const CHUNK_SIZE_COMPRESSED_MAX: usize = (1 << 16) + 16;
 
+/// C: `LZMA2_ENC_PROPS_BLOCK_SIZE_SOLID`. One block for the whole input.
+pub const BLOCK_SIZE_SOLID: u64 = u64::MAX;
+/// C: `LZMA2_ENC_PROPS_BLOCK_SIZE_AUTO`. The size [`auto_block_size`] derives
+/// from the dictionary.
+pub const BLOCK_SIZE_AUTO: u64 = 0;
+
+/// The largest thread count [`Lzma2Encoder::set_threads`] will take. Without
+/// `std` there are no threads at all and the encoder is always solid.
+#[cfg(feature = "std")]
+const THREADS_LIMIT: usize = THREADS_MAX;
+#[cfg(not(feature = "std"))]
+const THREADS_LIMIT: usize = 1;
+
 /// C: `LZMA2_DIC_SIZE_FROM_PROP(p)`.
 const fn dic_size_from_prop(p: u32) -> u32 {
     (2 | (p & 1)) << (p / 2 + 11)
 }
 
-/// An LZMA2 encoder: one solid block of LZMA2 chunks, ending in the
-/// end-of-stream control byte.
+/// The block size `Lzma2EncProps_Normalize` derives from a dictionary size.
 ///
-/// C: `CLzma2EncHandle` driven by `Lzma2Enc_Encode2`.
-pub struct Lzma2Encoder {
-    /// C: `CLzma2EncInt`, whose one `enc` this is.
+/// C: the `LZMA2_ENC_PROPS_BLOCK_SIZE_AUTO` arm of `Lzma2EncProps_Normalize` —
+/// four dictionaries, held between 1 MiB and 256 MiB, never below the
+/// dictionary itself, rounded up to a whole megabyte.
+#[must_use]
+pub const fn auto_block_size(dict_size: u32) -> u64 {
+    const K_MIN_SIZE: u64 = 1 << 20;
+    const K_MAX_SIZE: u64 = 1 << 28;
+    let mut block_size = (dict_size as u64) << 2;
+    if block_size < K_MIN_SIZE {
+        block_size = K_MIN_SIZE;
+    }
+    if block_size > K_MAX_SIZE {
+        block_size = K_MAX_SIZE;
+    }
+    if block_size < dict_size as u64 {
+        block_size = dict_size as u64;
+    }
+    block_size += K_MIN_SIZE - 1;
+    block_size &= !(K_MIN_SIZE - 1);
+    block_size
+}
+
+/// C: `CLzma2EncInt`, one block coder. The threaded path keeps one of these
+/// per thread (`me->coders[coderIndex]`); the single-threaded path has one.
+pub(crate) struct Lzma2EncInt {
     enc: alloc::boxed::Box<LzmaEnc>,
+    /// C: `p->propsByte`, captured by `Lzma2EncInt_InitStream`.
     props_byte: u8,
     dict_size: u32,
     /// C: `p->needInitState`.
@@ -55,24 +103,11 @@ pub struct Lzma2Encoder {
     src_pos: u64,
     /// C: `me->tempBufLzma`.
     temp: Vec<u8>,
-    /// C: `me->expectedDataSize`.
-    expected_data_size: u64,
 }
 
-impl Lzma2Encoder {
-    /// C: `Lzma2Enc_Create` plus `Lzma2Enc_SetProps`, with
-    /// `Lzma2EncInt_InitStream`'s property capture folded in.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Param`] if a setting is out of range — including `lc + lp`
-    /// above 4, which LZMA2 does not allow — and [`Error::Alloc`] on
-    /// allocation failure.
-    pub fn new(props: &LzmaEncProps) -> Result<Self, Error> {
-        // C: `Lzma2Enc_SetProps` refuses lc + lp above `LZMA2_LCLP_MAX`,
-        // which is what an LZMA2 decoder is allowed to allocate for.
-        props.check_lclp_for_lzma2()?;
-
+impl Lzma2EncInt {
+    /// C: `LzmaEnc_Create` plus `Lzma2EncInt_InitStream`'s property capture.
+    pub(crate) fn new(props: &LzmaEncProps) -> Result<Self, Error> {
         let mut enc = alloc::boxed::Box::new(LzmaEnc::new()?);
         enc.set_props(props)?;
         let props_byte = enc.write_properties()[0];
@@ -82,7 +117,7 @@ impl Lzma2Encoder {
         temp.try_reserve_exact(CHUNK_SIZE_COMPRESSED_MAX)
             .map_err(|_| Error::Alloc)?;
 
-        Ok(Lzma2Encoder {
+        Ok(Lzma2EncInt {
             enc,
             props_byte,
             dict_size,
@@ -90,35 +125,7 @@ impl Lzma2Encoder {
             need_init_prop: true,
             src_pos: 0,
             temp,
-            expected_data_size: u64::MAX,
         })
-    }
-
-    /// The single LZMA2 property byte, as the `.xz` filter and the 7z coder
-    /// carry it.
-    ///
-    /// C: `Lzma2Enc_WriteProperties`.
-    #[must_use]
-    pub fn properties(&self) -> u8 {
-        let mut i = 0u32;
-        while i < 40 {
-            if self.dict_size <= dic_size_from_prop(i) {
-                break;
-            }
-            i += 1;
-        }
-        i as u8
-    }
-
-    /// The dictionary size the property byte rounds up to.
-    #[must_use]
-    pub fn dict_size(&self) -> u32 {
-        self.dict_size
-    }
-
-    /// C: `Lzma2Enc_SetDataSize`.
-    pub fn set_data_size(&mut self, expected: u64) {
-        self.expected_data_size = expected;
     }
 
     /// C: `Lzma2EncInt_InitBlock`.
@@ -128,50 +135,90 @@ impl Lzma2Encoder {
         self.need_init_prop = true;
     }
 
-    /// Encode `input` into `out` as one LZMA2 stream.
+    /// C: `Lzma2Enc_EncodeMt1`'s `inStream` path, the whole loop over blocks.
     ///
-    /// C: `Lzma2Enc_Encode2`'s `outStream` path, with `blockSize` solid, so
-    /// there is exactly one block and the loop over blocks runs once.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the streams return, or [`Error::Alloc`].
-    pub fn encode(
+    /// `expected_data_size` is `me->expectedDataSize` and `finished` is the C's
+    /// argument of that name: whether the end-of-stream control byte belongs at
+    /// the end.
+    fn encode_mt1_stream(
         &mut self,
         input: &mut dyn SeqInStream,
         out: &mut dyn SeqOutStream,
+        block_size: u64,
+        expected_data_size: u64,
+        finished: bool,
+    ) -> Result<(), Error> {
+        let mut unpack_total = 0u64;
+        let mut limited = LimitedSeqInStream::new(input);
+        loop {
+            self.init_block();
+            limited.reset(block_size);
+
+            // C: `expected = me->expectedDataSize - unpackTotal`, clamped to
+            // the block. It only sizes the hash table, but it does change the
+            // bytes, so the memory path must agree with it.
+            let mut expected = u64::MAX;
+            if expected_data_size != u64::MAX && expected_data_size >= unpack_total {
+                expected = expected_data_size - unpack_total;
+            }
+            if block_size != BLOCK_SIZE_SOLID && expected > block_size {
+                expected = block_size;
+            }
+            self.enc.set_data_size(expected);
+            self.enc.prepare(UNPACK_SIZE_MAX)?;
+
+            loop {
+                let pack_size = self.encode_subblock(&mut limited, out)?;
+                if pack_size == 0 {
+                    break;
+                }
+            }
+
+            if self.src_pos != limited.processed {
+                return Err(Error::InternalFailure);
+            }
+            unpack_total += self.src_pos;
+
+            if limited.finished {
+                if finished {
+                    out.write(&[CONTROL_EOF])?;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    /// C: `Lzma2Enc_EncodeMt1`'s `inData` path, which is what the `MtCoder`
+    /// callback drives: `src` is already at most one block, so the C's loop
+    /// over blocks runs once.
+    #[cfg(feature = "std")]
+    pub(crate) fn encode_mt1_mem(
+        &mut self,
+        src: &[u8],
+        out: &mut dyn SeqOutStream,
+        finished: bool,
     ) -> Result<(), Error> {
         self.init_block();
-
-        let mut limited = LimitedSeqInStream::new(input);
-        self.enc.set_data_size(self.expected_data_size);
-        self.enc.prepare(UNPACK_SIZE_MAX)?;
-
+        // C: `LzmaEnc_MemPrepare`, whose `MatchFinder_SET_DIRECT_INPUT_BUF`
+        // also sets `expectedDataSize` from the block's length — which is what
+        // makes this byte for byte what the stream path above produces for the
+        // same block. `SliceStream` stands in for `directInput`; see
+        // `crate::enc::stream`.
+        let mut input = SliceStream::new(src);
+        self.enc.mem_prepare(src.len() as u64, UNPACK_SIZE_MAX)?;
         loop {
-            let pack_size = self.encode_subblock(&mut limited, out)?;
+            let pack_size = self.encode_subblock(&mut input, out)?;
             if pack_size == 0 {
                 break;
             }
         }
-
-        if self.src_pos != limited.processed {
+        if self.src_pos != src.len() as u64 {
             return Err(Error::InternalFailure);
         }
-
-        out.write(&[CONTROL_EOF])
-    }
-
-    /// Encode a slice into one LZMA2 stream.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Alloc`] if the output could not be grown.
-    pub fn encode_to_vec(&mut self, src: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
-        let mut input = SliceStream::new(src);
-        self.set_data_size(src.len() as u64);
-        self.encode(&mut input, &mut out)?;
-        Ok(out)
+        if finished {
+            out.write(&[CONTROL_EOF])?;
+        }
+        Ok(())
     }
 
     /// C: `Lzma2EncInt_EncodeSubblock`, in the `outStream` form. Returns how
@@ -258,6 +305,403 @@ impl Lzma2Encoder {
     }
 }
 
+/// An LZMA2 encoder: blocks of LZMA2 chunks, ending in the end-of-stream
+/// control byte.
+///
+/// C: `CLzma2EncHandle` driven by `Lzma2Enc_Encode2`.
+pub struct Lzma2Encoder {
+    props: LzmaEncProps,
+    /// C: `me->coders[0]`, the coder the single-threaded path uses.
+    coder: Lzma2EncInt,
+    dict_size: u32,
+    /// C: `props.blockSize`.
+    block_size: u64,
+    /// C: `props.numBlockThreads_Max`.
+    threads: usize,
+    /// The memory the block threads may take together, `u64::MAX` for no
+    /// limit.
+    mem_limit: u64,
+    /// C: `me->expectedDataSize`.
+    expected_data_size: u64,
+    /// What [`Lzma2Encoder::coder`] was built with, so that a change of block
+    /// size can be noticed.
+    coder_props: LzmaEncProps,
+}
+
+impl Lzma2Encoder {
+    /// C: `Lzma2Enc_Create` plus `Lzma2Enc_SetProps`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Param`] if a setting is out of range — including `lc + lp`
+    /// above 4, which LZMA2 does not allow — and [`Error::Alloc`] on
+    /// allocation failure.
+    pub fn new(props: &LzmaEncProps) -> Result<Self, Error> {
+        // C: `Lzma2Enc_SetProps` refuses lc + lp above `LZMA2_LCLP_MAX`,
+        // which is what an LZMA2 decoder is allowed to allocate for.
+        props.check_lclp_for_lzma2()?;
+        let coder = Lzma2EncInt::new(props)?;
+        let dict_size = coder.dict_size;
+        Ok(Lzma2Encoder {
+            props: *props,
+            coder,
+            dict_size,
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+            mem_limit: u64::MAX,
+            expected_data_size: u64::MAX,
+            coder_props: *props,
+        })
+    }
+
+    /// The LZMA settings a block is actually encoded with.
+    ///
+    /// C: the `reduceSize` dance at the top of `Lzma2EncProps_Normalize` — a
+    /// block smaller than the file is all the dictionary a block coder can
+    /// ever see, so `LzmaEncProps_Normalize` is told to shrink the dictionary
+    /// to it. A solid or automatic block size leaves the settings alone, which
+    /// is why `Lzma2Encoder::new` can normalize before the block size is
+    /// known.
+    fn effective_props(&self) -> LzmaEncProps {
+        let mut p = self.props;
+        let bs = self.block_size;
+        if bs != BLOCK_SIZE_SOLID
+            && bs != BLOCK_SIZE_AUTO
+            && (bs < p.reduce_size || p.reduce_size == u64::MAX)
+        {
+            p.reduce_size = bs;
+        }
+        p
+    }
+
+    /// Rebuilds the single-threaded coder if the block size has changed what
+    /// [`Lzma2Encoder::effective_props`] resolves to.
+    fn sync_coder(&mut self) -> Result<(), Error> {
+        let want = self.effective_props();
+        if want == self.coder_props {
+            return Ok(());
+        }
+        self.coder = Lzma2EncInt::new(&want)?;
+        self.dict_size = self.coder.dict_size;
+        self.coder_props = want;
+        Ok(())
+    }
+
+    /// The single LZMA2 property byte, as the `.xz` filter and the 7z coder
+    /// carry it.
+    ///
+    /// C: `Lzma2Enc_WriteProperties`.
+    #[must_use]
+    pub fn properties(&self) -> u8 {
+        let dict_size = self.dict_size();
+        let mut i = 0u32;
+        while i < 40 {
+            if dict_size <= dic_size_from_prop(i) {
+                break;
+            }
+            i += 1;
+        }
+        i as u8
+    }
+
+    /// The dictionary size the property byte rounds up to, with the block
+    /// size's effect on it applied.
+    #[must_use]
+    pub fn dict_size(&self) -> u32 {
+        self.effective_props().normalized().dict_size
+    }
+
+    /// C: `Lzma2Enc_SetDataSize`.
+    pub fn set_data_size(&mut self, expected: u64) {
+        self.expected_data_size = expected;
+    }
+
+    /// How much input one block may cover.
+    ///
+    /// C: `props.blockSize`. [`BLOCK_SIZE_SOLID`] is the default and is one
+    /// block for the whole input; [`BLOCK_SIZE_AUTO`] is [`auto_block_size`]
+    /// of the dictionary.
+    pub fn set_block_size(&mut self, block_size: u64) {
+        self.block_size = block_size;
+    }
+
+    /// The block size in force, with the sentinels resolved.
+    ///
+    /// C: `p->blockSize` after `Lzma2EncProps_Normalize`.
+    #[must_use]
+    pub fn block_size(&self) -> u64 {
+        match self.block_size {
+            BLOCK_SIZE_AUTO => {
+                if self.threads <= 1 {
+                    // C: "if there is no block multi-threading, we use SOLID
+                    // block".
+                    BLOCK_SIZE_SOLID
+                } else {
+                    auto_block_size(self.dict_size())
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// How many threads may compress blocks at once.
+    ///
+    /// C: `props.numBlockThreads_Max`. One is the default and is the
+    /// single-threaded path, byte for byte as before block threads existed.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.clamp(1, THREADS_LIMIT);
+    }
+
+    /// A ceiling on the memory the block threads may take together.
+    ///
+    /// C: the reduction 7-Zip applies for `mt` when `memUsage` is set — the
+    /// thread count comes down until the estimate fits, and never below one.
+    pub fn set_mem_limit(&mut self, bytes: u64) {
+        self.mem_limit = bytes;
+    }
+
+    /// What one block thread is estimated to need, in bytes.
+    ///
+    /// The estimate is this port's own allocation arithmetic — the match
+    /// finder's window and reference tables, the encoder's literal probability
+    /// arrays, and the block's output buffer — not a formula taken from
+    /// 7-Zip's C++.
+    #[must_use]
+    pub fn mem_usage_per_thread(&mut self) -> u64 {
+        let block = match self.block_size() {
+            BLOCK_SIZE_SOLID => u64::from(self.dict_size()),
+            other => other,
+        };
+        // C: `destBlockSize` in `Lzma2Enc_Encode2`, plus the block's own copy
+        // of the input that `MtCoder` holds.
+        let bufs = block + (block >> 10) + 16 + block;
+        let _ = self.sync_coder();
+        self.coder.enc.mem_usage().saturating_add(bufs)
+    }
+
+    /// The thread count after the memory limit and the number of blocks have
+    /// been applied.
+    ///
+    /// C: `numBlockThreads_Reduced`.
+    #[must_use]
+    pub fn threads_reduced(&mut self) -> usize {
+        if self.block_size() == BLOCK_SIZE_SOLID {
+            // C: a solid block is one block, so it is one thread.
+            return 1;
+        }
+        let mut t = self.threads;
+        if self.mem_limit != u64::MAX {
+            let per = self.mem_usage_per_thread().max(1);
+            let fits = (self.mem_limit / per) as usize;
+            t = t.min(fits.max(1));
+        }
+        // C: "if (numBlocks < t2) t2r = numBlocks", once the data size is
+        // known.
+        if self.expected_data_size != u64::MAX {
+            let num_blocks = self.expected_data_size.div_ceil(self.block_size()).max(1);
+            if num_blocks < t as u64 {
+                t = num_blocks as usize;
+            }
+        }
+        t.max(1)
+    }
+
+    /// Encode `input` into `out` as one LZMA2 stream.
+    ///
+    /// C: `Lzma2Enc_Encode2`'s `outStream` path, which is single-threaded
+    /// whatever [`Lzma2Encoder::set_threads`] says: the C's `MtCoder` path
+    /// takes its input as memory. [`Lzma2Encoder::encode_slice`] is the one
+    /// that threads.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the streams return, or [`Error::Alloc`].
+    pub fn encode(
+        &mut self,
+        input: &mut dyn SeqInStream,
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), Error> {
+        self.sync_coder()?;
+        let block_size = self.block_size();
+        self.coder
+            .encode_mt1_stream(input, out, block_size, self.expected_data_size, true)
+    }
+
+    /// Encode a slice into one LZMA2 stream.
+    ///
+    /// C: `Lzma2Enc_Encode2` with `inData`, which is where the `MtCoder` path
+    /// lives. With more than one thread and a block size other than
+    /// [`BLOCK_SIZE_SOLID`] the blocks are compressed in parallel; the bytes
+    /// are the same either way.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the output stream returns, or [`Error::Alloc`].
+    /// The sink must be [`Send`] because with more than one thread the worker
+    /// that finished a block is the one that writes it, in order. C: the same
+    /// `ISeqOutStream` is reached from `Lzma2Enc_MtCallback_Write` on whichever
+    /// thread holds the write turn.
+    pub fn encode_slice(
+        &mut self,
+        src: &[u8],
+        out: &mut (dyn SeqOutStream + Send),
+    ) -> Result<(), Error> {
+        self.sync_coder()?;
+        #[cfg(feature = "std")]
+        {
+            let threads = self.threads_reduced();
+            if threads > 1 {
+                return self.encode_slice_mt(src, out, threads);
+            }
+        }
+        let mut input = SliceStream::new(src);
+        self.encode(&mut input, out)
+    }
+
+    /// Encode a slice into a fresh `Vec`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if the output could not be grown.
+    pub fn encode_to_vec(&mut self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.set_data_size(src.len() as u64);
+        self.encode_slice(src, &mut out)?;
+        Ok(out)
+    }
+
+    /// Encode a stream with block threads.
+    ///
+    /// C: `Lzma2Enc_Encode2`'s `inStream` argument reaching `MtCoder`, which
+    /// reads one block at a time on whichever thread holds the read token.
+    ///
+    /// Unlike [`Lzma2Encoder::encode_slice`], this does not in general produce
+    /// what [`Lzma2Encoder::encode`] produces for the same input: a block read
+    /// from a stream is encoded knowing its own length, whereas the
+    /// single-threaded loop tells the encoder the block size until the stream
+    /// runs out, and the expected data size changes how the match finder's
+    /// hash table is sized. Give [`Lzma2Encoder::set_data_size`] the real
+    /// length and the two agree. Either way the output is deterministic for a
+    /// given `(props, block size, data size)` and does not depend on the
+    /// thread count.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the streams return, or [`Error::Alloc`].
+    #[cfg(feature = "std")]
+    pub fn encode_mt(
+        &mut self,
+        input: &mut (dyn SeqInStream + Send),
+        out: &mut (dyn SeqOutStream + Send),
+    ) -> Result<(), Error> {
+        self.sync_coder()?;
+        let threads = self.threads_reduced();
+        if threads <= 1 {
+            return self.encode(input, out);
+        }
+        self.run_mt(MtInput::Stream(Mutex::new(input)), out, threads)
+    }
+
+    /// C: the `p->props.numBlockThreads_Reduced > 1` arm of
+    /// `Lzma2Enc_Encode2`.
+    #[cfg(feature = "std")]
+    fn encode_slice_mt(
+        &mut self,
+        src: &[u8],
+        out: &mut (dyn SeqOutStream + Send),
+        threads: usize,
+    ) -> Result<(), Error> {
+        self.run_mt(MtInput::Data(src), out, threads)
+    }
+
+    /// The body both threaded entry points share: build the per-thread coders
+    /// and the per-block output buffers, then hand them to `MtCoder`.
+    #[cfg(feature = "std")]
+    fn run_mt(
+        &mut self,
+        input: MtInput<'_>,
+        out: &mut (dyn SeqOutStream + Send),
+        threads: usize,
+    ) -> Result<(), Error> {
+        let block_size = usize::try_from(self.block_size()).map_err(|_| Error::Param)?;
+        let props = self.coder_props;
+
+        // C: `me->coders[i]`, one per block thread, and `me->outBufs[i]`, one
+        // per block in flight. The C allocates the out buffers at
+        // `destBlockSize` and passes them to `MtCoder` by index; here they are
+        // growable and behind mutexes, so an incompressible block cannot
+        // overflow one.
+        let mut coders = Vec::new();
+        coders
+            .try_reserve_exact(threads)
+            .map_err(|_| Error::Alloc)?;
+        for _ in 0..threads {
+            coders.push(Mutex::new(Lzma2EncInt::new(&props)?));
+        }
+        let mut out_bufs = Vec::new();
+        out_bufs
+            .try_reserve_exact(BLOCKS_MAX)
+            .map_err(|_| Error::Alloc)?;
+        for _ in 0..BLOCKS_MAX {
+            out_bufs.push(Mutex::new(Vec::new()));
+        }
+
+        let cb = Lzma2MtCallback {
+            coders,
+            out_bufs,
+            out: Mutex::new(out),
+        };
+        MtCoder {
+            block_size,
+            num_threads_max: threads,
+            expected_data_size: self.expected_data_size,
+            input,
+            callback: &cb,
+        }
+        .code()
+    }
+}
+
+/// C: `Lzma2Enc_MtCallback_Code` and `Lzma2Enc_MtCallback_Write`.
+#[cfg(feature = "std")]
+struct Lzma2MtCallback<'o> {
+    coders: Vec<Mutex<Lzma2EncInt>>,
+    out_bufs: Vec<Mutex<Vec<u8>>>,
+    out: Mutex<&'o mut (dyn SeqOutStream + Send)>,
+}
+
+#[cfg(feature = "std")]
+impl MtCoderCallback for Lzma2MtCallback<'_> {
+    /// C: `Lzma2Enc_MtCallback_Code`.
+    fn code(
+        &self,
+        coder_index: usize,
+        out_buf_index: usize,
+        src: &[u8],
+        finished: bool,
+    ) -> Result<(), Error> {
+        let mut dest = self.out_bufs[out_buf_index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dest.clear();
+        let mut coder = self.coders[coder_index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        coder.encode_mt1_mem(src, &mut *dest, finished)
+    }
+
+    /// C: `Lzma2Enc_MtCallback_Write`.
+    fn write(&self, out_buf_index: usize) -> Result<(), Error> {
+        let data = self.out_bufs[out_buf_index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(&data)
+    }
+}
+
 /// Encode `src` as a raw LZMA2 stream, returning it with its property byte.
 ///
 /// # Errors
@@ -266,6 +710,28 @@ impl Lzma2Encoder {
 /// allocation failure.
 pub fn encode_lzma2(src: &[u8], props: &LzmaEncProps) -> Result<(u8, Vec<u8>), Error> {
     let mut enc = Lzma2Encoder::new(props)?;
+    let out = enc.encode_to_vec(src)?;
+    Ok((enc.properties(), out))
+}
+
+/// Encode `src` as a raw LZMA2 stream with block threads.
+///
+/// `block_size` is how much input one block may cover ([`BLOCK_SIZE_AUTO`] to
+/// take it from the dictionary), `threads` how many blocks may be compressed at
+/// once. The bytes do not depend on `threads`.
+///
+/// # Errors
+///
+/// As [`encode_lzma2`].
+pub fn encode_lzma2_mt(
+    src: &[u8],
+    props: &LzmaEncProps,
+    block_size: u64,
+    threads: usize,
+) -> Result<(u8, Vec<u8>), Error> {
+    let mut enc = Lzma2Encoder::new(props)?;
+    enc.set_block_size(block_size);
+    enc.set_threads(threads);
     let out = enc.encode_to_vec(src)?;
     Ok((enc.properties(), out))
 }
@@ -300,15 +766,7 @@ mod tests {
     fn incompressible_input_falls_back_to_stored_chunks() {
         // A stored chunk is what the C writes when the packed size did not beat
         // the unpacked one; random bytes are the case that forces it.
-        let mut x = 0x1234_5678u32;
-        let src: Vec<u8> = (0..200_000)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                x as u8
-            })
-            .collect();
+        let src = pseudo_random(200_000);
         let (_prop, out) = encode_lzma2(&src, &LzmaEncProps::new()).unwrap();
         assert!(
             out.contains(&CONTROL_COPY_NO_RESET) || out[0] == CONTROL_COPY_RESET_DIC,
@@ -328,5 +786,122 @@ mod tests {
         for chunk in src.chunks(16 * 1024) {
             let _ = enc.encode_to_vec(chunk).expect("encode");
         }
+    }
+
+    /// A solid block is what a fresh encoder writes, as it did before block
+    /// threads existed.
+    #[test]
+    fn solid_is_still_the_default() {
+        let mut enc = Lzma2Encoder::new(&LzmaEncProps::new()).unwrap();
+        assert_eq!(enc.block_size(), BLOCK_SIZE_SOLID);
+        assert_eq!(enc.threads_reduced(), 1);
+    }
+
+    /// Blocking the input is the same work whether one thread or several did
+    /// it: same block size, same bytes.
+    #[test]
+    #[cfg(feature = "std")]
+    fn threads_do_not_change_the_bytes() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let src = pseudo_random(300_000);
+        for block_size in [1u64 << 14, 1 << 16, 1 << 20, 400_000, 100_000] {
+            let mut one = Lzma2Encoder::new(&props).unwrap();
+            one.set_block_size(block_size);
+            let want = one.encode_to_vec(&src).unwrap();
+            for threads in [2usize, 3, 8] {
+                let mut enc = Lzma2Encoder::new(&props).unwrap();
+                enc.set_block_size(block_size);
+                enc.set_threads(threads);
+                let got = enc.encode_to_vec(&src).unwrap();
+                assert_eq!(got, want, "block {block_size}, {threads} threads");
+            }
+        }
+    }
+
+    /// An exact multiple of the block size has no trailing partial block, and
+    /// an empty input is still a well-formed stream.
+    #[test]
+    #[cfg(feature = "std")]
+    fn block_boundaries_and_empty_input() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        for len in [0usize, 1, 65_536, 131_072] {
+            let src = pseudo_random(len);
+            let mut one = Lzma2Encoder::new(&props).unwrap();
+            one.set_block_size(1 << 16);
+            let want = one.encode_to_vec(&src).unwrap();
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_block_size(1 << 16);
+            enc.set_threads(4);
+            assert_eq!(enc.encode_to_vec(&src).unwrap(), want, "len {len}");
+            assert_eq!(*want.last().unwrap(), CONTROL_EOF, "len {len}");
+        }
+    }
+
+    /// Told the real data size, the threaded stream path agrees with the
+    /// single-threaded one byte for byte.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_threaded_stream_path_matches_the_single_threaded_one() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let src = pseudo_random(250_000);
+        for block_size in [1u64 << 15, 1 << 16, 120_000] {
+            let mut one = Lzma2Encoder::new(&props).unwrap();
+            one.set_block_size(block_size);
+            one.set_data_size(src.len() as u64);
+            let mut want = Vec::new();
+            one.encode(&mut SliceStream::new(&src), &mut want).unwrap();
+
+            for threads in [2usize, 5] {
+                let mut enc = Lzma2Encoder::new(&props).unwrap();
+                enc.set_block_size(block_size);
+                enc.set_threads(threads);
+                enc.set_data_size(src.len() as u64);
+                let mut got = Vec::new();
+                enc.encode_mt(&mut SliceStream::new(&src), &mut got)
+                    .unwrap();
+                assert_eq!(got, want, "block {block_size}, {threads} threads");
+            }
+        }
+    }
+
+    /// The memory limit brings the thread count down, and never below one.
+    #[test]
+    fn the_memory_limit_reduces_the_thread_count() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 20);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        enc.set_block_size(1 << 22);
+        enc.set_threads(16);
+        enc.set_data_size(1 << 30);
+        let per = enc.mem_usage_per_thread();
+        assert!(per > 0);
+        enc.set_mem_limit(per * 4);
+        assert_eq!(enc.threads_reduced(), 4);
+        enc.set_mem_limit(1);
+        assert_eq!(enc.threads_reduced(), 1);
+    }
+
+    /// The thread count also comes down to the number of blocks there are.
+    #[test]
+    fn fewer_blocks_than_threads_reduces_the_thread_count() {
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        enc.set_block_size(1 << 16);
+        enc.set_threads(16);
+        enc.set_data_size(3 * (1 << 16));
+        assert_eq!(enc.threads_reduced(), 3);
+    }
+
+    /// Bytes that do not compress, so the stored-chunk path and the block
+    /// boundaries both get exercised.
+    fn pseudo_random(len: usize) -> Vec<u8> {
+        let mut x = 0x1234_5678u32;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
     }
 }
