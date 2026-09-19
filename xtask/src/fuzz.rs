@@ -27,10 +27,11 @@ const WHOLE: u8 = 0x0F;
 
 /// Every target a fuzzing run covers.
 ///
-/// `differential` compares the decode loops with the C's; `encode_round_trip`
-/// asks the question the C cannot answer, which is that whatever this encoder
-/// produces, this crate's own decoders return.
-const TARGETS: &[&str] = &["differential", "encode_round_trip"];
+/// `differential` compares the decode loops with the C's and
+/// `encode_differential` the encoders; `encode_round_trip` asks the question
+/// the C cannot answer, which is that whatever this encoder produces, this
+/// crate's own decoders return.
+const TARGETS: &[&str] = &["differential", "encode_round_trip", "encode_differential"];
 
 /// The shortest slot worth starting: below this libFuzzer spends it loading
 /// the corpus.
@@ -108,7 +109,9 @@ pub fn fuzz_check(_args: impl Iterator<Item = String>) -> ExitCode {
 fn seed(root: &Path, target: &str, corpus: &Path) -> Result<(), String> {
     match target {
         "differential" => seed_differential(root, corpus),
-        "encode_round_trip" | "encode_differential" => seed_encode(root, corpus),
+        // The two encode targets read a settings prefix of their own length.
+        "encode_round_trip" => seed_encode(root, corpus, 4),
+        "encode_differential" => seed_encode(root, corpus, 6),
         other => Err(format!("no seeds defined for {other}")),
     }
 }
@@ -144,16 +147,19 @@ fn seed_differential(root: &Path, corpus: &Path) -> Result<(), String> {
 /// An encoder wants plausible input, not a compressed stream: `src_*.bin` are
 /// the plain bytes - text, random, zeros, a mixture - already in the
 /// repository with a generator that explains every one.
-fn seed_encode(root: &Path, corpus: &Path) -> Result<(), String> {
+fn seed_encode(root: &Path, corpus: &Path, prefix: usize) -> Result<(), String> {
     // Four prefixes, so each source arrives at more than one setting: a
     // hash-chain finder and a binary-tree one, a fast level and an optimal
     // one. The fourth byte is the encode targets' container and thread
-    // selector.
-    const PREFIXES: [(&str, [u8; 4]); 4] = [
-        ("hc4-l1", [0, 4, 1, 0]),
-        ("bt4-l9", [4, 6, 9, 0x5A]),
-        ("bt2-l5", [2, 0, 5, 0xA5]),
-        ("bt5-l0", [5, 7, 0, 0xFF]),
+    // selector. `encode_differential` reads its settings in a different order
+    // and two bytes further, so the last two are for it and the others take
+    // the first four; either way each seed covers more than one shape, which
+    // is all a seed has to do.
+    const PREFIXES: [(&str, [u8; 6]); 4] = [
+        ("hc4-l1", [0, 4, 1, 0, 0, 0]),
+        ("bt4-l9", [4, 6, 9, 0x5A, 3, 1]),
+        ("bt2-l5", [2, 0, 5, 0xA5, 1, 2]),
+        ("bt5-l0", [5, 7, 0, 0xFF, 4, 7]),
     ];
     let dir = root.join("tests/data");
     for path in entries(&dir)? {
@@ -162,7 +168,7 @@ fn seed_encode(root: &Path, corpus: &Path) -> Result<(), String> {
         }
         let bytes = fs::read(&path).map_err(|e| e.to_string())?;
         for (tag, cfg) in PREFIXES {
-            let mut seed = cfg.to_vec();
+            let mut seed = cfg[..prefix].to_vec();
             seed.extend_from_slice(&bytes);
             write_seed(corpus, &format!("{tag}-{}", name_of(&path)), &seed)?;
         }

@@ -686,13 +686,18 @@ jobs:
           toolchain: nightly-2026-09-01
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
-      # With the SDK, so the differential target is built with its oracle in
-      # rather than in the shape that compares the crate with itself.
+      # With the SDK, so the two differential targets are built with their
+      # oracles in rather than in the shape that compares the crate with
+      # itself.
       - name: Fetch the pinned LZMA SDK
         run: cargo "+$FUZZ_TOOLCHAIN" xtask sdk "$RUNNER_TEMP/lzma-sdk"
       - name: Every fuzz target builds
         env:
           LZMA_ORACLE_REQUIRE: "1"
+          # The encoder oracle too: `encode_differential` links the SDK's
+          # encoder, and a build without it would compile to a target that
+          # returns immediately.
+          LZMA_ENCODER_ORACLE_REQUIRE: "1"
         run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo xtask fuzz-check
 
   fuzz-differential:

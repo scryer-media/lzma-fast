@@ -1,0 +1,19 @@
+[package]
+name = "sdk-encoder"
+description = "The LZMA SDK's own encoder, built from a pinned checkout to test lzma-turbo's against"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-turbo"
+publish = false
+build = "build.rs"
+
+[dependencies]
+# The encoder and the .xz writer; without `crypto`, so this does not build
+# AWS-LC for an oracle that has nothing to check.
+lzma-turbo = { path = "../..", default-features = false, features = ["std", "enc", "xz", "native-crypto"] }
+
+[build-dependencies]
+cc = "1.4.6"
+sha2 = "0.11.0"

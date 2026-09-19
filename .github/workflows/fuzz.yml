@@ -2,8 +2,10 @@ name: fuzz
 
 # Every fuzz target, sharing one budget: `differential` (lzma-turbo's assembly
 # and portable decode loops against the LZMA SDK's C and assembly ones, call
-# for call) and `encode_round_trip` (whatever this encoder writes, these
-# decoders must return). CI calls this for a short run on every change; the schedule
+# for call), `encode_round_trip` (whatever this encoder writes, these
+# decoders must return) and `encode_differential` (this encoder's bytes
+# against the SDK encoder's, at settings the fuzzer picks too).
+# CI calls this for a short run on every change; the schedule
 # runs it for half an hour a night on both architectures that carry an
 # assembly loop.
 on:
@@ -60,6 +62,9 @@ jobs:
       - name: Fuzz
         env:
           LZMA_ORACLE_REQUIRE_ASM: "1"
+          # And the encoder oracle `encode_differential` compares against: a
+          # missing SDK would leave that target fuzzing nothing at all.
+          LZMA_ENCODER_ORACLE_REQUIRE: "1"
           SECONDS_TO_RUN: ${{ inputs.seconds || 1800 }}
         run: |
           LZMA_SDK="$RUNNER_TEMP/lzma-sdk" \
