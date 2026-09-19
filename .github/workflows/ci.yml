@@ -592,12 +592,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # The external-decode test compares this crate's output with what `xz`
-      # makes of it; without `xz` on PATH it skips, so Linux gets the same
-      # pinned build the container tests use.
+      # The external-decode tests compare this crate's output with what `xz`
+      # and 7-Zip make of it. Both are installed on every platform here, and
+      # required below rather than skipped: the `.xz` frame is the one part of
+      # the writer with no parity oracle, so an external reader that silently
+      # did not run is the difference between proving it and not.
       - name: Install the xz the container tests are written against
-        if: runner.os == 'Linux'
         run: ./.github/scripts/install-xz.sh
+      - name: Install the pinned 7-Zip
+        run: echo "LZMA_TURBO_7ZZ=$(cargo xtask sevenzip | tail -n1)" >> "$GITHUB_ENV"
       # `cargo xtask lzma-util` builds LzmaUtil, the props-driven oracles --
       # including the LZMA1 and LZMA2 ones built without `Z7_ST`, which are the
       # only builds that have `MtCoder.c` and `LzFindMt.c` in them -- and the
@@ -625,7 +628,10 @@ jobs:
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test filter_parity
-      - name: The .xz writer through every reader, and through xz itself
+      - name: The .xz writer through every reader, and through xz and 7-Zip
+        env:
+          LZMA_TURBO_XZ_REQUIRE: "1"
+          LZMA_TURBO_7ZZ_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test xz_encoder
 
   # A fuzz target is in its own workspace under `fuzz/`, so `cargo test`,

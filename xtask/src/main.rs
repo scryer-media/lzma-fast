@@ -22,6 +22,8 @@ cargo xtask vectors     regenerate tests/data and the fuzz seeds; --check compar
 cargo xtask sdk <dir>   fetch the pinned LZMA SDK source the decode loops were ported from
 cargo xtask jwasm <dir> build the pinned JWasm assembler and print its path (Unix)
 cargo xtask xz-tests    fetch XZ Utils' decoder test files, checked against tests/xz-utils.manifest
+cargo xtask sevenzip [dir]
+                        install the pinned 7-Zip console binary and print its path
 cargo xtask lzma-util [dir]
                         build the pinned SDK's reference LZMA encoder for the parity tests
 cargo xtask fuzz <seconds> <workdir>
@@ -39,6 +41,7 @@ fn main() -> ExitCode {
         Some("sdk") => fetch::sdk(args),
         Some("jwasm") => fetch::jwasm(args),
         Some("xz-tests") => fetch::xz_tests(args),
+        Some("sevenzip") => fetch::sevenzip(args),
         Some("lzma-util") => fetch::lzma_util(args),
         Some("fuzz") => fuzz::fuzz(args),
         Some("fuzz-check") => fuzz::fuzz_check(args),

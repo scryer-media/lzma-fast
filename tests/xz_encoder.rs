@@ -191,15 +191,54 @@ fn the_writer_adapters_produce_the_same_bytes_as_the_one_shot_calls() {
     );
 }
 
-/// Is `xz` on PATH, and does it run?
-fn have(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// One of the external decoders: where it is, and whether it must be there.
+///
+/// `LZMA_TURBO_XZ` and `LZMA_TURBO_7ZZ` name the binary, which is how CI
+/// points at the pinned builds `.github/scripts/install-xz.sh` and
+/// `cargo xtask sevenzip` install rather than at whatever the image happens to
+/// carry; without one the plain name is looked up on `PATH`. The matching
+/// `_REQUIRE` variable turns "not installed" from a skip into a failure, as
+/// `LZMA_TURBO_LZMA_UTIL_REQUIRE` already does for the parity oracles: an
+/// external decoder that quietly is not run proves nothing, and the writer is
+/// exactly the part of this crate that has no oracle of its own.
+struct External {
+    var: &'static str,
+    default: &'static str,
+}
+
+const XZ: External = External {
+    var: "LZMA_TURBO_XZ",
+    default: "xz",
+};
+const SEVENZIP: External = External {
+    var: "LZMA_TURBO_7ZZ",
+    default: "7zz",
+};
+
+impl External {
+    /// The binary to run, or `None` with a message - unless the `_REQUIRE`
+    /// variable is set, and then a missing decoder is a failure.
+    fn find(&self) -> Option<String> {
+        let tool = std::env::var(self.var).unwrap_or_else(|_| self.default.to_owned());
+        // `7zz` with no argument prints its banner and exits non-zero, so the
+        // question is whether the process starts at all, not what it says.
+        let runs = Command::new(&tool)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if runs {
+            return Some(tool);
+        }
+        assert!(
+            std::env::var_os(format!("{}_REQUIRE", self.var)).is_none(),
+            "{}_REQUIRE is set but {tool} will not run",
+            self.var
+        );
+        eprintln!("skipping: `{tool}` is not on PATH");
+        None
+    }
 }
 
 /// Runs `tool` with `args` over `input` on stdin and returns stdout.
@@ -264,10 +303,9 @@ fn a_chain_the_format_forbids_is_refused() {
 
 #[test]
 fn xz_itself_accepts_what_this_crate_writes() {
-    if !have("xz") {
-        eprintln!("skipping: `xz` is not on PATH");
+    let Some(xz_tool) = XZ.find() else {
         return;
-    }
+    };
     let dir = tempdir("xz-encoder");
     for (name, data) in corpus() {
         for check in checks() {
@@ -278,14 +316,14 @@ fn xz_itself_accepts_what_this_crate_writes() {
             // producing output.
             let path = dir.join(format!("{name}-{check:?}.xz"));
             std::fs::write(&path, &xz).expect("write");
-            let status = Command::new("xz")
+            let status = Command::new(&xz_tool)
                 .arg("-t")
                 .arg(&path)
                 .status()
                 .expect("run xz -t");
             assert!(status.success(), "xz -t rejected {name}, check {check:?}");
 
-            let got = pipe("xz", &["-dc"], &xz)
+            let got = pipe(&xz_tool, &["-dc"], &xz)
                 .unwrap_or_else(|| panic!("xz -dc failed on {name}, check {check:?}"));
             assert_eq!(got, data, "xz -dc on {name}, check {check:?}");
         }
@@ -293,7 +331,7 @@ fn xz_itself_accepts_what_this_crate_writes() {
         // The `.lzma` writer goes through the same tool, which reads
         // LZMA-Alone with `--format=lzma`.
         let alone = encode_lzma_alone(&data, &LzmaEncProps::new()).expect("encode");
-        let got = pipe("xz", &["-dc", "--format=lzma"], &alone)
+        let got = pipe(&xz_tool, &["-dc", "--format=lzma"], &alone)
             .unwrap_or_else(|| panic!("xz -dc --format=lzma failed on {name}"));
         assert_eq!(got, data, "xz -dc --format=lzma on {name}");
     }
@@ -302,10 +340,9 @@ fn xz_itself_accepts_what_this_crate_writes() {
 
 #[test]
 fn xz_itself_accepts_every_filter_chain() {
-    if !have("xz") {
-        eprintln!("skipping: `xz` is not on PATH");
+    let Some(xz_tool) = XZ.find() else {
         return;
-    }
+    };
     let dir = tempdir("xz-filters");
     let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
     // One input big enough to exercise the filters, rather than the whole
@@ -319,13 +356,13 @@ fn xz_itself_accepts_every_filter_chain() {
             encode_xz_with_filters(&data, &props, CheckType::Crc64, 0, &filters).expect("encode");
         let path = dir.join(format!("{tag}.xz"));
         std::fs::write(&path, &xz).expect("write");
-        let status = Command::new("xz")
+        let status = Command::new(&xz_tool)
             .arg("-t")
             .arg(&path)
             .status()
             .expect("run xz -t");
         assert!(status.success(), "xz -t rejected the {tag} chain");
-        let got = pipe("xz", &["-dc"], &xz).unwrap_or_else(|| panic!("xz -dc failed on {tag}"));
+        let got = pipe(&xz_tool, &["-dc"], &xz).unwrap_or_else(|| panic!("xz -dc failed on {tag}"));
         assert_eq!(got, data, "xz -dc on the {tag} chain");
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -333,10 +370,9 @@ fn xz_itself_accepts_every_filter_chain() {
 
 #[test]
 fn seven_zip_accepts_what_this_crate_writes() {
-    if !have("7zz") {
-        eprintln!("skipping: `7zz` is not on PATH");
+    let Some(sevenzip) = SEVENZIP.find() else {
         return;
-    }
+    };
     let dir = tempdir("7zz-encoder");
     for (name, data) in corpus() {
         let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
@@ -346,7 +382,7 @@ fn seven_zip_accepts_what_this_crate_writes() {
             encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode"),
         )
         .expect("write");
-        let out = Command::new("7zz")
+        let out = Command::new(&sevenzip)
             .arg("t")
             .arg(&path)
             .stdout(Stdio::null())
